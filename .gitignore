@@ -1,0 +1,26 @@
+# macOS / Python
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Runtime data, logs, caches, and local credentials
+00_For_*/runtime/
+00_For_*/logs/
+*_notes.md
+*.log
+
+# Legacy root-level runtime files
+00_For_*/state.json
+00_For_*/state.bak.json
+00_For_*/notify_state.json
+00_For_*/renew_state.json
+00_For_*/watchdog_state.json
+00_For_*/clawbot_state.json
+00_For_*/notify_config.json
+00_For_*/renew_config.json
+00_For_*/scripts/api_endpoints.json
+00_For_*/clawbot_login.html
+
+# Scheduler XML is generated for the local Windows user
+00_For_Win/task.xml
+00_For_Win/task_watchdog.xml
