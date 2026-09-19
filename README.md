@@ -37,8 +37,8 @@ bash install.sh status
 
 `install.sh` 会注册两个 LaunchAgent：
 
-- `com.workbuddy.reward-catchup`：每 5 分钟触发主任务。
-- `com.workbuddy.reward-watchdog`：每 30 分钟检查主任务状态。
+- `com.workbuddy.wb-reward-catchup`：每 5 分钟触发主任务。
+- `com.workbuddy.wb-reward-watchdog`：每 30 分钟检查主任务状态。
 
 ### Windows
 
