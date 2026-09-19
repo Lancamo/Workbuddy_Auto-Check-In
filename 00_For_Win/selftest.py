@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -211,6 +212,40 @@ def test_task_xml() -> None:
         python_exe="py", script=DIR / "catchup.py", workdir=DIR, interval_min=15))
     check("interval_min 可配置（PT15M）",
           x15.find(".//t:Repetition/t:Interval", NS).text == "PT15M")
+
+    # --- 第三个任务：每日唤醒器（Windows 上「睡着也能签到」的唯一入口）---
+    # 它与轮询任务必须是两种**形态**，不能只是参数不同：
+    #   · 轮询任务绝不能开 WakeToRun —— 它带 Repetition PT5M，开了会每 5 分钟
+    #     把电脑叫醒一次，比不设还糟；
+    #   · 唤醒任务必须只留「每天一次」这一个触发点，且开 WakeToRun。
+    # 这两条是本次改动的核心，钉死在测试里，免得日后被「顺手统一一下」改坏。
+    xw = ET.fromstring(install.build_task_xml(
+        python_exe="py", script=DIR / "catchup.py", workdir=DIR,
+        name=install.WAKE_TASK_NAME, wake_to_run=True,
+        daily_once_at=install.WAKE_DAILY_AT, desc="唤醒任务"))
+
+    def wtxt(path: str, default=None):
+        e = xw.find(path, NS)
+        return e.text if (e is not None and e.text) else default
+
+    check("轮询主任务 WakeToRun = false（开了会每 5 分钟唤醒一次）",
+          txt(".//t:WakeToRun") == "false",
+          "实际：{}".format(txt(".//t:WakeToRun")))
+    check("唤醒任务 WakeToRun = true", wtxt(".//t:WakeToRun") == "true",
+          "实际：{}".format(wtxt(".//t:WakeToRun")))
+    check("唤醒任务不带 Repetition（带重复则每次重复都唤醒一遍）",
+          xw.find(".//t:Repetition", NS) is None)
+    check("唤醒任务不带 LogonTrigger（登录触发唤醒不了睡眠中的机器）",
+          xw.find(".//t:LogonTrigger", NS) is None)
+    check("唤醒任务每天定点触发一次（StartBoundary 落在 07:00）",
+          (wtxt(".//t:CalendarTrigger/t:StartBoundary") or "").endswith("T07:00:00"),
+          "实际：{}".format(wtxt(".//t:CalendarTrigger/t:StartBoundary")))
+    check("唤醒任务同样电池可跑（否则笔记本用电池时不会被唤醒）",
+          wtxt(".//t:DisallowStartIfOnBatteries") == "false",
+          "实际：{}".format(wtxt(".//t:DisallowStartIfOnBatteries")))
+    check("唤醒任务也补跑错过的触发", wtxt(".//t:StartWhenAvailable") == "true")
+    check("唤醒任务名与常量一致", install.WAKE_TASK_NAME in
+          wtxt(".//t:URI", ""), "实际：{}".format(wtxt(".//t:URI")))
 
 
 # ---------------------------------------------------------------------------
@@ -903,6 +938,10 @@ def test_watchdog() -> None:
     # --- 判定逻辑：注入 job_loaded，用临时 state.json 控制心跳新鲜度 ---
     orig_state, orig_log = wd.STATE, wd.MAIN_LOG
     try:
+        orig_quiet = wd.QUIET_FROM
+        # 先关掉静默判定，让 1)~6) 专注「心跳新旧 → 报不报」这条逻辑本身；
+        # 静默相关的行为在 7)~8) 单独测，免得两件事互相干扰。
+        wd.QUIET_FROM = -1
         with tmpdir() as td:
             st = pathlib.Path(td) / "state.json"
             lg = pathlib.Path(td) / "catchup.log"
@@ -958,8 +997,81 @@ def test_watchdog() -> None:
             r = wd.check(now, job_loaded=True)
             check("心跳略旧但未超阈值 → 不报警",
                   r["healthy"], json.dumps(r["problems"], ensure_ascii=False))
+
+            # 7) 静默两种情形都不得报 stale —— 2026-09-19 的实际误报就出在这里：
+            #    电脑连续睡了 122 分钟（> 阈值 90），一开盖就收到「主脚本可能已停摆」。
+            #    ★ 每段都必须 write_text 之后**重新 utime** —— 写文件会把 mtime 刷成
+            #      当下，「心跳陈旧」的前提就没了，断言会以「心跳很新」的方式假通过。
+            #    ★ 同时断言 state_age 确实超阈值，否则「不报」可能只是心跳太新。
+            #    age 用**真实时间**算，所以固定「探测时刻」即可让断言与
+            #    「自检恰好在几点跑」无关 —— 否则凌晨跑自检会假失败。
+            wd.QUIET_FROM = orig_quiet
+            day_ = datetime.date.today()
+            stale_ts = now - (wd.STALE_MINUTES + 60) * 60
+            midnight = datetime.datetime.combine(day_, datetime.time(3, 0)).timestamp()
+            daytime = datetime.datetime.combine(day_, datetime.time(14, 0)).timestamp()
+
+            def _write_old(payload: dict) -> None:
+                st.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                os.utime(st, (stale_ts, stale_ts))
+
+            _write_old({"day": day_.isoformat(), "checkin_done": False,
+                        "claim_done": False})
+            r = wd.check(midnight, job_loaded=True)
+            check("凌晨静默期：心跳确实陈旧，但不报 stale",
+                  r["healthy"] and r["quiet_hours"]
+                  and (r["state_age_minutes"] or 0) > wd.STALE_MINUTES,
+                  "age={} quiet={} problems={}".format(
+                      r["state_age_minutes"], r["quiet_hours"], r["problems"]))
+
+            _write_old({"day": day_.isoformat(), "checkin_done": True,
+                        "claim_done": True})
+            r = wd.check(daytime, job_loaded=True)
+            check("当日已完成：心跳确实陈旧（122 分钟级），但不报 stale",
+                  r["healthy"] and r["day_finished"]
+                  and (r["state_age_minutes"] or 0) > wd.STALE_MINUTES,
+                  "age={} finished={} problems={}".format(
+                      r["state_age_minutes"], r["day_finished"], r["problems"]))
+
+            # 8) 真故障必须照报 —— 否则「静默放行」就变成了掩盖
+            yest = (day_ - datetime.timedelta(days=1)).isoformat()
+            _write_old({"day": yest, "checkin_done": True, "claim_done": True})
+            r = wd.check(daytime, job_loaded=True)
+            check("state 是昨天的 + 心跳陈旧 → 照报 stale（静默不掩盖真故障）",
+                  "stale" in r["problems"],
+                  "age={} problems={}".format(r["state_age_minutes"], r["problems"]))
     finally:
         wd.STATE, wd.MAIN_LOG = orig_state, orig_log
+        wd.QUIET_FROM = orig_quiet
+
+    # --- 静默判据：catchup 决定「写不写心跳」，watchdog 据此判活，口径必须一致 ---
+    import catchup as cu
+    check("catchup 与 watchdog 的静默期起点一致",
+          cu.QUIET_FROM == wd.QUIET_FROM,
+          "catchup={} watchdog={}".format(cu.QUIET_FROM, wd.QUIET_FROM))
+    check("静默起点与签到闸门同值（07:00 开门即可干活）",
+          cu.QUIET_FROM == cu.WINDOW1,
+          "QUIET_FROM={} WINDOW1={}".format(cu.QUIET_FROM, cu.WINDOW1))
+    for hm_, want in ((0, True), (629, True), (659, True), (700, False),
+                      (1400, False), (2359, False)):
+        h, m = divmod(hm_, 100)
+        t = datetime.datetime(2026, 9, 19, h, m)
+        check("静默判定 {:.2f} → {}".format(hm_ / 100.0, want),
+              cu._quiet_now(t) is want)
+    today_s = datetime.date.today().isoformat()
+    yest_s = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    check("签到 + 领取都到手 → 判为当日收工",
+          cu._day_finished({"day": today_s, "checkin_done": True, "claim_done": True},
+                           today_s))
+    check("只签到、还没领到 → 未收工（必须继续等猫）",
+          not cu._day_finished({"day": today_s, "checkin_done": True,
+                                "claim_done": False}, today_s))
+    check("昨天的完成状态不能给今天免跑（否则跨日当天不签到）",
+          not cu._day_finished({"day": yest_s, "checkin_done": True,
+                                "claim_done": True}, today_s))
+    check("watchdog 与 catchup 的收工口径一致",
+          wd._day_finished({"day": today_s, "checkin_done": True,
+                            "claim_done": True}, time.time()))
 
     # --- 报警自查指引必须是 Windows 命令（不能把 mac 的 launchctl 带进来）---
     check("报警自查指引是 Windows 命令（schtasks）",

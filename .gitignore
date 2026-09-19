@@ -24,3 +24,4 @@ __pycache__/
 # Scheduler XML is generated for the local Windows user
 00_For_Win/task.xml
 00_For_Win/task_watchdog.xml
+00_For_Win/task_wake.xml

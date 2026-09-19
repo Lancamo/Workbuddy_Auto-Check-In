@@ -77,6 +77,7 @@ import notify        # noqa: E402  同目录通知模块（微信推送 + 本机
 import renew         # noqa: E402  同目录续期守护（ClawBot 会话快到期时提醒用户发消息）
 
 WINDOW1 = 700       # 07:00 签到 + 派遣（「≥ 时间」语义，过了点补跑）
+QUIET_FROM = 700    # 07:00 —— 在此之前完全静默（见 _quiet_now）
 MAX_TRIES = 12      # 单事项最多真实尝试次数
 MIN_RETRY_GAP_MIN = 20   # 两次真实尝试之间的最小间隔（分钟）
 LOCK_STALE_SEC = 600     # 超过 10 分钟未释放的锁视为残留（正常一次运行只需几秒）
@@ -88,6 +89,15 @@ LOCK_STALE_SEC = 600     # 超过 10 分钟未释放的锁视为残留（正常�
 # 为什么不做「固定时刻兜底」：领取的唯一正当理由是**猫真的到了**。
 # 时间兜底会凭空制造一次请求，而且「到点电脑恰好睡着」反而是它最不可靠的时候。
 # 到达时间由接口给出（travel 的 arrive_at）；缺失时下面的 need_arrive_info 会去问一次。
+#
+# ── 静默（2026-09-19 加）────────────────────────────────────────────────
+# 触发由系统维护唤醒带起时，很多次触发根本无事可做（凌晨、或当天早已领完）。
+# （★ Windows 上没有系统的周期维护唤醒，只有 install.py 注册的每日 07:00 唤醒器。）
+# 这些触发若照常跑完整流程，就要付出「解释器启动 + 读 state + 续期检查 + 端点
+# 探测 + 写日志写状态」的全套开销，纯属空转。两条静默规则把它们压到最小：
+#   ① 00:00–07:00         → 连锁都不抢，零落盘（_quiet_now）
+#   ② 当天已完成          → 不再做任何事（_day_finished）
+# 静默只省开销，**不改闸门逻辑**；设计与取证见 Plan/2026-09-19-静默期与唤醒策略.md。
 
 
 MAX_LOG_BYTES = 512 * 1024   # 日志超过这个大小就裁剪（触发频率提到 5 分钟后需要）
@@ -414,6 +424,37 @@ def _due(state: dict, key: str, now_ts: float, gap_min: int) -> bool:
     return last <= 0 or (now_ts - last) >= gap_min * 60
 
 
+def _quiet_now(now: datetime.datetime) -> bool:
+    """是否处于完全静默时段（00:00 – 07:00）。
+
+    为什么要这一条：凌晨既不该签到（闸门未开），也没有任何事可做，但计划任务
+    仍会随系统的维护唤醒被触发。不加判断的话，每次触发都要启动解释器、读 state、
+    跑续期检查与端点探测、再写盘 —— 纯属空转。
+
+    刻意与 WINDOW1 同值：闸门几点开门，就几点结束静默，不留下
+    「醒了但不该干活」的中间态。
+    """
+    return now.hour * 100 + now.minute < QUIET_FROM
+
+
+def _day_finished(state: dict, today: str) -> bool:
+    """今天该做的都做完了吗 —— 是则后续触发全部静默。
+
+    口径刻意只有一条：**签到成功 且 旅行奖励到手**。两件都完成之后，再触发
+    也没有任何事可做，继续跑纯属空转。
+
+    为什么不把「领取预算耗尽」也算进来：那是「今天没领到」，与「做完了」是
+    两回事，由 probe_exhausted 告警负责（每天一条）。把失败路径混进静默判据
+    会让口径分裂，还逼着 watchdog 侧再同步一个常量 —— 不值得。
+
+    为什么必须比对 day：完成状态属于**某一天**。昨天的 checkin_done 不能拿来
+    给今天免跑 —— 否则跨日后的第一个触发会被静默掉，当天直接不签到。
+    """
+    return (state.get("day") == today
+            and bool(state.get("checkin_done"))
+            and bool(state.get("claim_done")))
+
+
 def main() -> None:
     """入口：先抢文件锁，再跑 _run()。
 
@@ -421,6 +462,10 @@ def main() -> None:
     撞在同一分钟的概率不再可忽略，而两者都会读 → 改 → 写 state.json。
     锁放在最外层，保证任何退出路径（包括异常）都会释放。
     """
+    if _quiet_now(datetime.datetime.now()):
+        # 静默期：锁不抢、日志不写、state 不读 —— 零落盘开销，只读一次系统时间。
+        print(json.dumps({"action": "quiet_hours"}, ensure_ascii=False))
+        return
     now_ts = time.time()
     if not _acquire_lock(now_ts):
         log("另一个实例正在运行（{} 存在且有效），本次跳过".format(LOCK.name))
@@ -433,6 +478,13 @@ def main() -> None:
 
 
 def _run() -> None:
+    # 静默第二道：当天该做的都做完了 → 之后每次触发都不再做任何事。
+    # 放在 ensure_config / renew / discovery 之前，因为那些都属于「每次触发都跑」
+    # 的固定开销，正是静默要省掉的那部分。
+    if _day_finished(_load_state(), datetime.datetime.now().strftime("%Y-%m-%d")):
+        print(json.dumps({"action": "day_done"}, ensure_ascii=False))
+        return
+
     notify.ensure_config()   # 首次运行自动生成 notify_config.json 模板
     renew.ensure_config()    # 首次运行自动生成 renew_config.json 模板
 

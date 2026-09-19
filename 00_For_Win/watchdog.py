@@ -47,7 +47,9 @@ SELF_LOG = _LOG_DIR / "watchdog.log"
 SELF_STATE = _STATE_DIR / "watchdog_state.json"
 
 JOB_NAME = "WorkBuddyRewardCatchup"        # 被监控的那个计划任务
-STALE_MINUTES = 90       # 心跳超过这么久没更新就报警（> 一次电脑睡眠，避免误报）
+STALE_MINUTES = 90       # 心跳超过这么久没更新就报警（静默期与收工后除外，见 check）
+QUIET_FROM = 700         # 07:00 —— 主脚本的静默期起点。两边各自定义一份常量、
+                         # 刻意不互相 import：本文件的价值就在于独立，宁可重复两行。
 REALERT_HOURS = 6        # 同一个问题最多每 6 小时提醒一次
 MAX_LOG_BYTES = 256 * 1024
 
@@ -72,6 +74,38 @@ def _age_minutes(p: pathlib.Path):
         return (time.time() - p.stat().st_mtime) / 60.0
     except OSError:
         return None
+
+
+def _state_info() -> dict:
+    """读 state.json 的**内容**（而不是只看 mtime）。
+
+    为什么必须读内容：主脚本有两种情况会**故意不写心跳** —— 凌晨静默期，以及
+    当天任务全部完成之后。此时 mtime 陈旧是**设计预期**，不是故障。只看 mtime
+    就分不清「正常静默」与「真的停摆」，于是长时间合盖/休眠后一恢复就误报。
+    """
+    try:
+        d = json.loads(STATE.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001 — 读不到/损坏就当作「不知道」，按原规则保守判定
+        return {}
+
+
+def _quiet_now(now: float) -> bool:
+    """是否处于主脚本的静默时段（00:00–07:00）。"""
+    dt = datetime.datetime.fromtimestamp(now)
+    return dt.hour * 100 + dt.minute < QUIET_FROM
+
+
+def _day_finished(st: dict, now: float) -> bool:
+    """主脚本今天是否已收工（签到 + 旅行奖励都到手）。
+
+    口径必须与 catchup.py 的 `_day_finished` **完全一致** —— 它是主脚本决定
+    「今天不再写心跳」的唯一判据，判错就会把正常静默当成故障。
+    """
+    today = datetime.datetime.fromtimestamp(now).strftime("%F")
+    return (st.get("day") == today
+            and bool(st.get("checkin_done"))
+            and bool(st.get("claim_done")))
 
 
 def _job_loaded() -> bool:
@@ -195,10 +229,16 @@ def check(now: float, job_loaded: bool | None = None) -> dict:
     log_age = _age_minutes(MAIN_LOG)
     loaded = _job_loaded() if job_loaded is None else bool(job_loaded)
 
+    # 主脚本在「凌晨静默期」与「当日收工后」是**故意不写心跳**的（见 catchup.py
+    # 的 _quiet_now / _day_finished）。这两种情况下心跳陈旧是预期行为，不算故障。
+    quiet = _quiet_now(now)
+    finished = _day_finished(_state_info(), now)
+    expected_silence = quiet or finished
+
     problems = []
     if age is None:
         problems.append(("missing", "找不到 state.json —— 主脚本可能从未成功运行过"))
-    elif age > STALE_MINUTES:
+    elif age > STALE_MINUTES and not expected_silence:
         problems.append(("stale", "主脚本已 {:.0f} 分钟没有运行（心跳阈值 {} 分钟）".format(
             age, STALE_MINUTES)))
     if not loaded:
@@ -209,6 +249,9 @@ def check(now: float, job_loaded: bool | None = None) -> dict:
         "state_age_minutes": None if age is None else round(age, 1),
         "main_log_age_minutes": None if log_age is None else round(log_age, 1),
         "job_loaded": loaded,
+        # 把判定依据显式写出来：事后核对「为什么这次没报警」时不用猜。
+        "quiet_hours": quiet,
+        "day_finished": finished,
         "problems": [k for k, _ in problems],
         "details": [d for _, d in problems],
         "healthy": not problems,

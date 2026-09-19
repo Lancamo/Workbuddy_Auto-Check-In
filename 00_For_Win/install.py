@@ -14,6 +14,10 @@ install.py — 注册 / 卸载 / 查看 Windows 计划任务（Task Scheduler）
     launchd 唤醒后补发过期任务              StartWhenAvailable=true ← 等价物
     （launchd 无对应项）                    DisallowStartIfOnBatteries=false ← 必须显式关，
                                            否则笔记本一拔电源任务就静默不跑
+    系统维护唤醒顺带带起计划任务            唤醒任务 WorkBuddyRewardWake（每天 07:00
+    （Power Nap，每 ~16 分钟）             + WakeToRun=true）← 睡眠中也能签到。
+                                           唤醒开关作用于任务的所有触发器，所以它
+                                           必须是独立任务，不能加在 5 分钟轮询上
 
 ★ 三个容易踩的坑（都在本文件里处理掉了）
   1. **默认「仅在使用交流电时启动」** —— Windows 计划任务的默认值是 true，
@@ -24,21 +28,29 @@ install.py — 注册 / 卸载 / 查看 Windows 计划任务（Task Scheduler）
      彻底避开代码页问题；解释器与脚本路径**一律带引号**（路径里常含空格与中文）。
      执行体用 `pythonw.exe`（无控制台）→ 不闪黑窗，输出自动落到 `logs/stdio.log`。
 
+★ 第四个坑只在「想让它睡着也能跑」时出现
+  直观做法是给主任务加 WakeToRun=true —— **千万别**。`<WakeToRun>` 作用于该任务的
+  所有触发器，而主任务带 Repetition PT5M，结果是把电脑**每 5 分钟叫醒一次**。
+  正确做法是单独一个「每天只触发一次」的唤醒任务（本案把它定在 07:00）。
+
 命令
 ----
-    python install.py install            # 注册两个计划任务（主任务 + watchdog）并跑一次自检
+    python install.py install            # 注册三个计划任务并跑一次自检
     python install.py install --dry-run  # 只生成 XML 并打印，不注册
     python install.py install --interval 15
-    python install.py install --no-watchdog        # 只装主任务
-    python install.py uninstall          # 卸载（两个任务一起删）
-    python install.py status             # 查看两个任务的定义与最近运行痕迹
+    python install.py install --no-watchdog        # 不装 watchdog
+    python install.py install --no-wake            # 不装每日唤醒器（睡眠中不再签到）
+    python install.py uninstall          # 卸载（三个任务一起删）
+    python install.py status             # 查看三个任务的定义与最近运行痕迹
     python install.py run                # 立即手动跑一次（前台，看得到输出）
     python install.py enable / disable   # 启用 / 停用（不删除）
     python install.py trigger            # 让主任务立即执行一次（验证任务本身可运行）
 
-★ 会注册**两个**任务（对应 mac 版的 plist 也是两个）
-  1. WorkBuddyRewardCatchup   —— 每 5 分钟；真正干活的主脚本
+★ 会注册**三个**任务（对应 mac 版是两个 plist + 系统的维护唤醒）
+  1. WorkBuddyRewardCatchup   —— 每 5 分钟；真正干活的主脚本（WakeToRun=false）
   2. WorkBuddyRewardWatchdog  —— 每 30 分钟；只盯主脚本还活着没，异常时弹本机通知
+  3. WorkBuddyRewardWake      —— 每天 07:00 一次；唯一的 WakeToRun=true，
+                                 负责在电脑睡着时把它叫醒跑签到
   watchdog 存在的意义：主脚本的所有告警都以「它自己跑起来了」为前提。若计划任务
   被停用/删除、Python 被卸载、项目目录被移走，主脚本会**连告警机制一起静默死掉**。
   唯一出路就是一个完全独立的第二个任务（不共享任何代码）来盯它。
@@ -83,6 +95,17 @@ WATCHDOG_XML = paths.cache_path("task_watchdog.xml")
 DEFAULT_WATCHDOG_INTERVAL_MIN = 30
 WATCHDOG_LOG = paths.log_path("watchdog.log")
 
+# ── 第三个计划任务：每日唤醒 ────────────────────────────────────────────────
+# 存在的唯一理由：让 Windows 也能做到 mac 那样的「睡着也能签到」。
+# 为什么必须是独立任务：`<WakeToRun>` 作用于该任务的**所有**触发器，而主任务是
+# 每 5 分钟重复的 —— 给它开唤醒等于每 5 分钟把电脑叫醒一次，比不设还糟。
+# 所以这件事只能交给一个「每天只触发一次」的任务。
+# 为什么定在 07:00：与 catchup.py 的静默期结束（QUIET_FROM）和签到闸门
+# （WINDOW1）同值 —— 醒了立刻就是能干活的时刻，不浪费这次唤醒。
+WAKE_TASK_NAME = "WorkBuddyRewardWake"
+WAKE_XML = paths.cache_path("task_wake.xml")
+WAKE_DAILY_AT = "07:00"
+
 
 def migrate_runtime() -> None:
     """Move legacy root-level state/config/log files into runtime/ once."""
@@ -121,7 +144,9 @@ def build_task_xml(*, python_exe: str, script: pathlib.Path,
                    name: str = DEFAULT_TASK_NAME,
                    start_boundary: str | None = None,
                    user_id: str | None = None,
-                   desc: str | None = None) -> str:
+                   desc: str | None = None,
+                   wake_to_run: bool = False,
+                   daily_once_at: str | None = None) -> str:
     """生成计划任务 XML（字符串）。纯函数，可在任何平台上测试。
 
     参数
@@ -133,6 +158,17 @@ def build_task_xml(*, python_exe: str, script: pathlib.Path,
       start_boundary  重复触发的起点，默认今天 00:00:00
       user_id         `DOMAIN\\user`，None/空 则省略该元素
       desc            任务描述；None 则用主任务的默认描述
+      wake_to_run     是否允许「到点唤醒睡眠中的电脑」来执行。**只给唤醒任务用**，
+                      见下面 ★ 的说明
+      daily_once_at   "HH:MM"。给定时生成「每天该时刻一次」的最小触发器集合
+                      （只留一个 CalendarTrigger，不带 LogonTrigger、不带
+                      Repetition）—— 唤醒任务的正确形态
+
+    ★ 为什么 wake_to_run 不能开在轮询任务上
+      `<WakeToRun>` 位于 `<Settings>`，作用于该任务的**所有**触发器。轮询任务
+      带 Repetition PT5M，一旦开了它，笔记本就会**每 5 分钟被唤醒一次**，比不设
+      还糟。所以「睡眠中也能签到」只能靠一个**独立的、每天只触发一次**的唤醒
+      任务来实现，轮询任务始终保持 false。
     """
     today = datetime.date.today().strftime("%Y-%m-%dT00:00:00")
     sb = start_boundary or today
@@ -152,6 +188,43 @@ def build_task_xml(*, python_exe: str, script: pathlib.Path,
         user_xml = "      <UserId>{}</UserId>\n".format(esc(uid))
         principal_user_xml = "      <UserId>{}</UserId>\n".format(esc(uid))
 
+    if daily_once_at:
+        # 「每天定点一次」——唤醒任务的形态。
+        # 刻意不给 LogonTrigger（登录触发不会唤醒睡眠中的机器）也不给 Repetition
+        # （带重复的话每次重复都会各自唤醒一遍），全天只在设定的那一刻唤醒一次。
+        sb_daily = esc("{}T{}:00".format(
+            datetime.date.today().strftime("%Y-%m-%d"), daily_once_at))
+        triggers = (
+            "    <!-- 每天 {at} 触发一次：本任务存在的唯一目的就是这个唤醒点 -->\n"
+            "    <CalendarTrigger>\n"
+            "      <StartBoundary>{sb}</StartBoundary>\n"
+            "      <Enabled>true</Enabled>\n"
+            "      <ScheduleByDay>\n"
+            "        <DaysInterval>1</DaysInterval>\n"
+            "      </ScheduleByDay>\n"
+            "    </CalendarTrigger>\n"
+        ).format(at=daily_once_at, sb=sb_daily)
+    else:
+        triggers = (
+            "    <!-- 登录后延迟 1 分钟跑一次（等网络与桌面端就绪） -->\n"
+            "    <LogonTrigger>\n"
+            "      <Enabled>true</Enabled>\n"
+            "{user_xml}      <Delay>PT1M</Delay>\n"
+            "    </LogonTrigger>\n"
+            "    <!-- 每 {interval} 分钟一次；不写 Duration = 无限重复 -->\n"
+            "    <CalendarTrigger>\n"
+            "      <StartBoundary>{sb}</StartBoundary>\n"
+            "      <Enabled>true</Enabled>\n"
+            "      <Repetition>\n"
+            "        <Interval>PT{interval}M</Interval>\n"
+            "        <StopAtDurationEnd>false</StopAtDurationEnd>\n"
+            "      </Repetition>\n"
+            "      <ScheduleByDay>\n"
+            "        <DaysInterval>1</DaysInterval>\n"
+            "      </ScheduleByDay>\n"
+            "    </CalendarTrigger>\n"
+        ).format(user_xml=user_xml, interval=int(interval_min), sb=esc(sb))
+
     return """<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -161,24 +234,7 @@ def build_task_xml(*, python_exe: str, script: pathlib.Path,
     <URI>\\{name}</URI>
   </RegistrationInfo>
   <Triggers>
-    <!-- 登录后延迟 1 分钟跑一次（等网络与桌面端就绪） -->
-    <LogonTrigger>
-      <Enabled>true</Enabled>
-{user_xml}      <Delay>PT1M</Delay>
-    </LogonTrigger>
-    <!-- 每 {interval} 分钟一次；不写 Duration = 无限重复 -->
-    <CalendarTrigger>
-      <StartBoundary>{sb}</StartBoundary>
-      <Enabled>true</Enabled>
-      <Repetition>
-        <Interval>PT{interval}M</Interval>
-        <StopAtDurationEnd>false</StopAtDurationEnd>
-      </Repetition>
-      <ScheduleByDay>
-        <DaysInterval>1</DaysInterval>
-      </ScheduleByDay>
-    </CalendarTrigger>
-  </Triggers>
+{triggers}  </Triggers>
   <Principals>
     <Principal id="Author">
 {principal_user_xml}      <LogonType>InteractiveToken</LogonType>
@@ -203,7 +259,8 @@ def build_task_xml(*, python_exe: str, script: pathlib.Path,
     <Enabled>true</Enabled>
     <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
+    <!-- ★ 只给「唤醒任务」开。轮询任务开了会每 5 分钟唤醒一次电脑，比不设还糟 -->
+    <WakeToRun>{wake}</WakeToRun>
     <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
     <Priority>7</Priority>
     <RestartOnFailure>
@@ -222,11 +279,10 @@ def build_task_xml(*, python_exe: str, script: pathlib.Path,
 """.format(
         date=datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         author=esc(_current_user_id() or "WorkBuddy 积分助手"),
-        interval=int(interval_min),
         name=esc(name),
-        user_xml=user_xml,
+        triggers=triggers,
         principal_user_xml=principal_user_xml,
-        sb=esc(sb),
+        wake="true" if wake_to_run else "false",
         desc=esc(desc),
         python=esc(python_exe),
         script=esc(str(script)),
@@ -355,11 +411,15 @@ def _print(obj) -> None:
 
 
 def _task_specs(args: argparse.Namespace) -> list[dict]:
-    """要注册/查询的任务清单：主任务 + watchdog（`--no-watchdog` 可去掉后者）。
+    """要注册/查询的任务清单：主任务 + watchdog + 每日唤醒
+    （`--no-watchdog` / `--no-wake` 可各自去掉）。
 
-    两个任务共用同一份 XML 生成逻辑，只是脚本、任务名、间隔、描述不同 ——
+    三个任务共用同一份 XML 生成逻辑，只是脚本、任务名、触发器、描述不同 ——
     这保证 watchdog 也自动获得 LogonTrigger / StartWhenAvailable / 电池可跑 /
     无控制台窗口这些「不设就静默失效」的关键设置。
+
+    唤醒任务（kind="wake"）是唯一的例外形态：它用 daily_once_at 走「每天定点一次」
+    的触发器，并单独开 wake_to_run。原因见 build_task_xml 的 ★ 说明。
     """
     out_xml = pathlib.Path(args.xml_out) if args.xml_out else TASK_XML
     specs = [{
@@ -387,6 +447,22 @@ def _task_specs(args: argparse.Namespace) -> list[dict]:
                          int(winterval)),
             "log": WATCHDOG_LOG,
         })
+    if not getattr(args, "no_wake", False):
+        specs.append({
+            "kind": "wake",
+            "name": getattr(args, "wake_name", WAKE_TASK_NAME),
+            "script": ENTRY,
+            "interval": 0,        # 该任务没有重复触发，此字段不参与生成
+            "xml": (out_xml.with_name("task_wake.xml") if args.xml_out else WAKE_XML),
+            "desc": ("WorkBuddy 积分「每日唤醒器」。每天 {} 触发一次，若电脑处于睡眠"
+                     "则由它唤醒后执行 catchup.py —— 这是 Windows 上「睡着也能签到」"
+                     "的唯一入口。刻意与轮询任务分开：唤醒开关作用于任务的所有触发器，"
+                     "开在每 5 分钟轮询的主任务上会把电脑每 5 分钟叫醒一次。").format(
+                         WAKE_DAILY_AT),
+            "log": LOG,
+            "wake_to_run": True,
+            "daily_once_at": WAKE_DAILY_AT,
+        })
     return specs
 
 
@@ -412,7 +488,9 @@ def cmd_install(args: argparse.Namespace) -> int:
             continue
 
         xml = build_task_xml(python_exe=python_exe, script=sp["script"], workdir=DIR,
-                             interval_min=sp["interval"], name=sp["name"], desc=sp["desc"])
+                             interval_min=sp["interval"], name=sp["name"], desc=sp["desc"],
+                             wake_to_run=sp.get("wake_to_run", False),
+                             daily_once_at=sp.get("daily_once_at"))
         # 先在内存里解析一遍，保证 XML 合法（不合法的 XML 会让 schtasks 报难懂的错）
         try:
             ET.fromstring(xml)
@@ -445,6 +523,7 @@ def cmd_install(args: argparse.Namespace) -> int:
 
     main_res = next((r for r in results if r.get("kind") == "main"), None)
     wd_res = next((r for r in results if r.get("kind") == "watchdog"), None)
+    wake_res = next((r for r in results if r.get("kind") == "wake"), None)
     all_ok = bool(results) and all(r.get("ok") for r in results)
 
     if main_res is None:
@@ -452,12 +531,13 @@ def cmd_install(args: argparse.Namespace) -> int:
                 "tasks": results})
         return 1
 
-    # 顶层保持向后兼容（沿用主任务的字段），watchdog 额外挂在 tasks / watchdog 下
+    # 顶层保持向后兼容（沿用主任务的字段），watchdog / wake 额外挂在 tasks 下
     out = dict(main_res)
     out["dry_run"] = bool(args.dry_run)
     out["ok"] = all_ok
     out["tasks"] = results
     out["watchdog"] = wd_res
+    out["wake"] = wake_res
 
     if not all_ok:
         out.setdefault("hint", ("注册失败。常见原因：① 任务名已存在且被占用 → 先 uninstall；"
@@ -468,9 +548,12 @@ def cmd_install(args: argparse.Namespace) -> int:
 
     if not args.dry_run:
         out["next_step"] = ("安装完成。主任务每 {} 分钟跑一次，watchdog 每 {} 分钟跑一次，"
-                            "登录时各跑一次。可随时用 `python install.py status` 查看。"
-                            ).format(args.interval, getattr(args, "watchdog_interval",
-                                                           DEFAULT_WATCHDOG_INTERVAL_MIN))
+                            "两者在登录时各跑一次；唤醒任务每天 {} 触发一次、必要时会"
+                            "叫醒睡眠中的电脑。可随时用 `python install.py status` 查看。"
+                            ).format(args.interval,
+                                     getattr(args, "watchdog_interval",
+                                             DEFAULT_WATCHDOG_INTERVAL_MIN),
+                                     WAKE_DAILY_AT)
     _print(out)
     return 0
 
@@ -482,11 +565,13 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     names = [args.name]
     if not getattr(args, "no_watchdog", False):
         names.append(getattr(args, "watchdog_name", WATCHDOG_TASK_NAME))
+    if not getattr(args, "no_wake", False):
+        names.append(getattr(args, "wake_name", WAKE_TASK_NAME))
     tasks = []
     for n in names:
         ok, msg = delete_task(n)
         tasks.append({"task_name": n, "ok": ok, "schtasks": msg})
-    # 两个任务里至少删掉一个就算成功；都没删掉（例如本来就没装）也能接受，
+    # 三个任务里至少删掉一个就算成功；都没删掉（例如本来就没装）也能接受，
     # 因为 uninstall 的语义是「确保不再自动触发」，是幂等的。
     any_ok = any(t["ok"] for t in tasks)
     _print({"ok": any_ok, "tasks": tasks,
@@ -570,11 +655,17 @@ def cmd_status(args: argparse.Namespace) -> int:
         out["task_query_message"] = main_blk.get("task_query_message")
         out["hint"] = "任务未注册 → 运行 `python install.py install`"
 
-    if len(out["tasks"]) > 1:
-        wd = out["tasks"][1]
-        out["watchdog_task_name"] = wd["task_name"]
-        out["watchdog_registered"] = wd["task_registered"]
-        out["watchdog_log_tail"] = wd["log_tail"]
+    # 按 kind 取，而不是按位置 —— `--no-watchdog` / `--no-wake` 会改变列表长度，
+    # 写死下标会在那种情况下张冠李戴。
+    for sp, blk in zip(specs, out["tasks"]):
+        if sp["kind"] == "watchdog":
+            out["watchdog_task_name"] = blk["task_name"]
+            out["watchdog_registered"] = blk["task_registered"]
+            out["watchdog_log_tail"] = blk["log_tail"]
+        elif sp["kind"] == "wake":
+            out["wake_task_name"] = blk["task_name"]
+            out["wake_registered"] = blk["task_registered"]
+            out["wake_task_settings"] = blk.get("task_settings")
 
     _print(out)
     return 0
@@ -627,6 +718,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="watchdog 触发间隔（分钟，默认 {}）".format(DEFAULT_WATCHDOG_INTERVAL_MIN))
     ap.add_argument("--no-watchdog", action="store_true",
                     help="不注册 watchdog（默认会一并注册第二个计划任务）")
+    ap.add_argument("--wake-name", default=WAKE_TASK_NAME,
+                    help="每日唤醒任务名（默认 {}）".format(WAKE_TASK_NAME))
+    ap.add_argument("--no-wake", action="store_true",
+                    help="不注册每日唤醒任务（默认会注册第三个计划任务；"
+                         "关了它，睡眠中的电脑就不会被叫醒跑签到）")
 
     try:
         args = ap.parse_args(rest)
