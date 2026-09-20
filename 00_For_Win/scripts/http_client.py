@@ -21,6 +21,7 @@ http_client.py — WorkBuddy 积分助手 · 统一 HTTP 客户端
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 import urllib.error
@@ -52,6 +53,24 @@ def _client_ua() -> str:
 
 
 DEFAULT_UA = _client_ua()
+
+_OPENER = None
+
+
+def _proxy_opener():
+    """WorkBuddy 官方接口默认直连；系统代理只作为显式开关。
+
+    Windows 系统代理也会跟随代理 App 的启停，代理不在时
+    urllib 就会报 Connection refused；开启 TLS 拦截时还可能换成自签名证书链。
+    """
+    global _OPENER
+    if _OPENER is None:
+        use_system_proxy = os.environ.get(
+            "WORKBUDDY_PROXY_MODE", "").strip().lower() == "system"
+        proxies = (urllib.request.getproxies() if use_system_proxy
+                   else urllib.request.getproxies_environment())
+        _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    return _OPENER
 
 
 class HttpTransportError(RuntimeError):
@@ -93,7 +112,7 @@ def request_json(
     req = urllib.request.Request(url, data=payload, headers=headers, method=method)
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _proxy_opener().open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
             return resp.status, _parse_json(raw)
     except urllib.error.HTTPError as e:

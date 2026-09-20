@@ -724,6 +724,7 @@ $PY clawbot.py test     # 绕过 notify 直接实测 ClawBot 通道
 | `HTTP 401 / 403` | 凭据被拒 → 跑 `clawbot.py login` 重新扫码 |
 | 凭据找不到 | 既无 `clawbot_state.json` 本地凭据，`settings.json` 里也没有 `weixinClawBot` → 跑 `clawbot.py login` |
 | 扫码页显示旧码 | 等自动换码后**刷新浏览器**；或重跑 `login` |
+| 签到/旅行报 `Connection refused` 或 `self-signed certificate in certificate chain` | 常见原因是系统代理端口未启动，或代理开启了 TLS 拦截。积分接口默认**绕过系统代理直连**；确需走系统代理时设置 `WORKBUDDY_PROXY_MODE=system` |
 
 
 ## 激活（安装 LaunchAgent）

@@ -369,6 +369,7 @@ python3 -m py_compile *.py scripts/*.py && echo "COMPILE OK"
 | 微信收不到且报 `errcode=-14` | 登录会话过期 | `login.cmd` 扫码，或直接在 WorkBuddy 里重连「微信助理」 |
 | 提示「接口疑似已变更」 | 腾讯改了接口路径 | 看 `runtime/cache/api_endpoints.json` 的 `history`；`doctor.py` 会显示现读到的端点。本版已做前置校验，正常情况下会自动跟上 |
 | 提示「当前无活动」 | 可能是真无活动，也可能是接口返回全零 | 本版已把这种情形判为 `suspect` 而非 `no_activity`，并**主动告警**，不会静默漏签 |
+| 签到/旅行报 `Connection refused` 或 `self-signed certificate in certificate chain` | 常见原因是系统代理端口未启动，或代理开启了 TLS 拦截。积分接口默认**绕过系统代理直连**；确需走系统代理时设置 `WORKBUDDY_PROXY_MODE=system` |
 | 路径找不到（settings / asar） | 客户端装在了非标准位置 | 跑 `doctor.cmd` 看它找过哪些路径 → 建 `win_paths.json` 填写正确路径 |
 | 双击 `.cmd` 闪一下就没了 | 脚本报错但窗口关太快 | 从 cmd 里手动运行同名 `.py`，或在文件夹里开 cmd 跑 `install.cmd` |
 
