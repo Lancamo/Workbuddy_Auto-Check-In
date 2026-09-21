@@ -94,6 +94,11 @@ RATE_LIMIT_MARK = "频率限制"
 # 「微信侧拒绝投递」：实测 ret=-2 + errmsg="prepare failed"（2026-09-18）。
 # 它与频率限制共用 ret=-2，含义完全不同；notify.py 据此决定「重试有没有意义」。
 DELIVER_BLOCKED_MARK = "投递被拒"
+# 「缺 context_token」：服务端照样回 message_id、照样扣 iLink 每日配额，
+# 但消息**根本不会出现在微信里**（这是最容易误判成"通道正常"的坑）。
+# 它也只能靠人工动作（给 bot 发一条消息刷新令牌）恢复，重试永远无效 ——
+# 所以 notify.py 把它归进「要等人工」那一档，而不是当成网络抖动去短冷却重试。
+TOKEN_MISSING_MARK = "缺 context_token"
 
 # 消息枚举
 MSG_TYPE_BOT = 2
@@ -121,8 +126,37 @@ def _apply_user_override(ch: dict | None) -> dict | None:
     return ch
 
 
+# 桌面端写 ClawBot 通道时用过的名字（不同版本/不同分支见过不止一种）
+_CLAWBOT_CHANNEL_NAMES = ("weixinClawBot", "clawbot", "clawBot", "weixin_claw_bot")
+
+
+def _pick_clawbot_channel(ch: dict | None) -> dict | None:
+    """从一个 channels 字典里挑出可用的 ClawBot 凭据；挑不到返回 None。"""
+    ch = ch or {}
+    token = ch.get("botToken") or ch.get("bot_token")
+    user_id = ch.get("userId") or ch.get("user_id")
+    if ch.get("enabled") and token and user_id:
+        return {
+            "bot_token": token,
+            "base_url": (ch.get("baseUrl") or ch.get("base_url")
+                         or DEFAULT_BASE_URL).rstrip("/"),
+            "user_id": user_id,
+            "channel_id": ch.get("channelId") or ch.get("channel_id"),
+        }
+    return None
+
+
 def _channel_from_settings(path: pathlib.Path) -> dict | None:
-    """从单个 settings.json 里解析 weixinClawBot 凭据（解析失败返回 None）。"""
+    """从单个 settings.json 里解析 weixinClawBot 凭据（解析失败返回 None）。
+
+    ★ 必须同时支持**两种存放结构**（2026-09-20 补）：
+      ① 按用户：`claw.users.<uid>.channels.weixinClawBot`
+      ② **顶层**：`claw.channels.<name>`
+    本机上实测看到的 `claw.channels.wechatmp`（公众平台 webhook 模式）就是**顶层**结构 ——
+    也就是说这个版本/这个分支的桌面端写的是扁平结构，而旧实现只读 `claw.users`，
+    于是**用户确实绑定成功了、工具却死活说「未绑定」**。
+    两种都读是安全的超集：哪边有就用哪边，不会改变原有行为。
+    """
     try:
         cfg = json.loads(path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
@@ -132,24 +166,29 @@ def _channel_from_settings(path: pathlib.Path) -> dict | None:
     users = claw.get("users") or {}
     owner = claw.get("legacyOwnerUid")
 
+    # ① 按用户
     candidates = []
     if isinstance(owner, str) and owner in users:
         candidates.append(users[owner])
     candidates.extend(u for k, u in users.items() if k != owner)
 
+    # ② 顶层（放在用户结构之后，保持原有优先级不变）
+    top_channels = claw.get("channels")
+    if isinstance(top_channels, dict):
+        candidates.append({"channels": top_channels})
+
     for u in candidates:
-        ch = ((u or {}).get("channels") or {}).get("weixinClawBot") or {}
-        token = ch.get("botToken")
-        user_id = ch.get("userId")
-        if ch.get("enabled") and token and user_id:
-            return {
-                "bot_token": token,
-                "base_url": (ch.get("baseUrl") or DEFAULT_BASE_URL).rstrip("/"),
-                "user_id": user_id,
-                "channel_id": ch.get("channelId"),
-                "source": "workbuddy-settings",
-                "settings_file": str(path),
-            }
+        channels = (u or {}).get("channels") or {}
+        if not isinstance(channels, dict):
+            continue
+        for name in _CLAWBOT_CHANNEL_NAMES:
+            picked = _pick_clawbot_channel(channels.get(name))
+            if picked:
+                return {
+                    **picked,
+                    "source": "workbuddy-settings",
+                    "settings_file": str(path),
+                }
     return None
 
 
@@ -463,7 +502,7 @@ def send_text(text: str, *, timeout: int = 20, use_context: bool = True) -> tupl
     mid_txt = "（message_id={}）".format(mid) if mid else ""
     if not ctx:
         return False, (
-            "缺 context_token：服务端已受理" + mid_txt +
+            TOKEN_MISSING_MARK + "：服务端已受理" + mid_txt +
             "，但消息不会到达微信。请在微信给机器人发任意一条消息"
             "（如「1」）刷新令牌，推送即自动恢复。"
         )

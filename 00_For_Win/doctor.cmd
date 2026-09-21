@@ -3,6 +3,8 @@ REM ===========================================================================
 REM  WorkBuddy reward auto check-in  --  DOCTOR (Windows)
 REM  Environment self-check. READ ONLY: it does not claim points and does not
 REM  send messages. Run this first whenever something looks wrong.
+REM  Exits non-zero when any check FAILs (doctor.py already returns 1), so this
+REM  is usable from scripts -- do not hardcode "exit /b 0" here.
 REM  ASCII-only on purpose; see install.cmd for the reason.
 REM ===========================================================================
 setlocal
@@ -19,9 +21,13 @@ if not defined PYEXE (
 if not defined PYEXE goto nopython
 
 %PYEXE% "%~dp0doctor.py" %*
+set "RC=%errorlevel%"
+echo.
+echo Exit code: %RC%
+if not "%RC%"=="0" echo Some checks FAILED -- read the [FAIL] lines above.
 echo.
 pause
-exit /b 0
+exit /b %RC%
 
 :nopython
 echo.

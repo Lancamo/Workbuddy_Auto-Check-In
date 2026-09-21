@@ -79,6 +79,10 @@ def _appdata() -> str:
     return os.environ.get("APPDATA", "")
 
 
+def _localappdata() -> str:
+    return os.environ.get("LOCALAPPDATA", "")
+
+
 def _xdg_config() -> str:
     return os.environ.get("XDG_CONFIG_HOME", os.path.join(_home(), ".config"))
 
@@ -86,15 +90,29 @@ def _xdg_config() -> str:
 # ---------------------------------------------------------------------------
 # 候选路径
 # ---------------------------------------------------------------------------
+# ★ Windows 上必须**同时**列 %APPDATA%(Roaming) 与 %LOCALAPPDATA%(Local)。
+#   2026-09-20 实测：桌面端把新版明文登录态写进了
+#     %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info
+#   而旧实现只找 %APPDATA%（Roaming）→ 于是**明明已登录却报「读不到登录态」**，
+#   签到与领取全部空转，报错文案还会把人引向「请先登录」这个错误方向。
+#   Electron 应用把用户数据放 Roaming 还是 Local 取决于打包方，两个都列、
+#   逐个探测、哪边有就用哪边 —— 与 winenv 里 asar 候选的做法一致。
 def desktop_info_candidates() -> list[str]:
-    """新版明文登录态候选路径（按平台）。"""
+    """新版明文登录态候选路径（按平台，**顺序即优先级**）。"""
     rel = os.path.join(
         "CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info"
     )
     if sys.platform == "darwin":
         return [os.path.join(_home(), "Library", "Application Support", rel)]
     if sys.platform == "win32":
-        return [os.path.join(_appdata(), rel)]
+        out: list[str] = []
+        for base in (_appdata(), _localappdata()):
+            if base:
+                p = os.path.join(base, rel)
+                if p not in out:
+                    out.append(p)
+        # 两个环境变量都取不到时保留一条，维持原有行为（不去猜其它路径）
+        return out or [os.path.join(_appdata(), rel)]
     return [os.path.join(_xdg_config(), rel)]
 
 
@@ -103,7 +121,11 @@ def legacy_vscdb_candidates() -> list[str]:
     if sys.platform == "darwin":
         roots = [os.path.join(_home(), "Library", "Application Support", a) for a in APP_NAMES]
     elif sys.platform == "win32":
-        roots = [os.path.join(_appdata(), a) for a in APP_NAMES]
+        # 同上：Roaming 优先，再退 Local（Electron 两种布局都见过）
+        roots = []
+        for base in (_appdata(), _localappdata()):
+            if base:
+                roots += [os.path.join(base, a) for a in APP_NAMES]
     else:
         roots = [os.path.join(_xdg_config(), a) for a in APP_NAMES]
     return [os.path.join(r, "User", "globalStorage", "state.vscdb") for r in roots]
@@ -268,7 +290,14 @@ def _decrypt_legacy_blob(blob: str) -> str:
         proc = subprocess.run(
             [electron, js_path, blob_path],
             capture_output=True,
+            # ★ 显式指定编码，**不要**只写 text=True：那样会按会漂移的 locale 解码
+            #   （开了 PYTHONUTF8 / LANG=C.UTF-8 的进程里是 utf-8，而控制台代码页
+            #   可能是 GBK），一旦对不上，reader 线程抛 UnicodeDecodeError，
+            #   这一行 DECRYPT_RESULT 就丢了、旧版登录态路径静默失败。
+            #   Node 往管道写的是 UTF-8，所以这里固定 utf-8 + replace。
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             env=env,
         )

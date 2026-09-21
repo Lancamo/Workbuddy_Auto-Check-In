@@ -1,7 +1,11 @@
 @echo off
 REM ===========================================================================
 REM  WorkBuddy reward auto check-in  --  INSTALL (Windows)
-REM  Registers the scheduled task "WorkBuddyRewardCatchup".
+REM  Registers FOUR scheduled tasks:
+REM    WorkBuddyRewardCatchup   main poller, every 5 min
+REM    WorkBuddyRewardWatchdog  liveness monitor, every 30 min
+REM    WorkBuddyRewardWake      daily 07:00 wake-up (so it can run while asleep)
+REM    WorkBuddyRewardDayWake   hourly 07:00-23:00 wake points (daytime only)
 REM  Double-click this file. No administrator rights required.
 REM
 REM  NOTE: this file is intentionally ASCII-only. Windows cmd.exe would garble
@@ -21,7 +25,7 @@ if not defined PYEXE (
 if not defined PYEXE goto nopython
 
 echo.
-echo === Registering scheduled task ===
+echo === Registering scheduled tasks (Catchup + Watchdog + Wake) ===
 %PYEXE% "%~dp0install.py" install %*
 set "RC=%errorlevel%"
 echo.

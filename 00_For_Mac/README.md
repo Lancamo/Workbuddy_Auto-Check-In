@@ -479,7 +479,7 @@ $PY renew.py reset    # 清空提醒记录
 >
 > | 事件 | 时间 | 依据 |
 > |---|---|---|
-> | 绑定（会话开始） | 2026-07-10 11:47 | `dffb797a0545_im.bot.cursor.json` 创建时间 |
+> | 绑定（会话开始） | 2026-07-10 11:47 | `<bot_id>_im.bot.cursor.json` 创建时间 |
 > | 最后一次成功轮询 | 2026-08-19 11:11 | 同文件最后写入时间（**此后桌面端不再活动**） |
 > | 确认失效（-14） | 2026-09-16 | 实测返回 `errcode=-14` |
 >
@@ -732,7 +732,7 @@ $PY clawbot.py test     # 绕过 notify 直接实测 ClawBot 通道
 两个 LaunchAgent 都由 `install.sh` **一并安装**，必须在 **Terminal.app** 里执行一次：
 
 ```bash
-cd "<本文件夹>"            # 例如 .../00_Workbuddy自动签到领积分/00_For_Mac
+cd "<本文件夹>"            # 例如 .../09_Workbuddy自动签到领积分/00_For_Mac
 bash install.sh            # 安装（已存在则重装；主任务 5 分钟 + watchdog 30 分钟）
 bash install.sh status     # 复查：是否真的加载了 + watchdog 自己的判定
 ```

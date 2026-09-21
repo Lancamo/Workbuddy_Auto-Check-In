@@ -191,7 +191,17 @@ def _release_lock() -> None:
 # 为什么必须分类：以前所有失败都附同一句「打开一次 WorkBuddy 桌面端刷新登录态」，
 # 但这句话只对「登录态过期」成立 —— 接口变了 / 网络不通时让用户去点桌面端纯属误导。
 _AUTH_HINTS = ("401", "403", "unauthorized", "登录", "凭据", "令牌", "token 失效")
-_NET_HINTS = ("timeout", "timed out", "超时", "网络", "connection", "ssl", "proxy", "代理")
+# ★ 网络类的关键词必须**同时覆盖中英两种措辞 + WinError 号**。
+#   2026-09-20 实测的坑：Windows 的中文报错是**全本地化**的，不含英文 "connection" ——
+#     端口没人监听时会给出
+#       「<urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>」
+#   原列表只有英文 "connection"，于是这句落进「未知」分支，
+#   拿到的提示是「跑一次 run_now.cmd 看详细报错」—— 而 README 排错表专门为这个
+#   场景（系统代理端口未启动 / TLS 拦截）写了处置办法，等于没传到用户手里。
+#   WinError 号（10061 等）与界面语言无关，是最可靠的一路信号。
+_NET_HINTS = ("timeout", "timed out", "超时", "网络", "connection", "ssl", "proxy", "代理",
+              "积极拒绝", "无法连接", "连接被", "连接超时", "远程主机", "名解析",
+              "winerror", "10061", "10060", "10054", "10053", "11001", "11002")
 _DRIFT_HINTS = ("404", "405", "不存在", "not found", "接口", "endpoint", "路由")
 
 
@@ -199,12 +209,23 @@ def _hint_for(reasons: list[str]) -> str:
     """按失败原因给出对应的处理动作（返回一句给用户看的话）。"""
     low = " ".join(str(r or "") for r in reasons).lower()
     if any(k in low for k in _DRIFT_HINTS):
-        return ("像是接口变了，脚本已尝试自动跟随。请运行 py -3 scripts\\api_discovery.py "
-                "核对端点；若仍失败，多半需要等客户端升级。")
+        # ★ 这里必须走 winenv.selfcheck_hint()，不能自己写命令。
+        #   本文件另有 4 处同类「自查端点」的指引都用的它，只有这一处漏了、
+        #   硬编码了 `py -3 scripts\api_discovery.py`。后果有二：
+        #     ① 违反「平台差异只许写在 winenv.py」的硬规则；
+        #     ② README 承诺「Windows 上不会给你一条跑不通的命令」——
+        #        而 `py -3` 依赖 py 启动器（可选组件），且它指向的解释器未必是
+        #        跑本脚本的那个（本机 py -3 = 3.14，实际跑的是 3.11）。
+        #   统一后文案变成「双击本文件夹下的 doctor.cmd」，与别处一致且必然可用。
+        return ("像是接口变了，脚本已尝试自动跟随。自查方式：{}；"
+                "若仍失败，多半需要等客户端升级。".format(winenv.selfcheck_hint()))
     if any(k in low for k in _AUTH_HINTS):
         return "打开一次 WorkBuddy 桌面端即可刷新登录态，之后脚本会自动重试。"
     if any(k in low for k in _NET_HINTS):
-        return "像是网络问题，脚本会在 20 分钟后自动重试；若持续失败，检查网络或代理。"
+        return ("像是网络问题，脚本会在 20 分钟后自动重试。若持续失败，"
+                "检查网络或代理 —— 本工具默认绕过**系统代理**直连；"
+                "若挂着 VPN / 代理，请确认它能访问 codebuddy.cn，"
+                "并确认没有残留的 HTTP_PROXY/HTTPS_PROXY 指向已关闭的端口。")
     return "脚本会在 20 分钟后自动重试；若连续失败，手动跑一次 run_now.cmd 看详细报错。"
 
 
@@ -455,6 +476,30 @@ def _day_finished(state: dict, today: str) -> bool:
             and bool(state.get("claim_done")))
 
 
+def _reshow_pending_notifications() -> None:
+    """用户回到机器前后，把「投递时用户不在场」的通知补弹一次。
+
+    ★ 2026-09-21（用户要求）：Windows 在熄屏 / 长时间无人操作时**不弹横幅**，
+      通知只进通知中心 —— 光把通知设成常驻也没用，那条通知压根没在屏幕上出现过。
+      `winenv` 侧负责「判定不在场 + 记下原文」，这里负责每次触发问一句
+      「用户回来了吗」，回来了就把积压的补弹出来（依旧常驻，点叉才消失）。
+
+    为什么放在静默判定**之前**：夜里回到机器前，也该看到积压的通知。
+    代价极小：正常情况下队列文件不存在，只多做一次文件存在性检查。
+    """
+    if winenv.platform() != "win":
+        return            # 这一层是 Windows 的显示行为兜底，mac 版没有对应问题
+    try:
+        res = winenv.reshow_pending(paths.LOG_DIR)
+    except Exception as e:  # noqa: BLE001
+        log("notify reshow error: {!r}".format(e))
+        return
+    if res.get("resent"):
+        log("notify: 补弹 {} 条（投递时用户不在场）{}".format(
+            res["resent"],
+            "" if not res.get("left") else "，还剩 {} 条".format(res["left"])))
+
+
 def main() -> None:
     """入口：先抢文件锁，再跑 _run()。
 
@@ -462,8 +507,11 @@ def main() -> None:
     撞在同一分钟的概率不再可忽略，而两者都会读 → 改 → 写 state.json。
     锁放在最外层，保证任何退出路径（包括异常）都会释放。
     """
+    # 先补弹积压的本机通知（用户"回来了"就该看到）。放在静默判定之前，理由见该函数。
+    _reshow_pending_notifications()
     if _quiet_now(datetime.datetime.now()):
-        # 静默期：锁不抢、日志不写、state 不读 —— 零落盘开销，只读一次系统时间。
+        # 静默期：不抢锁、不写日志、不读 state —— 只多一次上面那次「补弹队列是否为空」
+        # 的文件存在性检查（通常是 0 次读盘），其余零落盘开销。
         print(json.dumps({"action": "quiet_hours"}, ensure_ascii=False))
         return
     now_ts = time.time()

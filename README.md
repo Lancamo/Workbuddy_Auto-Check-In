@@ -12,7 +12,8 @@ WorkBuddy 桌面端的本地签到与旅行奖励补跑工具，支持 macOS 与
 - 签到、领取、失败和接口异常可推送通知；ClawBot 微信通知不可用时降级为本机通知。
 - 独立 watchdog 监控主任务是否停止运行。
 - 00:00–07:00 与当日签到、领取都完成后立即退出，避免无意义空转。
-- Windows 增加每日 07:00 唤醒任务，电脑睡眠时也能完成当日签到；可用 `--no-wake` 关闭。
+- Windows 增加每日 07:00 与白天每小时唤醒点，电脑睡眠时也能完成当日签到；可用 `--no-wake` / `--no-daywake` 关闭。
+- Windows 本机通知改为右下角卡片，并避免 watchdog 子进程弹出控制台窗口。
 - watchdog 识别预期的静默期，不把正常收工误报为停摆。
 - 运行状态、配置、缓存和日志集中在各平台目录的 `runtime/`，不写入仓库。
 
@@ -52,11 +53,12 @@ install.cmd
 doctor.cmd
 ```
 
-`install.cmd` 会注册三个计划任务：
+`install.cmd` 会注册四个计划任务：
 
 - `WorkBuddyRewardCatchup`：每 5 分钟触发主任务。
 - `WorkBuddyRewardWatchdog`：每 30 分钟检查主任务状态。
 - `WorkBuddyRewardWake`：每天 07:00 唤醒电脑执行主任务；安装时可使用 `--no-wake` 禁用。
+- `WorkBuddyRewardDayWake`：07:00–23:00 每小时一个唤醒点；安装时可使用 `--no-daywake` 禁用。
 
 ## 微信通知
 

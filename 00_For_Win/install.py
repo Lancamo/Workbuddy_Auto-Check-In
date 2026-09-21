@@ -15,9 +15,12 @@ install.py — 注册 / 卸载 / 查看 Windows 计划任务（Task Scheduler）
     （launchd 无对应项）                    DisallowStartIfOnBatteries=false ← 必须显式关，
                                            否则笔记本一拔电源任务就静默不跑
     系统维护唤醒顺带带起计划任务            唤醒任务 WorkBuddyRewardWake（每天 07:00
-    （Power Nap，每 ~16 分钟）             + WakeToRun=true）← 睡眠中也能签到。
-                                           唤醒开关作用于任务的所有触发器，所以它
-                                           必须是独立任务，不能加在 5 分钟轮询上
+    （Power Nap，每 ~16 分钟）             + WakeToRun=true）← 睡眠中也能签到；
+                                           白天唤醒任务 WorkBuddyRewardDayWake
+                                           （07:00 开窗后每小时一次、到 23:00 收窗）
+                                           ← 覆盖「白天睡过去没人叫醒」的那段时间。
+                                           唤醒开关作用于任务的所有触发器，所以它们
+                                           都必须是独立任务，不能加在 5 分钟轮询上
 
 ★ 三个容易踩的坑（都在本文件里处理掉了）
   1. **默认「仅在使用交流电时启动」** —— Windows 计划任务的默认值是 true，
@@ -35,22 +38,24 @@ install.py — 注册 / 卸载 / 查看 Windows 计划任务（Task Scheduler）
 
 命令
 ----
-    python install.py install            # 注册三个计划任务并跑一次自检
+    python install.py install            # 注册四个计划任务并跑一次自检
     python install.py install --dry-run  # 只生成 XML 并打印，不注册
     python install.py install --interval 15
     python install.py install --no-watchdog        # 不装 watchdog
     python install.py install --no-wake            # 不装每日唤醒器（睡眠中不再签到）
-    python install.py uninstall          # 卸载（三个任务一起删）
-    python install.py status             # 查看三个任务的定义与最近运行痕迹
+    python install.py uninstall          # 卸载（四个任务一起删）
+    python install.py status             # 查看四个任务的定义与最近运行痕迹
     python install.py run                # 立即手动跑一次（前台，看得到输出）
     python install.py enable / disable   # 启用 / 停用（不删除）
     python install.py trigger            # 让主任务立即执行一次（验证任务本身可运行）
 
-★ 会注册**三个**任务（对应 mac 版是两个 plist + 系统的维护唤醒）
+★ 会注册**四个**任务（对应 mac 版是两个 plist + 系统的维护唤醒）
   1. WorkBuddyRewardCatchup   —— 每 5 分钟；真正干活的主脚本（WakeToRun=false）
   2. WorkBuddyRewardWatchdog  —— 每 30 分钟；只盯主脚本还活着没，异常时弹本机通知
-  3. WorkBuddyRewardWake      —— 每天 07:00 一次；唯一的 WakeToRun=true，
+  3. WorkBuddyRewardWake      —— 每天 07:00 一次；WakeToRun=true，
                                  负责在电脑睡着时把它叫醒跑签到
+  4. WorkBuddyRewardDayWake   —— 每天 07:00–23:00 每小时一次；同样 WakeToRun=true，
+                                 补上当天白天睡眠时的唤醒窗口
   watchdog 存在的意义：主脚本的所有告警都以「它自己跑起来了」为前提。若计划任务
   被停用/删除、Python 被卸载、项目目录被移走，主脚本会**连告警机制一起静默死掉**。
   唯一出路就是一个完全独立的第二个任务（不共享任何代码）来盯它。
@@ -62,8 +67,10 @@ install.py — 注册 / 卸载 / 查看 Windows 计划任务（Task Scheduler）
 from __future__ import annotations
 
 import argparse
+import codecs
 import datetime
 import json
+import locale
 import os
 import pathlib
 import subprocess
@@ -81,6 +88,33 @@ DEFAULT_TASK_NAME = "WorkBuddyRewardCatchup"
 # 为什么这么密：触发周期的唯一价值是「事件发生后多快被发现」；闸门未开时
 # 只做本地判断就退出、零网络请求，所以代价极小，换来「到达即领」的精度。
 DEFAULT_INTERVAL_MIN = 5
+
+# ★★ Repetition 的 <Duration> 必须写 —— 这是 2026-09-20 实测出来的一个**致命**坑：
+#    `<Repetition>` **省略 <Duration>** 在 Windows 11 上**不等于「无限重复」**，
+#    而是**该触发器永远不触发**！表现极具欺骗性：
+#      · `schtasks /Query /V` 里「重复: 每: 5 分钟」显示得好好的；
+#      · `NextRunTime` 也会每 5 分钟往后滚一格 → 看起来一切正常；
+#      · 但 `LastRunTime` 永远停在注册前，`NumberOfMissedRuns` 一直往上涨，
+#        `LastTaskResult` 恒为 267011（= SCHED_S_TASK_HAS_NOT_RUN）。
+#    实测对照（1 分钟间隔，各跑 3.5 分钟）：
+#      ① 不写 Duration + 有 LogonTrigger  → 触发 0 次
+#      ② 不写 Duration + 无 LogonTrigger  → 触发 0 次
+#      ③ <Duration>P1D</Duration>         → 触发 3 次 ✅
+#    影响：主任务的「每 5 分钟轮询」与 watchdog 的「每 30 分钟心跳」**双双静默失效**，
+#    「猫到达即领」退化成「下次登录时才领」（实测当天领奖被推迟了 59 分钟）。
+#
+#    ★ 取值同样是实测出来的 —— 两个 Task Scheduler 前端对 Duration 的上限**不一致**：
+#      · PowerShell/CIM API（`New-ScheduledTaskTrigger ... -RepetitionDuration
+#        ([TimeSpan]::MaxValue)`）接受并序列化为 `P99999999DT23H59M59S`，
+#        但 **schtasks.exe 会直接拒绝**它：
+#        「任务 XML 包含格式不正确或超出范围的值。(23,42):Duration:P99999999DT23H59M59S」；
+#      · 本项目用 `schtasks /Create /XML` 注册，所以只能取它接受的上限。
+#        实测：P1D / P30D / P365D / P1000D / P3650D / **P9999D 均通过**，
+#        P36500D 与 P99999D 被拒 → 上限在 9999 天附近。
+#      · 取 `P9999D`（≈27 年）：一个窗口覆盖到底，不依赖「次日重新开窗」，
+#        比 `P1D` 少一层耦合。对签到工具而言这就是「无限期」。
+REPETITION_DURATION = "P9999D"
+
 TASK_XML = paths.cache_path("task.xml")  # 注册时实际提交的 XML（UTF-16），留档便于人工核对
 ENTRY = DIR / "catchup.py"
 LOG = paths.log_path("catchup.log")
@@ -105,6 +139,44 @@ WATCHDOG_LOG = paths.log_path("watchdog.log")
 WAKE_TASK_NAME = "WorkBuddyRewardWake"
 WAKE_XML = paths.cache_path("task_wake.xml")
 WAKE_DAILY_AT = "07:00"
+
+# ── 第四个计划任务：白天定时唤醒 ────────────────────────────────────────────
+# 补的是「第三个任务够不着」的那一大段时间 —— 2026-09-21 实测发现：
+#   ① 这台机器**空闲 1~2 分钟就自己睡了**（Kernel-Power 42，睡眠原因 System Idle，
+#      交流下的 STANDBYIDLE 是 0，所以它不是被电源计划催睡的）；
+#   ② 而 `WorkBuddyRewardWake` **每天只响一次**（07:00）。
+#   两者一叠加，白天睡过去之后除「明天 07:00」或「人回来动一下鼠标」之外，
+#   没有任何东西能把它叫醒 —— 晚上的旅行领奖会整段错过。
+# 所以它每 N 分钟唤醒一次，但**只限白天**：触发器从 07:00 开窗、Repetition 的
+# Duration 限定 17 小时，到午夜自动收窗，深夜绝不打扰；第二天同一时刻重新开窗。
+# 和第三个任务一样必须**独立存在**：`<WakeToRun>` 作用于该任务的所有触发器，
+# 开在每 5 分钟轮询的主任务上会把电脑每 5 分钟叫醒一次（见 build_task_xml 的 ★）。
+DAYWAKE_TASK_NAME = "WorkBuddyRewardDayWake"
+DAYWAKE_XML = paths.cache_path("task_daywake.xml")
+DAYWAKE_FROM = WAKE_DAILY_AT     # 与静默期结束 / 签到闸门同值，醒了立刻能干活
+DAYWAKE_TO = "23:00"             # 当天最后一个唤醒点（含）；之后留给深夜，不再打扰
+DAYWAKE_EVERY_MIN = 60           # 默认每小时一个唤醒点（07:00…23:00 共 17 个）
+
+
+def daywake_points(every_min: int = DAYWAKE_EVERY_MIN) -> list[str]:
+    """生成白天的唤醒点列表：`["07:00", "08:00", ...]`。
+
+    ★ 刻意**不用**「一个触发器 + Repetition」那种写法：2026-09-21 实测那样
+    做，任务会按时运行、XML 也对，但**睡着后一次都叫不醒**（`powercfg /waketimers`
+    里根本没有它，最后是用户按电源键才醒的）—— 重复实例不会武装唤醒定时器。
+    只有把每个时刻写成独立的 CalendarTrigger 才有效（07:00 那个任务就是活证据）。
+    """
+    _h, _m = (DAYWAKE_FROM.split(":") + ["0"])[:2]
+    start = int(_h) * 60 + int(_m)
+    _h2, _m2 = (DAYWAKE_TO.split(":") + ["0"])[:2]
+    end = int(_h2) * 60 + int(_m2)
+    step = max(1, int(every_min))
+    out: list[str] = []
+    t = start
+    while t <= end:
+        out.append("{:02d}:{:02d}".format(*divmod(t, 60)))
+        t += step
+    return out
 
 
 def migrate_runtime() -> None:
@@ -146,7 +218,8 @@ def build_task_xml(*, python_exe: str, script: pathlib.Path,
                    user_id: str | None = None,
                    desc: str | None = None,
                    wake_to_run: bool = False,
-                   daily_once_at: str | None = None) -> str:
+                   daily_once_at: str | None = None,
+                   daily_points: list | None = None) -> str:
     """生成计划任务 XML（字符串）。纯函数，可在任何平台上测试。
 
     参数
@@ -163,6 +236,10 @@ def build_task_xml(*, python_exe: str, script: pathlib.Path,
       daily_once_at   "HH:MM"。给定时生成「每天该时刻一次」的最小触发器集合
                       （只留一个 CalendarTrigger，不带 LogonTrigger、不带
                       Repetition）—— 唤醒任务的正确形态
+      daily_points    ["HH:MM", ...]。给定时生成**多个并列的定点触发器**
+                      （每个都是不带 Repetition 的 CalendarTrigger）——
+                      白天唤醒任务的形态。★ 不能用「一个触发器 + Repetition」：
+                      实测重复实例不会武装唤醒定时器，睡着了叫不醒
 
     ★ 为什么 wake_to_run 不能开在轮询任务上
       `<WakeToRun>` 位于 `<Settings>`，作用于该任务的**所有**触发器。轮询任务
@@ -204,6 +281,35 @@ def build_task_xml(*, python_exe: str, script: pathlib.Path,
             "      </ScheduleByDay>\n"
             "    </CalendarTrigger>\n"
         ).format(at=daily_once_at, sb=sb_daily)
+    elif daily_points:
+        # 「每天多个定点」——白天唤醒任务的形态。
+        # ★★ 血泪教训（2026-09-21 实测）：**重复实例不挂唤醒定时器**。
+        #   上一版是「07:00 开窗 + Repetition PT3M + Duration PT17H + WakeToRun」，
+        #   看起来完美：任务确实按时运行、StartBoundary 也对；可 `powercfg /waketimers`
+        #   里**只有 07:00 那个任务**，让它睡下去后 48 分钟一次都没叫醒，最后是用户
+        #   按电源键才醒的（lastwake = 电源按钮）。
+        #   结论：`WakeToRun` 只对**触发器本身的计划起始时刻**生效，
+        #   Repetition 派生出来的那些重复时刻**不会**各自去武装唤醒定时器。
+        #   所以要「白天多次唤醒」，只能把每个时刻写成**独立的 CalendarTrigger**
+        #   （不带 Repetition）—— 与 07:00 那个已被证实有效的形态完全一致。
+        _pts = [str(p) for p in daily_points if str(p).strip()]
+        if not _pts:
+            raise ValueError("daily_points 为空：白天唤醒任务至少要有一个唤醒点")
+        _chunks = [
+            "    <!-- 每天 {at} 一个唤醒点（不带 Repetition：重复实例不会武装唤醒定时器） -->\n"
+            "    <CalendarTrigger>\n"
+            "      <StartBoundary>{sb}</StartBoundary>\n"
+            "      <Enabled>true</Enabled>\n"
+            "      <ScheduleByDay>\n"
+            "        <DaysInterval>1</DaysInterval>\n"
+            "      </ScheduleByDay>\n"
+            "    </CalendarTrigger>\n".format(
+                at=esc(p),
+                sb=esc("{}T{}:00".format(
+                    datetime.date.today().strftime("%Y-%m-%d"), p)))
+            for p in _pts]
+        triggers = ("    <!-- 共 {} 个唤醒点：{} -->\n".format(
+            len(_pts), ", ".join(_pts))) + "".join(_chunks)
     else:
         triggers = (
             "    <!-- 登录后延迟 1 分钟跑一次（等网络与桌面端就绪） -->\n"
@@ -211,19 +317,22 @@ def build_task_xml(*, python_exe: str, script: pathlib.Path,
             "      <Enabled>true</Enabled>\n"
             "{user_xml}      <Delay>PT1M</Delay>\n"
             "    </LogonTrigger>\n"
-            "    <!-- 每 {interval} 分钟一次；不写 Duration = 无限重复 -->\n"
+            "    <!-- 每 {interval} 分钟一次。★ Duration 必须写：省略它并不会「无限重复」，\n"
+            "         而是该触发器**永不触发**（详见文件顶部 REPETITION_DURATION 的说明）。 -->\n"
             "    <CalendarTrigger>\n"
             "      <StartBoundary>{sb}</StartBoundary>\n"
             "      <Enabled>true</Enabled>\n"
             "      <Repetition>\n"
             "        <Interval>PT{interval}M</Interval>\n"
+            "        <Duration>{duration}</Duration>\n"
             "        <StopAtDurationEnd>false</StopAtDurationEnd>\n"
             "      </Repetition>\n"
             "      <ScheduleByDay>\n"
             "        <DaysInterval>1</DaysInterval>\n"
             "      </ScheduleByDay>\n"
             "    </CalendarTrigger>\n"
-        ).format(user_xml=user_xml, interval=int(interval_min), sb=esc(sb))
+        ).format(user_xml=user_xml, interval=int(interval_min), sb=esc(sb),
+                 duration=REPETITION_DURATION)
 
     return """<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -299,12 +408,68 @@ def write_task_xml(xml: str, path: pathlib.Path = TASK_XML) -> pathlib.Path:
 # ---------------------------------------------------------------------------
 # schtasks 封装
 # ---------------------------------------------------------------------------
+def decode_process_output(data: bytes) -> str:
+    """Decode Windows command output without assuming it is UTF-8.
+
+    `schtasks /Query /XML` may emit UTF-16LE, UTF-8 with BOM, or the active
+    Windows code page depending on the Windows build and whether stdout is a
+    console or a pipe. Hard-decoding it as UTF-8 makes valid task XML look
+    corrupted, which then causes false warnings in doctor.py.
+    """
+    if not data:
+        return ""
+    for bom, encoding in ((codecs.BOM_UTF8, "utf-8-sig"),
+                          (codecs.BOM_UTF16_LE, "utf-16"),
+                          (codecs.BOM_UTF16_BE, "utf-16")):
+        if data.startswith(bom):
+            try:
+                return data.decode(encoding)
+            except UnicodeDecodeError:
+                pass
+
+    # UTF-16 without a BOM is still common. ASCII XML contains NUL in every
+    # other byte, which gives us a reliable byte-order signal.
+    sample = data[:4096]
+    even_nuls = sample[::2].count(b"\x00")
+    odd_nuls = sample[1::2].count(b"\x00")
+    if even_nuls or odd_nuls:
+        encoding = "utf-16-be" if even_nuls > odd_nuls else "utf-16-le"
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+
+    fallbacks = [locale.getpreferredencoding(False), "gb18030", "cp1252"]
+    for encoding in dict.fromkeys(e for e in fallbacks if e):
+        if encoding.lower().replace("_", "-") in {"utf-8", "utf8"}:
+            continue
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            pass
+
+    for encoding in dict.fromkeys(e for e in fallbacks if e):
+        try:
+            return data.decode(encoding, errors="replace")
+        except LookupError:
+            pass
+    return data.decode("utf-8", errors="replace")
+
+
 def _run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout,
-        encoding="utf-8", errors="replace",
+    p = subprocess.run(
+        cmd, capture_output=True, timeout=timeout,
         env=winenv.subprocess_env(), **winenv.subprocess_flags(),
     )
+    p.stdout = decode_process_output(p.stdout or b"")
+    p.stderr = decode_process_output(p.stderr or b"")
+    return p
 
 
 def task_query_xml(name: str) -> tuple[bool, str]:
@@ -316,6 +481,119 @@ def task_query_xml(name: str) -> tuple[bool, str]:
     if p.returncode != 0:
         return False, ((p.stderr or p.stdout or "").strip()[:400] or "任务不存在")
     return True, p.stdout or ""
+
+
+def task_settings_from_xml(xml: str) -> dict:
+    """Return the task fields used by install.py and doctor.py.
+
+    Keeping one parser prevents the installer and the diagnostic command from
+    disagreeing about the same Windows task definition.
+    """
+    root = ET.fromstring(xml)
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+
+    def txt(path: str):
+        element = root.find(path, ns)
+        return element.text.strip() if (element is not None and element.text) else None
+
+    return {
+        "interval": txt(".//t:Repetition/t:Interval"),
+        "start_when_available": txt(".//t:StartWhenAvailable"),
+        "disallow_start_if_on_batteries": txt(".//t:DisallowStartIfOnBatteries"),
+        "wake_to_run": txt(".//t:WakeToRun"),
+        "run_level": txt(".//t:Principal/t:RunLevel"),
+        "logon_type": txt(".//t:Principal/t:LogonType"),
+        "command": txt(".//t:Actions/t:Exec/t:Command"),
+        "arguments": txt(".//t:Actions/t:Exec/t:Arguments"),
+        "working_directory": txt(".//t:Actions/t:Exec/t:WorkingDirectory"),
+    }
+
+
+def task_live_settings(name: str) -> dict | None:
+    """Read effective task settings through PowerShell when XML omits a field.
+
+    Some Windows versions normalize or omit optional XML elements in
+    `schtasks /Query /XML`. PowerShell exposes the effective Task Scheduler
+    settings directly, so doctor.py can distinguish "not emitted" from
+    "actually disabled" without guessing.
+    """
+    if winenv.platform() != "win":
+        return None
+    safe_name = str(name).replace("'", "''")
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$s=(Get-ScheduledTask -TaskName '{}').Settings;"
+        "[pscustomobject]@{{"
+        "start_when_available=[bool]$s.StartWhenAvailable;"
+        "disallow_start_if_on_batteries=[bool]$s.DisallowStartIfOnBatteries;"
+        "wake_to_run=[bool]$s.WakeToRun"
+        "}}|ConvertTo-Json -Compress"
+    ).format(safe_name)
+    try:
+        p = _run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+                  "-Command", script], timeout=30)
+    except Exception:  # noqa: BLE001
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        data = json.loads((p.stdout or "").strip())
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {
+        "start_when_available": ("true" if data.get("start_when_available") else "false"),
+        "disallow_start_if_on_batteries": (
+            "true" if data.get("disallow_start_if_on_batteries") else "false"),
+        "wake_to_run": ("true" if data.get("wake_to_run") else "false"),
+    }
+
+
+def task_run_info(name: str) -> dict | None:
+    """最近一次 / 下一次运行信息（LastRunTime / LastTaskResult / NextRunTime）。
+
+    为什么必须有：0x8007010B 那次事故里，任务「已注册、设置全对」，却**每次触发都
+    秒失败**，而 `status` 只核对「在不在 + 设置对不对」，从没看过「最近一次到底
+    跑成没有」—— 运行痕迹在 XML 里查不到，只能问调度器本身（Get-ScheduledTaskInfo）。
+    字段名用 PowerShell 的属性取，**不解析 `schtasks /FO LIST` 的中文列名**。
+    """
+    if winenv.platform() != "win":
+        return None
+    safe_name = str(name).replace("'", "''")
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$i=Get-ScheduledTaskInfo -TaskName '{}';"
+        "[pscustomobject]@{{"
+        "last_run_time=$i.LastRunTime.ToString('yyyy-MM-dd HH:mm:ss');"
+        "last_task_result=$i.LastTaskResult;"
+        "next_run_time=$i.NextRunTime.ToString('yyyy-MM-dd HH:mm:ss')"
+        "}}|ConvertTo-Json -Compress"
+    ).format(safe_name)
+    try:
+        p = _run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+                  "-Command", script], timeout=30)
+    except Exception:  # noqa: BLE001
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        data = json.loads((p.stdout or "").strip())
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        code = int(data.get("last_task_result") or 0)
+    except (TypeError, ValueError):
+        code = -1
+    return {
+        "last_run_time": data.get("last_run_time"),
+        "last_task_result": code,
+        # 0 = 成功；267011 (0x41303) = 任务尚未运行过；其余都值得看一眼
+        "last_task_result_ok": code in (0, 267011),
+        "next_run_time": data.get("next_run_time"),
+    }
 
 
 def task_raw_query(name: str) -> str:
@@ -414,7 +692,7 @@ def _task_specs(args: argparse.Namespace) -> list[dict]:
     """要注册/查询的任务清单：主任务 + watchdog + 每日唤醒
     （`--no-watchdog` / `--no-wake` 可各自去掉）。
 
-    三个任务共用同一份 XML 生成逻辑，只是脚本、任务名、触发器、描述不同 ——
+    四个任务共用同一份 XML 生成逻辑，只是脚本、任务名、触发器、描述不同 ——
     这保证 watchdog 也自动获得 LogonTrigger / StartWhenAvailable / 电池可跑 /
     无控制台窗口这些「不设就静默失效」的关键设置。
 
@@ -463,11 +741,65 @@ def _task_specs(args: argparse.Namespace) -> list[dict]:
             "wake_to_run": True,
             "daily_once_at": WAKE_DAILY_AT,
         })
+    if not getattr(args, "no_daywake", False):
+        dname = getattr(args, "daywake_name", DAYWAKE_TASK_NAME)
+        raw_points = getattr(args, "daywake_points", "") or ""
+        if raw_points.strip():
+            pts = [p.strip() for p in raw_points.replace("，", ",").split(",")
+                   if p.strip()]
+        else:
+            pts = daywake_points(getattr(args, "daywake_every", DAYWAKE_EVERY_MIN))
+        specs.append({
+            "kind": "daywake",
+            "name": dname,
+            "script": ENTRY,          # 与主任务同一入口：幂等，醒了直接就能干活
+            "interval": 0,            # 每个唤醒点都是独立触发器，此字段不参与生成
+            "xml": (out_xml.with_name("task_daywake.xml") if args.xml_out
+                    else DAYWAKE_XML),
+            "desc": ("WorkBuddy 积分「白天定时唤醒器」。每天在 {} 这 {} 个时刻各唤醒一次"
+                     "（每 {} 分钟一个点）—— 补的就是 07:00 那个任务够不着的白天时段："
+                     "本机实测空闲 1~2 分钟就自己睡了，睡着后没人叫醒，旅行领奖会整段错过。"
+                     "深夜刻意不唤醒：{} 之后当天不再有唤醒点。"
+                     "★ 每个时刻写成独立触发器而**不是**一个触发器加 Repetition："
+                     "实测重复实例不会武装唤醒定时器，那样睡着了叫不醒。").format(
+                         "、".join(pts[:4]) + ("…" if len(pts) > 4 else ""), len(pts),
+                         getattr(args, "daywake_every", DAYWAKE_EVERY_MIN), DAYWAKE_TO),
+            "log": LOG,
+            "wake_to_run": True,
+            "daily_points": pts,
+        })
     return specs
+
+
+def windows_guard(action: str) -> dict | None:
+    """非 Windows 上统一早退：返回失败结构；在 Windows 上返回 None。
+
+    为什么要抽出来（而不是各处 `if not winenv.IS_WIN`）：
+      · 原来 5 处各写一遍同一句「当前不是 Windows」，措辞还都不一样；
+      · 更关键的是它读的是模块级常量 `IS_WIN` —— 那是**导入时就固定**的值，
+        自检无法把平台翻过去验证这条守卫。结果就是「非 Windows 必须明确报错」
+        这条不变量在测试里只能靠**真的去注册一个计划任务**来间接验证：既验错了
+        对象，又在目标机上留下了系统痕迹。
+      改调 `winenv.platform()` 之后，自检可以直接翻转平台断言这条守卫。
+    """
+    if winenv.platform() == "win":
+        return None
+    return {"ok": False, "error": "当前不是 Windows，无法{}".format(action)}
 
 
 def cmd_install(args: argparse.Namespace) -> int:
     migrate_runtime()
+    # ★ 非 Windows 且非 dry-run：在**任何落盘 / 注册动作之前**就明确失败。
+    #   旧实现把守卫放在「XML 已写出、正要调 schtasks」那一步，代价是：
+    #     · 非 Windows 上会先在项目里留下一堆 XML 才报错（本不该有的副作用）；
+    #     · Windows 上自检本想验证「非 Windows 会失败」，却因为机器真在 Windows 上
+    #       而**真的注册并覆盖了一个计划任务** —— 一个自检不该改系统。
+    #   dry-run 不受影响：它的契约就是「只生成 XML 不注册，可在 mac 上审阅」。
+    if not args.dry_run:
+        blocked = windows_guard("注册计划任务（只想生成 XML 审阅请加 --dry-run）")
+        if blocked:
+            _print(blocked)
+            return 1
     if args.python:
         python_exe = args.python
     else:
@@ -490,7 +822,8 @@ def cmd_install(args: argparse.Namespace) -> int:
         xml = build_task_xml(python_exe=python_exe, script=sp["script"], workdir=DIR,
                              interval_min=sp["interval"], name=sp["name"], desc=sp["desc"],
                              wake_to_run=sp.get("wake_to_run", False),
-                             daily_once_at=sp.get("daily_once_at"))
+                             daily_once_at=sp.get("daily_once_at"),
+                             daily_points=sp.get("daily_points"))
         # 先在内存里解析一遍，保证 XML 合法（不合法的 XML 会让 schtasks 报难懂的错）
         try:
             ET.fromstring(xml)
@@ -507,12 +840,7 @@ def cmd_install(args: argparse.Namespace) -> int:
             results.append(item)
             continue
 
-        if not winenv.IS_WIN:
-            item.update({"ok": False,
-                         "error": "当前不是 Windows，无法注册计划任务（已生成 XML 供审阅）"})
-            results.append(item)
-            continue
-
+        # 平台守卫已在函数开头统一做过（非 Windows 会提前返回），此处无需重复判断。
         ok, msg = install_task(sp["name"], path)
         item["ok"] = ok
         item["schtasks"] = msg
@@ -548,30 +876,35 @@ def cmd_install(args: argparse.Namespace) -> int:
 
     if not args.dry_run:
         out["next_step"] = ("安装完成。主任务每 {} 分钟跑一次，watchdog 每 {} 分钟跑一次，"
-                            "两者在登录时各跑一次；唤醒任务每天 {} 触发一次、必要时会"
-                            "叫醒睡眠中的电脑。可随时用 `python install.py status` 查看。"
+                            "两者在登录时各跑一次；唤醒任务每天 {} 触发一次，白天唤醒任务"
+                            "从 {} 起每 {} 分钟一次（到午夜收窗）—— 睡着时由它们叫醒。"
+                            "可随时用 `python install.py status` 查看。"
                             ).format(args.interval,
                                      getattr(args, "watchdog_interval",
                                              DEFAULT_WATCHDOG_INTERVAL_MIN),
-                                     WAKE_DAILY_AT)
+                                     WAKE_DAILY_AT, DAYWAKE_FROM,
+                                     getattr(args, "daywake_every", DAYWAKE_EVERY_MIN))
     _print(out)
     return 0
 
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
-    if not winenv.IS_WIN:
-        _print({"ok": False, "error": "当前不是 Windows"})
+    blocked = windows_guard("卸载计划任务")
+    if blocked:
+        _print(blocked)
         return 1
     names = [args.name]
     if not getattr(args, "no_watchdog", False):
         names.append(getattr(args, "watchdog_name", WATCHDOG_TASK_NAME))
     if not getattr(args, "no_wake", False):
         names.append(getattr(args, "wake_name", WAKE_TASK_NAME))
+    if not getattr(args, "no_daywake", False):
+        names.append(getattr(args, "daywake_name", DAYWAKE_TASK_NAME))
     tasks = []
     for n in names:
         ok, msg = delete_task(n)
         tasks.append({"task_name": n, "ok": ok, "schtasks": msg})
-    # 三个任务里至少删掉一个就算成功；都没删掉（例如本来就没装）也能接受，
+    # 四个任务里至少删掉一个就算成功；都没删掉（例如本来就没装）也能接受，
     # 因为 uninstall 的语义是「确保不再自动触发」，是幂等的。
     any_ok = any(t["ok"] for t in tasks)
     _print({"ok": any_ok, "tasks": tasks,
@@ -584,7 +917,8 @@ _NS = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
 
 def _task_block(name: str, xml_path: pathlib.Path, log_path: pathlib.Path) -> dict:
     """单个计划任务的状态快照（供 status / 自检复用）。"""
-    exists, xml_or_err = task_query_xml(name) if winenv.IS_WIN else (False, "非 Windows 环境")
+    exists, xml_or_err = (task_query_xml(name) if winenv.platform() == "win"
+                          else (False, "非 Windows 环境"))
     blk: dict = {
         "task_name": name,
         "task_registered": bool(exists),
@@ -599,31 +933,23 @@ def _task_block(name: str, xml_path: pathlib.Path, log_path: pathlib.Path) -> di
     if exists:
         # 从 XML 解析出关键设置（与系统语言无关），逐项核对是否真的生效
         try:
-            root = ET.fromstring(xml_or_err)
-
-            def txt(p, d=None):
-                e = root.find(p, _NS)
-                return e.text if (e is not None and e.text) else d
-            blk["task_settings"] = {
-                "interval": txt(".//t:Repetition/t:Interval"),
-                "start_when_available": txt(".//t:StartWhenAvailable"),
-                "disallow_start_if_on_batteries": txt(".//t:DisallowStartIfOnBatteries"),
-                "run_level": txt(".//t:Principal/t:RunLevel"),
-                "logon_type": txt(".//t:Principal/t:LogonType"),
-                "command": txt(".//t:Actions/t:Exec/t:Command"),
-                "arguments": txt(".//t:Actions/t:Exec/t:Arguments"),
-                "working_directory": txt(".//t:Actions/t:Exec/t:WorkingDirectory"),
-            }
-            blk["task_settings_note"] = ("核对三项：interval 应为 PT{n}M；"
+            blk["task_settings"] = task_settings_from_xml(xml_or_err)
+            # interval 从 XML 读出来已经是「PT5M」这种完整形式，别再套一层 `PT{}M` ——
+            # 旧写法会拼成「PTPT5MM」，一个根本不存在的值，照它去核对永远对不上。
+            blk["task_settings_note"] = ("核对三项：interval 应为 {n}；"
                                          "start_when_available 应为 true（错过的触发会补跑）；"
                                          "disallow_start_if_on_batteries 应为 false（电池下也跑）"
                                          ).format(n=blk["task_settings"].get("interval"))
         except Exception as e:  # noqa: BLE001
             blk["task_xml_parse_error"] = repr(e)[:160]
+        # ★ 最近一次到底跑成没有 —— 「设置全对却每次都失败」的那种静默故障
+        #   （如搬迁后的 0x8007010B）只有看运行痕迹才能发现。
+        blk["task_run_info"] = task_run_info(name)
     else:
         blk["task_query_message"] = str(xml_or_err)[:300]
 
-    blk["raw_query"] = task_raw_query(name) if winenv.IS_WIN else "(非 Windows 环境跳过)"
+    blk["raw_query"] = (task_raw_query(name) if winenv.platform() == "win"
+                        else "(非 Windows 环境跳过)")
     return blk
 
 
@@ -666,6 +992,25 @@ def cmd_status(args: argparse.Namespace) -> int:
             out["wake_task_name"] = blk["task_name"]
             out["wake_registered"] = blk["task_registered"]
             out["wake_task_settings"] = blk.get("task_settings")
+        elif sp["kind"] == "daywake":
+            out["daywake_task_name"] = blk["task_name"]
+            out["daywake_registered"] = blk["task_registered"]
+            out["daywake_task_settings"] = blk.get("task_settings")
+
+    # 顶层给出四个任务最近一次运行的一句话摘要（人先看这里，细节在各 task 块里）
+    _runs = []
+    for sp, blk in zip(specs, out["tasks"]):
+        ri = blk.get("task_run_info") or {}
+        if ri:
+            _runs.append("{}: last={} result={} ok={}".format(
+                blk["task_name"], ri.get("last_run_time"),
+                ri.get("last_task_result"), ri.get("last_task_result_ok")))
+    if _runs:
+        out["last_runs"] = _runs
+        _bad = [r for r in _runs if "ok=False" in r]
+        if _bad:
+            out["last_runs_alert"] = ("有任务最近一次运行失败（见 last_runs）—— "
+                                      "先核对任务指向的路径是否存在、解释器是否还在")
 
     _print(out)
     return 0
@@ -678,8 +1023,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_toggle(args: argparse.Namespace, enable: bool) -> int:
-    if not winenv.IS_WIN:
-        _print({"ok": False, "error": "当前不是 Windows"})
+    blocked = windows_guard("启用 / 停用计划任务")
+    if blocked:
+        _print(blocked)
         return 1
     ok, msg = change_task(args.name, enable)
     _print({"ok": ok, "task_name": args.name,
@@ -689,8 +1035,9 @@ def cmd_toggle(args: argparse.Namespace, enable: bool) -> int:
 
 def cmd_trigger(args: argparse.Namespace) -> int:
     """让计划任务**立即执行**（验证任务本身能不能跑起来，而不是验证脚本）。"""
-    if not winenv.IS_WIN:
-        _print({"ok": False, "error": "当前不是 Windows"})
+    blocked = windows_guard("立即触发计划任务")
+    if blocked:
+        _print(blocked)
         return 1
     ok, msg = run_task_now(args.name)
     _print({"ok": ok, "task_name": args.name, "schtasks": msg,
@@ -723,6 +1070,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-wake", action="store_true",
                     help="不注册每日唤醒任务（默认会注册第三个计划任务；"
                          "关了它，睡眠中的电脑就不会被叫醒跑签到）")
+    ap.add_argument("--daywake-name", default=DAYWAKE_TASK_NAME,
+                    help="白天唤醒任务名（默认 {}）".format(DAYWAKE_TASK_NAME))
+    ap.add_argument("--daywake-every", type=int, default=DAYWAKE_EVERY_MIN,
+                    help="白天每隔多少分钟设一个唤醒点（默认 {}；"
+                         "生成的时刻一律写成独立触发器，不加 Repetition —— "
+                         "实测重复实例叫不醒睡眠中的电脑）".format(DAYWAKE_EVERY_MIN))
+    ap.add_argument("--daywake-points", default="",
+                    help="直接指定唤醒点，如 \"07:30,12:00,19:30\"（给了它就忽略"
+                         "--daywake-every）")
+    ap.add_argument("--no-daywake", action="store_true",
+                    help="不注册白天唤醒任务（默认会注册第四个计划任务；"
+                         "关了它，白天睡着的电脑只能等明天 07:00 或你自己动一下鼠标）")
 
     try:
         args = ap.parse_args(rest)

@@ -264,11 +264,21 @@ def _scan(force: bool = False) -> dict:
             result["scan_error"] = repr(e)[:200]
 
     # ---- 变更检测：与上一次记录的端点集比对，记录变更历史 ----
+    # ★ 只在「本次与上次**都是**权威扫描（source=asar）」时才判定变化。
+    #   为什么要卡这一条：客户端定位失败时本函数会退回内置兜底表（source=fallback），
+    #   那**不是**「端点变了」，而是「这次没能读到权威来源」——两码事。
+    #   不区分的话，一次读取抖动就会给用户推一条「接口已自动切换」：
+    #   2026-09-20 实测踩到（客户端路径探测失败 → 立刻误报端点变化 →
+    #   catchup 推 warning 通知）。更坏的是它会稀释这个告警的可信度，
+    #   把「真正该重视的接口漂移」淹没在噪音里。
     old_status = prev.get("status_paths") or []
     old_claim = prev.get("claim_paths") or []
     hist = list(prev.get("history") or [])
-    changed = bool(old_status and (old_status != result["status_paths"]
-                                   or old_claim != result["claim_paths"]))
+    degraded = result["source"] != "asar"
+    authoritative = (not degraded) and prev.get("source") == "asar"
+    changed = bool(authoritative and old_status
+                   and (old_status != result["status_paths"]
+                        or old_claim != result["claim_paths"]))
     result["changed"] = changed
     if changed:
         result["changed_from"] = {"status_paths": old_status, "claim_paths": old_claim}
@@ -281,8 +291,25 @@ def _scan(force: bool = False) -> dict:
         })
     result["history"] = hist[-40:]
 
+    # ★ 兜底扫描的结果不得覆盖权威基线。
+    #   原因同上：把兜底表写进缓存，等于把「上次真实读到的端点」抹掉，
+    #   于是下一次成功扫描又会与兜底基线比对、**反向再误报一次**变化。
+    #   正确语义是「缓存 = 最后一次权威扫描的结果」，本次读取失败单独记一笔。
+    to_write = result
+    if degraded and prev.get("source") == "asar":
+        to_write = dict(result)
+        for key in ("fingerprint", "billing_prefix", "status_names", "claim_names",
+                    "status_paths", "claim_paths",
+                    "preferred_status", "preferred_claim", "scanned_at"):
+            if prev.get(key) is not None:
+                to_write[key] = prev[key]
+        to_write["source"] = "asar"
+        to_write["degraded_scan_at"] = result["scanned_at"]
+        to_write["degraded_scan_reason"] = (result.get("scan_error")
+                                            or "客户端未定位，已退回内置兜底表")
+
     try:
-        CACHE.write_text(json.dumps(result, ensure_ascii=False, indent=1),
+        CACHE.write_text(json.dumps(to_write, ensure_ascii=False, indent=1),
                          encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass

@@ -78,10 +78,23 @@ class HttpTransportError(RuntimeError):
 
 
 def _parse_json(raw: str) -> dict:
+    """把响应体解析成 dict —— **保证返回 dict**，调用方一律可以直接 .get()。
+
+    ★ 为什么必须保证类型，而不只是挡住「不是 JSON」：
+      合法 JSON 的顶层**可以**是数组或标量（网关错误页、被包成 [] 的空响应、
+      `"ok"` 这样的裸字符串都会解析成功）。旧实现直接 `return json.loads(raw)`，
+      于是 checkin.py / travel.py 里的 `body.get("code")` 会抛 AttributeError——
+      而它们只捕 HttpTransportError / CredentialError，异常会一路穿透到 main.py
+      变成一段 traceback，当天签到直接空转，直到 MAX_TRIES 用完。
+      这里多一层 isinstance 判断，把「形状不对」也归进同一个哨兵返回。
+    """
     try:
-        return json.loads(raw)
+        obj = json.loads(raw)
     except Exception:
         return {"__non_json__": True}
+    if not isinstance(obj, dict):
+        return {"__non_json__": True, "__json_type__": type(obj).__name__}
+    return obj
 
 
 def request_json(

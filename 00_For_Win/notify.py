@@ -170,8 +170,15 @@ def _load_state() -> dict:
         if STATE.exists():
             d = json.loads(STATE.read_text(encoding="utf-8"))
             if isinstance(d, dict):
-                d.setdefault("sent", {})
-                d.setdefault("local_sent", {})
+                # ★ 必须**强制**成 dict，而不是 setdefault。
+                #   setdefault 只在「键不存在」时补齐；若文件被手工改坏或被别的版本
+                #   写成 list/字符串，键是存在的、值却不是 dict，后面那几处
+                #   `.<items()>` / `.get(fp)` 就会抛 AttributeError —— 而 send()
+                #   对外承诺「永不抛异常」，异常会直接穿透到调用方。
+                #   这里是唯一的入口，就地收口最省事。
+                for _k in ("sent", "local_sent"):
+                    if not isinstance(d.get(_k), dict):
+                        d[_k] = {}
                 return d
     except Exception:  # noqa: BLE001
         pass
@@ -435,14 +442,28 @@ def _reg_get(path: str, name: str):
     if not winenv.IS_WIN:
         return None
     try:
+        # ★ 取 bytes 自己解，不能用 `text=True`：它按 locale 解码，而 locale 会漂移
+        #   （开了 PYTHONUTF8/LANG=C.UTF-8 的进程里是 utf-8，Windows 命令给的却是 GBK）。
+        #   实测本机 `reg query` 查不到键时那句中文报错是 GBK，会在 reader 线程里抛
+        #   UnicodeDecodeError —— 用户看到一段 traceback，值被静默当成「读不到」。
+        #   详见 winenv.decode_console 的说明。
         r = subprocess.run(["reg", "query", path, "/v", name],
-                           capture_output=True, text=True, timeout=8)
+                           capture_output=True, timeout=8)
         if r.returncode != 0:
             return None
-        for line in r.stdout.splitlines():
+        for line in winenv.decode_console(r.stdout or b"").splitlines():
             parts = line.split()
             if len(parts) >= 3 and parts[0] == name:
-                return parts[-1]
+                # ★ DWORD 在 `reg query` 里是 `0x1` / `0x0` 形式，必须归一成 1 / 0 再返回。
+                #   2026-09-21 实测踩到：调用方拿返回值去查 {"1": "开", "0": "关"}，
+                #   于是 `0x1`（开）显示成「读不到」，而 `0x0`（**已被关掉**）
+                #   同样落进「读不到（按默认开处理）」—— 这条检查本来就是为了抓住
+                #   「系统通知被关、本机兜底全部静默消失」这个场景，判错就等于它不存在。
+                raw = parts[-1].strip().lower()
+                try:
+                    return str(int(raw, 0))
+                except ValueError:
+                    return raw
     except Exception:  # noqa: BLE001
         return None
     return None
@@ -465,6 +486,12 @@ def local_check() -> dict:
                          "ToastEnabled")
         out["toast_enabled_registry"] = {"1": "开", "0": "关（本机通知会被系统丢弃）"}.get(
             str(toast), "读不到（按默认「开」处理）")
+        # ★ 2026-09-21：本机通道默认已经不是 Toast 了 —— 是**必须点掉的弹窗**
+        #   （Toast 实测"过一会儿就自己收走"）。这里如实报出实际通道，
+        #   免得 status 显示的 backend 与真正弹出的东西对不上，把人带偏。
+        style = winenv._alert_style()
+        out["alert_style"] = style
+        out["backend"] = "windows-dialog（必须点掉）" if style == "dialog" else "windows-toast"
         out["focus"] = "unknown"
         out["focus_note"] = ("Windows 的专注助手状态没有稳定的公开读取方式，这里不假装能判断；"
                              "若怀疑被吞，请看下面的兜底日志。")
@@ -504,18 +531,27 @@ def _alert_channel_expired(st: dict, cfg: dict, now: float, kind: str = "session
     key = "channel_alert_date" if kind == "session" else "channel_alert_blocked_date"
     if st.get(key) == _today():
         return False
-    st[key] = _today()
     if kind == "blocked":
-        return _send_native(
+        ok = _send_native(
             "⚠️ 微信拒收积分通知（通道未失效，但发不出去）",
             "服务端拒绝投递主动消息（prepare failed）。请在微信里给机器人"
             "随便发一条消息（例如「1」）重新开窗，推送随即自动恢复 —— 不需要重新扫码。",
         )
-    return _send_native(
-        "⚠️ 微信推送通道已失效，积分通知发不出去",
-        "ClawBot 登录会话过期。请在 WorkBuddy 设置 → 远程通道里"
-        "重新连接「微信助理」，扫码后即恢复。",
-    )
+    else:
+        ok = _send_native(
+            "⚠️ 微信推送通道已失效，积分通知发不出去",
+            "ClawBot 登录会话过期。请在 WorkBuddy 设置 → 远程通道里"
+            "重新连接「微信助理」，扫码后即恢复。",
+        )
+    # ★ 只有**真的弹出来**才记「今天已告警」。
+    #   旧写法是 `st[key] = _today()` 写在发送之前 —— 本机 Toast 一旦发不出去
+    #   （系统通知被关掉、没有交互式桌面会话、pythonw 无窗口站），这条告警就被
+    #   永久吞掉一整天：用户既收不到微信、也收不到本机通知，日志里还显示「已告警」。
+    #   这正是本项目最忌讳的静默失效，而且和两张去重表同一条原则：
+    #   **只有真的送达，才配记账。**
+    if ok:
+        st[key] = _today()
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +620,11 @@ def send(title: str, content: str, level: str = "info", force: bool = False) -> 
         if not out["reason"]:
             out["reason"] = "无可用微信通道（请在 WorkBuddy 绑定 ClawBot，或配置 pushplus/serverchan 凭据）"
         if _local_fallback():
+            # ★ 本机确实弹出来了 → 对调用方而言就是「有人看到了」，必须置 sent。
+            #   旧写法只写了 local_sent 指纹却不置 sent，于是 catchup.log 里显示
+            #   `sent=False ... reason=已降级为本机通知` —— 日志自相矛盾，
+            #   排障时按 README 第 6 节去看 `sent=…` 会得出「根本没送到」的错误结论。
+            out["sent"] = True
             st.setdefault("local_sent", {})[fp] = now
         _prune_sent(st, now)
         _save_state(st)
@@ -598,6 +639,7 @@ def send(title: str, content: str, level: str = "info", force: bool = False) -> 
     if cap > 0 and used >= cap:
         out["reason"] = "已达今日微信请求上限 {}/{}，降级为本机通知".format(used, cap)
         if _local_fallback():
+            out["sent"] = True          # 理由同上：本机送到了就该算送达
             st.setdefault("local_sent", {})[fp] = now
         _prune_sent(st, now)
         _save_state(st)
@@ -621,11 +663,21 @@ def send(title: str, content: str, level: str = "info", force: bool = False) -> 
                     kind = "session"          # 登录失效：必须重新扫码
                 elif clawbot is not None and clawbot.DELIVER_BLOCKED_MARK in r_str:
                     kind = "blocked"          # 投递被拒：用户发条消息即可恢复
+                elif (clawbot is not None
+                      and getattr(clawbot, "TOKEN_MISSING_MARK",
+                                  "缺 context_token") in r_str):
+                    # 缺 context_token：服务端已受理并计入配额，但消息永远到不了微信；
+                    # 只能等用户给 bot 发消息刷新令牌。把它当「网络抖动」按 20 分钟短冷却
+                    # 反复重试毫无意义 —— 每次都在白烧 iLink 每日配额（默认 8 条），
+                    # 结果是把配额耗尽、连本该能送达的通知也只能降级成本机弹窗。
+                    # 归进「要等人工动作」那一档（与 blocked 同为 60 分钟）。
+                    kind = "token_missing"
                 else:
                     kind = "other"            # 网络/未知：短冷却，允许较早重试
                 cd_key = {
                     "session": "clawbot_cooldown_minutes",
                     "blocked": "clawbot_blocked_cooldown_minutes",
+                    "token_missing": "clawbot_blocked_cooldown_minutes",
                     "other": "clawbot_failure_cooldown_minutes",
                 }[kind]
                 try:
@@ -633,12 +685,14 @@ def send(title: str, content: str, level: str = "info", force: bool = False) -> 
                 except (TypeError, ValueError):
                     cd = 0
                 _set_clawbot_cooldown(st, cd, now)
-                if kind == "blocked":
+                if kind in ("blocked", "token_missing"):
                     # 记下失败时刻的用户活动基线：之后只要用户再发过消息，
-                    # 冷却就该立刻解除（告警文案承诺的是"发一条消息即刻恢复"）
+                    # 冷却就该立刻解除（这两种故障的恢复动作都是「发一条消息」）
                     st["cooldown_context_ts"] = _current_inbound_ts()
                 if kind in ("session", "blocked"):
-                    # 额外弹一条明确告警，避免用户把"降级后的本机通知"误当成通道正常
+                    # 额外弹一条明确告警，避免用户把"降级后的本机通知"误当成通道正常。
+                    # 刻意不含 token_missing：缺令牌的失败文案本身已经说清了原因与动作，
+                    # 而复用 blocked 的告警会把原因错写成「prepare failed」。
                     out["channel_expired_alert"] = _alert_channel_expired(st, cfg, now, kind)
                 out["cooldown_min"] = cd
 

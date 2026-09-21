@@ -93,7 +93,11 @@ def check_env(r: Report) -> None:
                "或用 `py -3` 重新注册计划任务（install.py --python）。")
 
     exe = winenv.default_python(windowless=True)
-    paths = winenv.python_exe_paths()
+    # 变量名刻意不叫 `paths`：本模块顶部 `import paths`（第 43 行），
+    # 用同名局部变量会把它遮住 —— 现在只在这一行用到所以没炸，
+    # 但只要以后在本函数里写一句 `paths.log_path(...)`，就会静默变成
+    # 「dict 没有 log_path 属性」，而且只在运行时才暴露。
+    exe_paths = winenv.python_exe_paths()
     r.ok("计划任务将使用的解释器", exe)
     if winenv.IS_WIN and pathlib.Path(exe).name.lower() != "pythonw.exe":
         r.warn("解释器不是 pythonw.exe",
@@ -110,7 +114,7 @@ def check_env(r: Report) -> None:
                "但若遇到诡异问题，优先怀疑这里——换成纯英文无空格的路径可排除干扰。")
     else:
         r.ok("项目路径", s)
-    r.ok("Python 探测结果", paths)
+    r.ok("Python 探测结果", exe_paths)
 
 
 # ---------------------------------------------------------------------------
@@ -257,16 +261,16 @@ def check_clawbot(r: Report) -> None:
     if hit:
         r.ok("settings.json 已定位", hit["path"])
     else:
-        r.fail("找不到 settings.json", "所有候选都不存在",
-               "说明本机 WorkBuddy 还没绑定「微信助理」，或数据目录在别处。"
-               "不影响签到，但微信推送会降级成本机通知。")
+        r.warn("找不到 settings.json", "所有候选都不存在",
+               "不影响签到；但微信推送会降级成本机通知。"
+               "若已绑定「微信助理」，请用 win_paths.json 指定实际路径。")
     r.add(WARN, "settings.json 候选路径", cands, "")
 
     ch = clawbot.load_channel()
     if not ch:
-        r.fail("没有 ClawBot 凭据", "既无本地 login 凭据，settings.json 里也没解析出通道",
-               "在 WorkBuddy 设置 → 远程通道里连接「微信助理」；"
-               "或运行 login.cmd 扫码自建凭据。")
+        r.warn("没有 ClawBot 凭据", "既无本地 login 凭据，settings.json 里也没解析出通道",
+               "不影响签到；若要微信推送，请在 WorkBuddy 设置 → 远程通道里"
+               "连接「微信助理」，或运行 login.cmd 扫码自建凭据。")
         return
     r.ok("ClawBot 凭据", "来源 {}，bot {}，user {}".format(
         ch.get("source"), clawbot.mask(ch.get("bot_token")), ch.get("user_id")))
@@ -293,6 +297,31 @@ def check_clawbot(r: Report) -> None:
 # ---------------------------------------------------------------------------
 # ⑦ 定时任务
 # ---------------------------------------------------------------------------
+def _script_from_args(arguments: str | None) -> str:
+    """从计划任务的 `Arguments` 里取出脚本绝对路径（容忍引号与额外参数）。
+
+    任务 XML 里写的是 `"E:\\...\\catchup.py"`（install.py 生成时**一律带引号**，
+    因为路径常含空格与中文），但也可能是未加引号 + 参数的形式。
+    取不到就返回空串 —— 调用方据此降级成 WARN，不会误报成 FAIL。
+    """
+    s = (arguments or "").strip()
+    if not s:
+        return ""
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        return s[1:end] if end > 1 else s.strip('"')
+    parts = s.split()
+    return parts[0] if parts else ""
+
+
+def _same_file(a: str | pathlib.Path, b: str | pathlib.Path) -> bool:
+    """两个路径是否指向同一个文件（Windows 大小写不敏感；resolve 失败则退化比较）。"""
+    try:
+        return pathlib.Path(a).resolve() == pathlib.Path(b).resolve()
+    except Exception:  # noqa: BLE001
+        return str(a).strip().lower() == str(b).strip().lower()
+
+
 def check_task(r: Report) -> None:
     if not winenv.IS_WIN:
         r.skip("计划任务", "非 Windows 环境（本文件在 mac 上跑只用于审阅）")
@@ -310,28 +339,62 @@ def check_task(r: Report) -> None:
                "运行 install.cmd（= python install.py install）完成注册。")
         return
     try:
-        import xml.etree.ElementTree as ET
-        root = ET.fromstring(xml_or_err)
-        ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+        settings = install.task_settings_from_xml(xml_or_err)
+        interval = settings.get("interval")
+        swa = settings.get("start_when_available")
+        bat = settings.get("disallow_start_if_on_batteries")
+        cmd = settings.get("command")
+        arg = settings.get("arguments")
 
-        def txt(p):
-            e = root.find(p, ns)
-            return e.text if (e is not None and e.text) else None
+        # Some Windows builds omit optional false-valued elements from the XML
+        # returned by schtasks. Read the effective settings through PowerShell
+        # before deciding that a required setting is missing.
+        if swa is None or bat is None:
+            live = install.task_live_settings(name) or {}
+            if swa is None:
+                swa = live.get("start_when_available")
+            if bat is None:
+                bat = live.get("disallow_start_if_on_batteries")
+            if live:
+                r.ok("计划任务设置回读", "schtasks XML 未返回全部字段；PowerShell 已回读有效设置")
 
-        interval = txt(".//t:Repetition/t:Interval")
-        swa = txt(".//t:StartWhenAvailable")
-        bat = txt(".//t:DisallowStartIfOnBatteries")
-        cmd = txt(".//t:Actions/t:Exec/t:Command")
-        arg = txt(".//t:Actions/t:Exec/t:Arguments")
         r.ok("计划任务已注册", "任务名 {}，间隔 {}".format(name, interval))
-        (r.ok if swa == "true" else r.fail)(
-            "错过补跑（StartWhenAvailable）", str(swa),
-            "必须为 true，否则睡眠/关机期间错过的触发不会补跑。"
-            "重新 install 即可修正。")
-        (r.ok if bat == "false" else r.fail)(
-            "电池下仍运行（DisallowStartIfOnBatteries）", str(bat),
-            "必须为 false。默认 true 会让笔记本用电池时静默跳过整个任务。")
+        if swa is None:
+            r.warn("错过补跑（StartWhenAvailable）", "无法回读该设置",
+                   "重跑 install.cmd 覆盖注册；若仍无法回读，再提供完整 doctor 输出。")
+        else:
+            (r.ok if swa == "true" else r.fail)(
+                "错过补跑（StartWhenAvailable）", str(swa),
+                "必须为 true，否则睡眠/关机期间错过的触发不会补跑。"
+                "重新 install 即可修正。")
+        if bat is None:
+            r.warn("电池下仍运行（DisallowStartIfOnBatteries）", "无法回读该设置",
+                   "重跑 install.cmd 覆盖注册；若仍无法回读，再提供完整 doctor 输出。")
+        else:
+            (r.ok if bat == "false" else r.fail)(
+                "电池下仍运行（DisallowStartIfOnBatteries）", str(bat),
+                "必须为 false。默认 true 会让笔记本用电池时静默跳过整个任务。")
         r.ok("执行体", "{} {}".format(cmd, arg))
+
+        # ★ 2026-09-20 新增：任务里的脚本路径必须就是**当前目录**下的那一个。
+        #   计划任务存的是绝对路径 —— 把文件夹挪走/改名之后，任务仍指向旧位置，
+        #   表现为每次触发都以 0x8007010B（目录名无效）失败，而且**完全静默**：
+        #   pythonw 没有控制台，旧位置的日志也不会再被写。
+        #   实测：搬迁后三个任务连续失败，而旧版 doctor 只把执行体打印出来、从不比对，
+        #   于是「计划任务已注册」一路绿灯 —— 正是本项目最忌讳的那类静默失效。
+        want = DIR / "catchup.py"
+        script = _script_from_args(arg)
+        if not script:
+            r.warn("任务脚本路径无法核对", "Arguments = {!r}".format(arg),
+                   "重跑 install.cmd 覆盖注册后再看这一项。")
+        elif _same_file(script, want):
+            r.ok("任务指向当前目录", str(want))
+        else:
+            r.fail("计划任务指向的是旧路径（搬迁后没有重新注册）",
+                   "任务里写的是：{}\n当前实际位置：{}".format(script, want),
+                   "在新位置重跑一次 install.cmd（= python install.py install）覆盖注册。"
+                   "否则任务每次触发都会以 0x8007010B（目录名无效）静默失败，"
+                   "签到不会发生，而任务列表里它看起来一切正常。")
     except Exception as e:  # noqa: BLE001
         r.warn("任务 XML 解析失败", repr(e)[:160], "任务已注册，但无法核对设置。")
 

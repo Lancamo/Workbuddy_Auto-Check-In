@@ -35,7 +35,7 @@ v2 改为**只读桌面端的轮询游标文件**，零网络请求、零抢消�
     · mtime 新鲜  → 有人在持续消费该 bot 的消息，会话被正常维护 → 健康
     · mtime 陈旧  → 桌面端已停止轮询（App 退出 / 崩溃 / 被更新中断）→ 会话有失效风险
 
-这条判据有实测支撑：本机上一个 bot（dffb797a0545）的游标 mtime 停在 2026-08-19 11:11，
+这条判据有实测支撑：本机上一个已停用 bot 的游标 mtime 停在 2026-08-19 11:11，
 而该会话在同一时期之后再未成功通信，最终于 2026-09-16 确认 -14 失效 —— 游标停滞
 正是会话失活的前兆信号。
 
@@ -104,9 +104,13 @@ DEFAULTS: dict = {
 # ---------------------------------------------------------------------------
 def log(msg: str) -> None:
     try:
-        with LOG.open("a") as f:
+        # ★ 必须显式 UTF-8。默认编码 = 系统区域默认（非中文 Windows 上是 cp1252），
+        #   而本模块的日志正文含中文、还可能带上含中文的项目路径 ——
+        #   在非中文系统上会抛 UnicodeEncodeError。它**不是 OSError**，
+        #   逃得过下面的 except，穿出去就破坏了 check()「永不抛异常」的承诺。
+        with LOG.open("a", encoding="utf-8", errors="replace") as f:
             f.write("[{}] [renew] {}\n".format(datetime.datetime.now().strftime("%F %T"), msg))
-    except OSError:
+    except (OSError, ValueError):  # ValueError 覆盖 UnicodeError
         pass
 
 
@@ -330,11 +334,22 @@ def check(*, now: datetime.datetime | None = None, force: bool = False) -> dict:
         out["stale_hours"] = stale_hours
         if st.get("last_remind_date") != today:
             out["remind_sent"] = _notify_stale(now, cs["age_hours"])
-            st["last_remind_date"] = today
-            st["remind_count"] = int(st.get("remind_count") or 0) + 1
-            out["remind_count"] = st["remind_count"]
-            log("stale reminder #{} sent={} age={:.1f}h".format(
-                st["remind_count"], out["remind_sent"], cs["age_hours"]))
+            # ★ 只有**真的送出去**才记「今天已提醒」。
+            #   旧写法无条件写日期：提醒没送达（无可用通道、降级也只到失败）时，
+            #   当天后续触发全会走 `remind_skipped`，这条提醒就永久消失了 ——
+            #   而它提醒的恰恰是「ClawBot 会话已停摆」这种一旦漏掉就再没人管的事。
+            #   没送到就不记账，让下一次触发（默认 30 分钟后）接着试；
+            #   重试本身不会被刷屏 —— notify.send 自己还有去重窗口与每日配额兜着。
+            if out["remind_sent"]:
+                st["last_remind_date"] = today
+                st["remind_count"] = int(st.get("remind_count") or 0) + 1
+                out["remind_count"] = st["remind_count"]
+                log("stale reminder #{} sent=True age={:.1f}h".format(
+                    st["remind_count"], cs["age_hours"]))
+            else:
+                out["remind_failed"] = "提醒未送达，本次不记账，下次触发会重试"
+                log("stale reminder NOT delivered, will retry age={:.1f}h".format(
+                    cs["age_hours"]))
         else:
             out["remind_skipped"] = "今日已提醒"
     else:

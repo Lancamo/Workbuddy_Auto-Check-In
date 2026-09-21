@@ -1,7 +1,8 @@
 @echo off
 REM ===========================================================================
 REM  WorkBuddy reward auto check-in  --  UNINSTALL (Windows)
-REM  Removes the scheduled task. Project files are NOT deleted.
+REM  Removes all THREE scheduled tasks (Catchup + Watchdog + Wake).
+REM  Project files are NOT deleted.
 REM  ASCII-only on purpose; see install.cmd for the reason.
 REM ===========================================================================
 setlocal
@@ -17,7 +18,7 @@ if not defined PYEXE (
 if not defined PYEXE goto nopython
 
 echo.
-echo === Removing scheduled task ===
+echo === Removing scheduled tasks (Catchup + Watchdog + Wake) ===
 %PYEXE% "%~dp0install.py" uninstall %*
 echo.
 echo Still want to delete everything? Close this window and delete the
@@ -32,7 +33,13 @@ echo [ERROR] Python 3 was not found, so the task cannot be removed by script.
 echo.
 echo   Manual removal:
 echo     press Win+R, type:  taskschd.msc
-echo     find "WorkBuddyRewardCatchup" in the task list, right-click, Delete.
+echo     then delete ALL FOUR of these from the task list:
+echo       WorkBuddyRewardCatchup   (main poller, every 5 min)
+echo       WorkBuddyRewardWatchdog  (liveness monitor, every 30 min)
+echo       WorkBuddyRewardWake      (daily 07:00 wake-up)
+echo       WorkBuddyRewardDayWake   (hourly 07:00-23:00 wake points)
+echo     (names may differ if you installed with --name / --no-watchdog / --no-wake
+echo      / --no-daywake)
 echo.
 pause
 exit /b 1
