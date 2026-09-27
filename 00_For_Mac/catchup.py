@@ -2,7 +2,7 @@
 """WorkBuddy 积分补跑器（带闸门 · 幂等 · 当日去重）
 
 自包含：引擎是同级 `scripts/` 下的 5 个脚本（checkin / travel / credentials /
-http_client / main），已从 Skill `workbuddy-reward-helper` 内联，**不再依赖任何技能**。
+http_client / main），已内联到本目录，**不再依赖任何技能**。
 
 唯一触发者：macOS LaunchAgent（Label: com.workbuddy.wb-reward-catchup）
   - 用户登录 / launchd 加载时跑一次（RunAtLoad）
@@ -64,8 +64,10 @@ import renew         # noqa: E402  同目录续期守护（ClawBot 会话快到�
 
 WINDOW1 = 700       # 07:00 签到 + 派遣（「≥ 时间」语义，过了点补跑）
 QUIET_FROM = 700    # 07:00 —— 在此之前完全静默（见 _quiet_now）
-MAX_TRIES = 12      # 单事项最多真实尝试次数
+MAX_TRIES = 12      # 单事项最多真实尝试次数（业务层失败：401 / 接口错误等）
 MIN_RETRY_GAP_MIN = 20   # 两次真实尝试之间的最小间隔（分钟）
+NET_RETRY_GAP_MIN = 30   # 网络层失败的重试间隔（分钟）—— 网络失败不烧配额，低频重试到当天结束
+PROBE_GAP_MIN = 30       # 业务预算耗尽后的只读探测间隔（分钟）—— 探测恢复
 LOCK_STALE_SEC = 600     # 超过 10 分钟未释放的锁视为残留（正常一次运行只需几秒）
 
 # 为什么需要 MIN_RETRY_GAP_MIN：触发频率从 30 分钟提到 5 分钟后，若不加间隔，
@@ -214,8 +216,11 @@ def _act(c: dict) -> str:
     return "（{}）".format(name) if name else ""
 
 
-def _fmt_checkin(c: dict) -> str:
+def _fmt_checkin(c: dict, done: bool = False) -> str:
     st = c.get("status")
+    # done：state 里已记为完成，本次 failed 只是整批调用被网络故障拖挂，不代表没领到
+    if done and st == "failed":
+        return "签到：今日已到账（本次查询失败，积分不受影响）"
     if st == "success":
         return "签到：+{} 积分{}".format(
             c.get("credit") if c.get("credit") is not None else "?", _act(c))
@@ -230,8 +235,11 @@ def _fmt_checkin(c: dict) -> str:
     return "签到：未执行"
 
 
-def _fmt_travel(t: dict) -> str:
+def _fmt_travel(t: dict, done: bool = False) -> str:
     st = t.get("status")
+    # done：奖励已领取，本次 failed 只是整批调用被网络故障拖挂，不代表没领到
+    if done and st == "failed":
+        return "旅行：奖励已领取（本次查询失败，积分不受影响）"
     if st == "claimed":
         return "旅行：+{} 积分".format(
             t.get("reward_credit") if t.get("reward_credit") is not None else "?")
@@ -259,7 +267,13 @@ def _report(c: dict, t: dict, state: dict, pf: dict | None = None) -> None:
     checkin_gain = c.get("status") == "success" and c.get("credit") is not None
     travel_gain = t.get("status") == "claimed" and t.get("reward_credit") is not None
 
-    failed = [n for n, v in (("签到", c), ("旅行", t)) if v.get("status") == "failed"]
+    done_map = {"签到": bool(state.get("checkin_done")),
+                "旅行": bool(state.get("claim_done"))}
+    # 只把**真正待办**的事项计入失败：已完成的事项即便本次调用返回 failed 也不该报。
+    # 2026-09-26 的教训 —— 08:23 签到已成功，10:23 网络故障让 main.py all 整批返回
+    # failed，告警却写「签到、旅行 失败」，与实际状态不符，白造一次误报。
+    failed = [n for n, v in (("签到", c), ("旅行", t))
+              if v.get("status") == "failed" and not done_map[n]]
     suspect = c.get("status") == "suspect"
     no_activity = c.get("status") == "no_activity"
     # 前置校验异常：只剩兜底端点可用，或探活全失败
@@ -300,8 +314,8 @@ def _report(c: dict, t: dict, state: dict, pf: dict | None = None) -> None:
             "success")
 
     content = "\n".join([
-        _fmt_checkin(c),
-        _fmt_travel(t),
+        _fmt_checkin(c, done_map["签到"]),
+        _fmt_travel(t, done_map["旅行"]),
         "",
         "时间：{}".format(stamp),
         progress,
@@ -377,6 +391,28 @@ def run_all(tag: str) -> dict:
         return {}
 
 
+def run_status() -> dict:
+    """只读探测：调用 main.py status（不领取 / 不派遣），用于「探测恢复」。
+
+    当业务预算（MAX_TRIES）耗尽、但当天该事项仍未完成时，不再做正式尝试，
+    改为低频只读查询一次状态 —— 一旦外部条件恢复（登录态刷新 / 网络恢复 /
+    活动重开），状态查询会返回 ok，据此重置预算、恢复正式签到。
+    """
+    log("run (probe status)")
+    try:
+        p = subprocess.run([PY, MAIN, "status"], capture_output=True, text=True, timeout=120)
+    except Exception as e:  # noqa: BLE001
+        log(f"probe exec error: {e!r}")
+        return {}
+    out = (p.stdout or "").strip()
+    if p.stderr:
+        log("probe stderr: " + p.stderr.strip()[:500])
+    try:
+        return json.loads(out.splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _claim_open(now_ts: float, state: dict) -> bool:
     """领取窗口是否已开：只看「猫是不是真的到了」。
 
@@ -401,6 +437,20 @@ def _due(state: dict, key: str, now_ts: float, gap_min: int) -> bool:
     except (TypeError, ValueError):
         return True
     return last <= 0 or (now_ts - last) >= gap_min * 60
+
+
+_NET_KINDS = ("net",)
+
+
+def _is_net_fail(res: dict) -> bool:
+    """判断一次失败是否属于「网络层」失败。
+
+    网络层失败（DNS / 连接 / 超时 / SSL / 断开）与业务层失败（401 / 活动结束 /
+    接口变更）性质完全不同：网络恢复后重试就能成功，**不该烧有限的 MAX_TRIES 配额**。
+    底层 checkin.py / travel.py 已在失败结果上打 fail_kind 标记，这里只读它，
+    不再靠关键词匹配 reason 字符串。
+    """
+    return bool(res) and res.get("status") == "failed" and res.get("fail_kind") in _NET_KINDS
 
 
 def _quiet_now(now: datetime.datetime) -> bool:
@@ -462,10 +512,19 @@ def main() -> None:
 
 
 def _run() -> None:
+    # 补发队列：之前未送达微信的关键通知（签到/旅行到账、失败告警）在此兜底重试。
+    # 必须在 _day_finished 静默检查**之前** —— 当天任务完成后会直接 return，放后面就永远跑不到。
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    done = _day_finished(_load_state(), today)
+    try:
+        notify.flush_pending(day_done=done)
+    except Exception as e:  # noqa: BLE001
+        log(f"flush_pending error: {e!r}")
+
     # 静默第二道：当天该做的都做完了 → 之后每次触发都不再做任何事。
     # 放在 ensure_config / renew / discovery 之前，因为那些都属于「每次触发都跑」
     # 的固定开销，正是静默要省掉的那部分。
-    if _day_finished(_load_state(), datetime.datetime.now().strftime("%Y-%m-%d")):
+    if done:
         print(json.dumps({"action": "day_done"}, ensure_ascii=False))
         return
 
@@ -506,9 +565,10 @@ def _run() -> None:
         # 跨日重置每日进度，但**保留** no_activity_streak（它是跨日累计的失效指标）
         carry_streak = int(state.get("no_activity_streak") or 0)
         state = {"day": today, "checkin_done": False, "checkin_tries": 0,
-                 "checkin_last_try": 0,
+                 "checkin_last_try": 0, "checkin_last_kind": "biz",
                  "claim_done": False, "claim_tries": 0,
-                 "claim_last_try": 0,
+                 "claim_last_try": 0, "claim_last_kind": "biz",
+                 "probe_last_try": 0,
                  "arrive_at": None,
                  "no_activity_streak": carry_streak}
 
@@ -535,9 +595,16 @@ def _run() -> None:
                 ]),
                 "failure")
 
+    # 上次失败类型决定重试间隔：网络失败用更长间隔（不烧配额），业务失败用原间隔。
+    checkin_gap = NET_RETRY_GAP_MIN if state.get("checkin_last_kind") == "net" else MIN_RETRY_GAP_MIN
+    claim_gap = NET_RETRY_GAP_MIN if state.get("claim_last_kind") == "net" else MIN_RETRY_GAP_MIN
+
+    checkin_budget_exhausted = int(state.get("checkin_tries") or 0) >= MAX_TRIES
+    claim_budget_exhausted = int(state.get("claim_tries") or 0) >= MAX_TRIES
+
     need_checkin = (hm >= WINDOW1 and not state["checkin_done"]
-                    and state["checkin_tries"] < MAX_TRIES
-                    and _due(state, "checkin_last_try", now_ts, MIN_RETRY_GAP_MIN))
+                    and not checkin_budget_exhausted
+                    and _due(state, "checkin_last_try", now_ts, checkin_gap))
 
     claim_open = _claim_open(now_ts, state)
     # 该去处理旅行：① 猫到了（窗口开）；或 ② 还不知道猫何时到达，需要问一次接口补齐
@@ -547,8 +614,14 @@ def _run() -> None:
     need_arrive_info = (not state["claim_done"] and not state.get("arrive_at")
                         and hm >= WINDOW1)
     need_claim = ((claim_open and not state["claim_done"]) or need_arrive_info) \
-        and state["claim_tries"] < MAX_TRIES \
-        and _due(state, "claim_last_try", now_ts, MIN_RETRY_GAP_MIN)
+        and not claim_budget_exhausted \
+        and _due(state, "claim_last_try", now_ts, claim_gap)
+
+    # 探测恢复触发条件：业务预算耗尽、当天该事项仍未完成时，进入低频只读探测。
+    need_probe = (hm >= WINDOW1
+                  and ((checkin_budget_exhausted and not state["checkin_done"])
+                       or (claim_budget_exhausted and not state["claim_done"]))
+                  and _due(state, "probe_last_try", now_ts, PROBE_GAP_MIN))
 
     c: dict = {}
     t: dict = {}
@@ -570,7 +643,6 @@ def _run() -> None:
                 len(pf.get("tried") or [])))
 
         if need_checkin:
-            state["checkin_tries"] += 1
             state["checkin_last_try"] = now_ts
             # no_activity 也计入「完成」：活动空档期无论重试多少次都不会有积分，
             # 计入完成才能让后续轮询真正空转、不做无谓请求。
@@ -578,16 +650,29 @@ def _run() -> None:
             # 该做的是**立刻告警**（见 _report），而不是反复重试刷屏。
             if c.get("status") in ("success", "already_checked", "no_activity", "suspect"):
                 state["checkin_done"] = True
+                state["checkin_last_kind"] = "biz"
+            elif _is_net_fail(c):
+                # 网络层失败：不烧配额（tries 不动），只记失败类型 → 下次用更长间隔重试
+                state["checkin_last_kind"] = "net"
+            else:
+                # 业务层失败：烧配额
+                state["checkin_tries"] += 1
+                state["checkin_last_kind"] = "biz"
             # 跨日累计「拿不到活动数据」的天数：连续多日即为接口/活动判定异常的信号
             if c.get("status") in ("no_activity", "suspect"):
                 state["no_activity_streak"] = int(state.get("no_activity_streak") or 0) + 1
             elif c.get("status") in ("success", "already_checked"):
                 state["no_activity_streak"] = 0
         if need_claim:
-            state["claim_tries"] += 1
             state["claim_last_try"] = now_ts
             if t.get("status") in ("claimed", "daily_limit_reached"):
                 state["claim_done"] = True
+                state["claim_last_kind"] = "biz"
+            elif _is_net_fail(t):
+                state["claim_last_kind"] = "net"
+            else:
+                state["claim_tries"] += 1
+                state["claim_last_kind"] = "biz"
 
         # 记录 / 清除猫的到达时间（「到达即领」的判据来源）：
         #   领到手 → 清掉，不留过期时间戳；
@@ -598,8 +683,38 @@ def _run() -> None:
         elif t.get("arrive_at"):
             state["arrive_at"] = t["arrive_at"]
 
-        _report(c, t, state, pf)
-    elif disc.get("changed"):
+        # 网络故障降频：本次失败若**全是网络层失败**（且没有成功到账），每天只推一条告警，
+        # 其余只记日志。否则网络故障持续一整天时，每 30 分钟一条会刷屏。
+        fails = [r for r in (c, t) if r and r.get("status") == "failed"]
+        gains = [r for r in (c, t) if r and r.get("status") in ("success", "already_checked", "claimed")]
+        net_only = bool(fails) and not gains and all(_is_net_fail(r) for r in fails)
+        if net_only and state.get("net_fail_warn_day") == today:
+            log("网络失败持续中（今日已告警），跳过重复通知")
+        else:
+            if net_only:
+                state["net_fail_warn_day"] = today
+            _report(c, t, state, pf)
+
+    if need_probe:
+        # 探测恢复：业务预算耗尽、当天该事项仍未完成时，低频只读探测一次状态。
+        # 外部条件恢复（登录态刷新 / 网络恢复 / 活动重开）→ 状态查询返回 ok →
+        # 重置预算，下次触发恢复正式签到。探测失败则不重置，继续等下一个探测周期。
+        state["probe_last_try"] = now_ts
+        st = run_status()
+        cs = (st.get("checkin_status") or {})
+        ts = (st.get("travel_status") or {})
+        if checkin_budget_exhausted and not state["checkin_done"] and cs.get("status") == "ok":
+            state["checkin_tries"] = 0
+            state["checkin_last_try"] = 0
+            state["checkin_last_kind"] = "biz"
+            log("probe: 签到状态已恢复，重置重试预算")
+        if claim_budget_exhausted and not state["claim_done"] and ts.get("status") == "ok":
+            state["claim_tries"] = 0
+            state["claim_last_try"] = 0
+            state["claim_last_kind"] = "biz"
+            log("probe: 旅行状态已恢复，重置重试预算")
+
+    if (not need_checkin and not need_claim and not need_probe) and disc.get("changed"):
         # 今日无待办（空转中），但客户端升级导致端点变了 —— 立刻报，不等明天。
         # 端点变化很少见（每次客户端发版至多一次），这点推送量可忽略。
         try:
@@ -637,7 +752,7 @@ def _run() -> None:
                 "签到不受影响。",
                 "",
                 "可能原因：旅行接口异常 / 今日未派猫 / 活动已结束。",
-                "明天会自动重试；若连续多天如此，运行 python3 scripts/api_discovery.py 核对端点。",
+                "脚本会持续只读探测，一旦接口恢复当天即自动重试；若连续多天如此，运行 python3 scripts/api_discovery.py 核对端点。",
             ]),
             "failure")
 
@@ -646,7 +761,7 @@ def _run() -> None:
     log(f"state={state}")
 
     summary = {
-        "action": "ran" if (need_checkin or need_claim) else "none",
+        "action": "ran" if (need_checkin or need_claim) else ("probe" if need_probe else "none"),
         "checkin_done": state["checkin_done"],
         "claim_done": state["claim_done"],
         # 领取闸门状态：排查「为什么还没领」时一眼就能看出是闸门没开还是领取失败了

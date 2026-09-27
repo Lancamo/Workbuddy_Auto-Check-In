@@ -80,6 +80,7 @@ def _biz_fail(label: str, code, body: dict) -> dict:
     res = _result(
         "failed",
         reason="{} 业务错误：code={} msg={}".format(label, code, (body or {}).get("msg")),
+        fail_kind="biz",
     )
     miss = api_discovery.looks_like_route_miss(code, body)
     if miss:
@@ -142,7 +143,7 @@ def run_travel(timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
     try:
         cred = credentials.load_credentials()
     except credentials.CredentialError as e:
-        return _result("failed", reason="登录态读取失败：" + str(e))
+        return _result("failed", reason="登录态读取失败：" + str(e), fail_kind="local")
     token = cred["access_token"]  # 仅内存使用，绝不打印/落盘
     uid = cred.get("uid", "")
     headers = _travel_headers(uid)
@@ -155,12 +156,14 @@ def run_travel(timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
             extra_headers=headers, timeout=timeout, user_agent=TRAVEL_UA,
         )
     except http_client.HttpTransportError as e:
-        return _result("failed", reason="查询旅行状态失败（网络异常）：" + str(e))
+        return _result("failed", reason="查询旅行状态失败（网络异常）：" + str(e),
+                       fail_kind="net")
 
     if st_code == 401:
         return _result(
             "failed",
             reason="令牌已失效（401），请打开 WorkBuddy 桌面端刷新登录态后重试",
+            fail_kind="auth",
         )
     if st_body.get("code") != 0:
         return _biz_fail("状态接口", st_body.get("code"), st_body)
@@ -179,9 +182,11 @@ def run_travel(timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
                 extra_headers=headers, timeout=timeout, user_agent=TRAVEL_UA,
             )
         except http_client.HttpTransportError as e:
-            return _result("failed", reason="claim 失败（网络异常）：" + str(e))
+            return _result("failed", reason="claim 失败（网络异常）：" + str(e),
+                           fail_kind="net")
         if c_code == 401:
-            return _result("failed", reason="claim 返回 401（令牌失效），停止本轮")
+            return _result("failed", reason="claim 返回 401（令牌失效），停止本轮",
+                           fail_kind="auth")
         if c_body.get("code") != 0:
             return _biz_fail("claim", c_body.get("code"), c_body)
         cd = c_body.get("data") or {}
@@ -203,9 +208,11 @@ def run_travel(timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
                 timeout=timeout, user_agent=TRAVEL_UA,
             )
         except http_client.HttpTransportError as e:
-            return _result("failed", reason="depart 失败（网络异常）：" + str(e))
+            return _result("failed", reason="depart 失败（网络异常）：" + str(e),
+                           fail_kind="net")
         if d_code == 401:
-            return _result("failed", reason="depart 返回 401（令牌失效），停止本轮")
+            return _result("failed", reason="depart 返回 401（令牌失效），停止本轮",
+                           fail_kind="auth")
         if d_body.get("code") != 0:
             return _biz_fail("depart", d_body.get("code"), d_body)
         dd = d_body.get("data") or {}
@@ -225,6 +232,7 @@ def run_travel(timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
     return _result(
         "failed",
         reason="未知旅行状态：state={}".format(state),
+        fail_kind="biz",
     )
 
 

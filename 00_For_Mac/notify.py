@@ -505,13 +505,129 @@ def _alert_channel_expired(st: dict, cfg: dict, now: float, kind: str = "session
     )
 
 
+def _recapture_and_resend(cfg: dict, title: str, content: str,
+                          st: dict, now: float) -> tuple[bool, str]:
+    """「投递被拒 / 缺 context_token」的自动自愈（2026-09-25 新增）。
+
+    背景：主动推送依赖本地捕获的 context_token，而捕获此前是**纯手动**操作
+    （python3 clawbot.py wait）。token 过期后推送进入 prepare failed 死状态且
+    永不自愈 —— 2026-09-24/25 的漏推即此因：用户其实一直在微信里发消息
+    （桌面端正常回复「知道了」），但没人跑 wait，脚本一条也没捕获到，
+    9/17 捕获的旧 token 失效（9/24 起）后主动推送就全断了。
+
+    自愈流程：
+      1. 弹 macOS 告警，引导用户「给机器人发条消息」（与告警承诺的恢复动作一致）；
+      2. 开 90 秒捕获窗口（长轮询），窗口内用户发消息即被捕获；
+      3. 抓到新 token 立即重发一次。
+
+    代价与边界：
+      · 捕获用 getupdates 会与桌面端抢消息，抢到的那条桌面端看不到（bot 不回复它）。
+        自愈场景一次的代价可接受，与 clawbot.py「排障用即可」的结论一致。
+      · 最坏阻塞约 90 秒；catchup 由 launchd 每 5 分钟触发，可接受。
+      · 重发这次请求单独计入每日配额（请求即消耗，与 iLink 规则一致）；
+        原始失败那次由主循环照常计入。
+    """
+    alerted = _alert_channel_expired(st, cfg, now, "blocked")
+    _save_state(st)
+    cap_ok, cap_reason = clawbot.capture_context_token(wait_seconds=90)
+    # capture 内部会读写盘上的 state（新 token / 游标）。无条件刷新内存快照，
+    # 否则稍后 _save_state(st) 会用进入本函数前的旧值把新 token 覆盖回去。
+    fresh = _load_state()
+    st.clear()
+    st.update(fresh)
+    ok, reason = _send_via("clawbot", cfg, title, content)
+    _bump_daily(st, delivered=ok)
+    _save_state(st)
+    tag = "（已弹本机引导告警）" if alerted else ""
+    if not cap_ok:
+        return False, "未捕获到新 token" + tag + "：" + cap_reason
+    if ok:
+        return True, reason + "（自动重捕获 token 后重发成功）"
+    return False, "已捕获新 token 但重发仍失败：" + reason
+
+
+def _enqueue_pending(st: dict, level: str, title: str, content: str, now: float) -> None:
+    """把「本应送达微信、却只降级了本机（或完全没送出）」的关键通知入队。
+
+    为什么需要：签到到账 / 旅行到账 / 失败告警这类 success/failure 通知是**一次性**的
+    —— 当天任务完成后 catchup 不会再触发。若发送时刻恰好 token 过期、当场自愈又没接住
+    （用户不在场），这条通知就会永久漏掉微信。入队后由 catchup 每次触发时 flush_pending
+    补发，token 一恢复就能补上，兑现「每天的消息一定微信通知到」。
+    """
+    fp = _fingerprint(title, content, level)
+    pending = st.setdefault("pending", [])
+    if not isinstance(pending, list):
+        pending = st["pending"] = []
+    for item in pending:
+        if isinstance(item, dict) and item.get("fp") == fp:
+            return
+    pending.append({"fp": fp, "level": level, "title": title,
+                    "content": content, "ts": now})
+    # 只保留最近 48 小时、最多 12 条，防止 token 长期失效时无限堆积
+    cutoff = now - 48 * 3600
+    st["pending"] = [it for it in pending
+                     if isinstance(it, dict) and it.get("ts", 0) >= cutoff][-12:]
+
+
+def flush_pending(day_done: bool = False) -> dict:
+    """补发 pending 队列里未送达微信的关键通知。由 catchup 每次运行时调用。
+
+    返回 {"flushed": 已补发, "dropped": 已作废, "remaining": 剩余}；永不抛异常。
+    补发走 send(..., allow_recapture=False)：不在批量补发里触发 90 秒自愈窗口
+    （自愈只该由正常通知路径触发一次，避免 flush 里多条失败把单次运行拖到几分钟）。
+
+    day_done=True（当天任务已全部完成）时，队列里的 failure 一律**作废**：它说的是
+    「当时没办成」，而当天既然已经办成了，这条告警就永远不该再发出去。
+    2026-09-26 的教训 —— 10:23 的网络故障告警排进队列，当天 19:02 其实已领取成功，
+    21:35 才被补发到微信，用户先在 19:02 看到「到账」、又在 21:35 看到「失败」，彻底错乱。
+    success（到账）不受影响：领到多少分是既成事实，晚到也比漏掉好。
+    （warning / info 根本不会入队，见 send() 末尾的入队条件，故这里无需处理。）
+    """
+    st = _load_state()
+    pending = st.get("pending") or []
+    if not pending:
+        return {"flushed": 0, "dropped": 0, "remaining": 0}
+    now = time.time()
+    cutoff = now - 48 * 3600
+    ok_n = 0
+    dropped = 0
+    rest = []
+    for item in pending:
+        if not isinstance(item, dict):
+            continue
+        if item.get("ts", 0) < cutoff:
+            dropped += 1
+            continue                      # 过期丢弃
+        if day_done and (item.get("level") or "") == "failure":
+            dropped += 1
+            continue                      # 当天已办成 → 这条失败告警已过时，作废
+        r = send(item.get("title", ""), item.get("content", ""),
+                 item.get("level") or "info", allow_recapture=False,
+                 cooldown_on_fail=False)
+        if r.get("wechat"):
+            ok_n += 1
+        else:
+            rest.append(item)
+    # 重新加载最新状态再只改 pending —— send() 内部会写盘（daily / 指纹），
+    # 直接用进入本函数的旧 st 写回会把那些更新覆盖掉。
+    st = _load_state()
+    st["pending"] = rest
+    _save_state(st)
+    return {"flushed": ok_n, "dropped": dropped, "remaining": len(rest)}
+
+
 # ---------------------------------------------------------------------------
 # 对外入口
 # ---------------------------------------------------------------------------
-def send(title: str, content: str, level: str = "info", force: bool = False) -> dict:
+def send(title: str, content: str, level: str = "info", force: bool = False,
+         allow_recapture: bool = True, cooldown_on_fail: bool = True) -> dict:
     """发送通知。level: success | failure | warning | info。永不抛异常。
 
     force=True 跳过级别开关与去重（测试用），但**不跳过**每日配额。
+    allow_recapture=False 时跳过「投递被拒 → 自动重捕获」的自愈（批量补发 flush 时用，
+    避免每条失败各阻塞 90 秒；自愈只该由正常通知路径触发一次）。
+    cooldown_on_fail=False 时失败**不设熔断冷却**（flush 补发时用 —— 补发是低优先级，
+    失败就等下次，不该冻结 clawbot 通道、拖累后续正常通知的自愈）。
     返回 {"level","sent","channel","reason",...}：
       sent    —— 是否送达（微信或本机任一条都算，调用方通常只关心"有人看到了"）
       wechat  —— **是否真的送到了微信**。判断"通道是否打通"只能看这个字段
@@ -593,6 +709,8 @@ def send(title: str, content: str, level: str = "info", force: bool = False) -> 
     reasons = []
     for ch in order:
         ok, reason = _send_via(ch, cfg, title, content)
+        # 原始尝试的送达结果（配额按它记；自愈重发在辅助函数里单独记）
+        first_attempt_ok = ok
 
         # ClawBot 熔断：成功则解除冷却；**任何失败**都进入冷却，避免无谓重试（见上方长注释）
         if ch == "clawbot" and not force:
@@ -606,31 +724,45 @@ def send(title: str, content: str, level: str = "info", force: bool = False) -> 
                 st["last_send_error_ts"] = now
                 if clawbot is not None and clawbot.SESSION_EXPIRED_MARK in r_str:
                     kind = "session"          # 登录失效：必须重新扫码
-                elif clawbot is not None and clawbot.DELIVER_BLOCKED_MARK in r_str:
-                    kind = "blocked"          # 投递被拒：用户发条消息即可恢复
+                elif clawbot is not None and (clawbot.DELIVER_BLOCKED_MARK in r_str
+                                              or "缺 context_token" in r_str):
+                    kind = "blocked"          # 投递被拒 / token 失效：可自动自愈
                 else:
                     kind = "other"            # 网络/未知：短冷却，允许较早重试
-                cd_key = {
-                    "session": "clawbot_cooldown_minutes",
-                    "blocked": "clawbot_blocked_cooldown_minutes",
-                    "other": "clawbot_failure_cooldown_minutes",
-                }[kind]
-                try:
-                    cd = int(cfg.get(cd_key) or 0)
-                except (TypeError, ValueError):
-                    cd = 0
-                _set_clawbot_cooldown(st, cd, now)
-                if kind == "blocked":
-                    # 记下失败时刻的用户活动基线：之后只要用户再发过消息，
-                    # 冷却就该立刻解除（告警文案承诺的是"发一条消息即刻恢复"）
-                    st["cooldown_context_ts"] = _current_inbound_ts()
-                if kind in ("session", "blocked"):
-                    # 额外弹一条明确告警，避免用户把"降级后的本机通知"误当成通道正常
-                    out["channel_expired_alert"] = _alert_channel_expired(st, cfg, now, kind)
-                out["cooldown_min"] = cd
+
+                # 2026-09-25：投递被拒不再只能人工恢复 —— 弹告警引导用户发消息的同时
+                # 自动开 90 秒捕获窗口接新 token，抓到立即重发（详见辅助函数 docstring）。
+                if kind == "blocked" and allow_recapture:
+                    ok2, reason2 = _recapture_and_resend(cfg, title, content, st, now)
+                    reason = reason + "；自动重捕获：" + reason2
+                    if ok2:
+                        ok = True
+                        _clear_clawbot_cooldown(st)
+                        st.pop("last_send_error", None)
+
+                if not ok:
+                    cd_key = {
+                        "session": "clawbot_cooldown_minutes",
+                        "blocked": "clawbot_blocked_cooldown_minutes",
+                        "other": "clawbot_failure_cooldown_minutes",
+                    }[kind]
+                    try:
+                        cd = int(cfg.get(cd_key) or 0)
+                    except (TypeError, ValueError):
+                        cd = 0
+                    if cooldown_on_fail:
+                        _set_clawbot_cooldown(st, cd, now)
+                        if kind == "blocked":
+                            # 记下失败时刻的用户活动基线：之后只要用户再发过消息，
+                            # 冷却就该立刻解除（告警文案承诺的是"发一条消息即刻恢复"）
+                            st["cooldown_context_ts"] = _current_inbound_ts()
+                        out["cooldown_min"] = cd
+                    if kind in ("session", "blocked"):
+                        # 额外弹一条明确告警，避免用户把"降级后的本机通知"误当成通道正常
+                        out["channel_expired_alert"] = _alert_channel_expired(st, cfg, now, kind)
 
         # 只要请求真的发出去过，就计入当日配额（失败也占用 iLink 配额）
-        _bump_daily(st, delivered=ok)
+        _bump_daily(st, delivered=first_attempt_ok)
         _save_state(st)
         if ok:
             out["sent"] = True
@@ -657,6 +789,10 @@ def send(title: str, content: str, level: str = "info", force: bool = False) -> 
         (st.get("local_sent") or {}).pop(fp, None)
     elif local_delivered:
         st.setdefault("local_sent", {})[fp] = now
+    # 关键通知（到账/失败）微信未送达时入队，供 flush_pending 稍后补发 ——
+    # 保证「每天的消息一定微信通知到」（2026-09-25）。
+    if not wechat_delivered and not force and level in ("success", "failure"):
+        _enqueue_pending(st, level, title, content, now)
     _prune_sent(st, now)
     _save_state(st)
     return out

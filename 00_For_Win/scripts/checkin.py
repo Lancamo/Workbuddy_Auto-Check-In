@@ -204,7 +204,8 @@ def query_activity_status(cred: dict, timeout: int = http_client.DEFAULT_TIMEOUT
             transport_err = str(e)
             continue
         if code == 401:
-            return {"__error__": "令牌已过期（401），请打开 WorkBuddy 桌面端刷新登录态后重试"}
+            return {"__error__": "令牌已过期（401），请打开 WorkBuddy 桌面端刷新登录态后重试",
+                    "__fail_kind__": "auth"}
         if body.get("code") != CODE_SUCCESS:
             biz_err = "code={} msg={}".format(body.get("code"), body.get("msg"))
             continue
@@ -218,8 +219,10 @@ def query_activity_status(cred: dict, timeout: int = http_client.DEFAULT_TIMEOUT
     if chosen is None:
         if first_ok is None:
             if transport_err:
-                return {"__error__": "查询签到活动状态失败（网络异常）：" + transport_err}
-            return {"__error__": "查询签到活动状态失败：" + (biz_err or "无可用候选端点")}
+                return {"__error__": "查询签到活动状态失败（网络异常）：" + transport_err,
+                        "__fail_kind__": "net"}
+            return {"__error__": "查询签到活动状态失败：" + (biz_err or "无可用候选端点"),
+                    "__fail_kind__": "biz"}
         # 只有退化结果可用 —— 保留它，但明确标记不可信
         path, data = first_ok
         data["__degraded__"] = True
@@ -238,14 +241,15 @@ def run_checkin(timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
     try:
         cred = credentials.load_credentials()
     except credentials.CredentialError as e:
-        return _result("failed", reason="登录态读取失败：" + str(e))
+        return _result("failed", reason="登录态读取失败：" + str(e), fail_kind="local")
     token = cred["access_token"]  # 仅内存使用，绝不打印/落盘
     host = resolve_host(cred, timeout)
 
     # 2. 查询活动 / 签到状态（新接口优先，旧接口兜底）
     st_data = query_activity_status(cred, timeout)
     if "__error__" in st_data:
-        return _result("failed", reason=st_data["__error__"])
+        return _result("failed", reason=st_data["__error__"],
+                       fail_kind=st_data.get("__fail_kind__", "biz"))
 
     activity = st_data.get("activity_name") or ""
     theme = st_data.get("theme_name") or ""
@@ -310,9 +314,11 @@ def run_checkin(timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
         return _result(
             "failed",
             reason="令牌已过期（401），请打开 WorkBuddy 桌面端刷新登录态后重试",
+            fail_kind="auth",
         )
     if kind == "transport":
-        return _result("failed", reason="签到请求失败（网络异常）：" + str(c_body.get("reason")))
+        return _result("failed", reason="签到请求失败（网络异常）：" + str(c_body.get("reason")),
+                       fail_kind="net")
 
     code = c_body.get("code")
     # 领取接口的成功返回体有两种可能形态：`{code,data:{credit,...}}` 或扁平
@@ -352,6 +358,7 @@ def run_checkin(timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
         "failed",
         reason="签到未成功：code={} msg={}".format(code, c_body.get("msg")),
         endpoint=used,
+        fail_kind="biz",
     )
     if miss:
         res["drift_suspect"] = miss

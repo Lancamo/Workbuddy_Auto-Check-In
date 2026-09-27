@@ -421,7 +421,7 @@ python3 -m py_compile *.py scripts/*.py && echo "COMPILE OK"
 | 微信收不到且报 `errcode=-14` | 登录会话过期 | `login.cmd` 扫码，或直接在 WorkBuddy 里重连「微信助理」 |
 | 提示「接口疑似已变更」 | 腾讯改了接口路径 | 看 `runtime/cache/api_endpoints.json` 的 `history`；`doctor.py` 会显示现读到的端点。本版已做前置校验，正常情况下会自动跟上 |
 | 提示「当前无活动」 | 可能是真无活动，也可能是接口返回全零 | 本版已把这种情形判为 `suspect` 而非 `no_activity`，并**主动告警**，不会静默漏签 |
-| 签到/旅行报 `Connection refused` 或 `self-signed certificate in certificate chain` | 常见原因是系统代理端口未启动，或代理开启了 TLS 拦截。积分接口默认**绕过系统代理直连**；确需走系统代理时设置 `WORKBUDDY_PROXY_MODE=system` |
+| 签到/旅行报 `Connection refused` 或 `self-signed certificate in certificate chain` | 常见原因是系统代理端口未启动，或代理开启了 TLS 拦截。积分接口默认**绕过系统代理直连**；确需走系统代理时设置 `WORKBUDDY_PROXY_MODE=system`。这类网络层失败**不烧重试配额**，每 30 分钟自动重试到当天结束，网络恢复即自动补签 |
 | 路径找不到（settings / asar） | 客户端装在了非标准位置 | 跑 `doctor.cmd` 看它找过哪些路径 → 建 `win_paths.json` 填写正确路径 |
 | `doctor.cmd` 报「找不到 WorkBuddy 客户端」，但客户端确实装了 | 旧版只靠 `%PROGRAMFILES%` 找安装目录，而该变量在某些启动上下文里**根本不存在** | 2026-09-20 已内置 `C:\Program Files` / `C:\Program Files (x86)` 固定兜底（见第 7 节第 5 条）。若仍找不到，按上一行用 `win_paths.json` 显式指定 |
 | 提示「接口已自动切换」但你什么都没改 | 旧版把「客户端临时读不到而退回内置兜底表」也判成了端点变化 | 2026-09-20 已修：只有两次都是权威扫描才判定变化（见第 9 节末）。看到 `runtime/cache/api_endpoints.json` 里的 `degraded_scan_at` 就说明那几次只是**没读到**，不是端点变了 |
