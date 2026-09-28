@@ -40,7 +40,7 @@ WorkBuddy 桌面端。**不需要管理员权限，也不需要 `pip install` �
 |---|---|
 | 立即跑一次、看 JSON 结果 | `run_now.cmd` |
 | 环境 / 配置诊断 | `doctor.cmd` |
-| 让微信也能收到通知副本 | `wait_token.cmd` |
+| 让微信也能收到通知副本 / 验收推送是否真能送达 | `check_channel.cmd` |
 
 要精细控制就在文件夹里开 PowerShell / cmd 用命令行 —— 完整命令表见 **第 4 节**，
 最常用的两条：
@@ -116,7 +116,9 @@ mac 版改 `00_For_Mac/README.md`；**跨平台的功能改动两份都要改**�
 第 1 步  双击 install.cmd          → 注册四个计划任务（主任务 + watchdog + 每日唤醒 + 白天唤醒）
 第 2 步  双击 doctor.cmd           → 环境诊断，全绿即通
 第 3 步  双击 run_now.cmd          → 手动跑一次，看到 JSON 摘要
-第 4 步  （可选）双击 wait_token.cmd → 让微信也能收到通知副本
+第 4 步  （可选）双击 check_channel.cmd → 在 WorkBuddy 里连上「微信助理」后的一次性验收
+                   （它会验活令牌、必要时等你发一条消息、再真发一条测试消息，
+                     直接给出「能不能送达」的结论）
 第 5 步  合上电脑，等第二天       → 到点自动跑
 ```
 
@@ -144,7 +146,7 @@ mac 版改 `00_For_Mac/README.md`；**跨平台的功能改动两份都要改**�
 ├── install.py            ← 计划任务注册 / 卸载 / 状态 / 立即运行（注册**四个**任务）
 ├── watchdog.py           ← ★ 存活监控：只查主脚本心跳与计划任务是否还在，异常弹 Toast
 ├── doctor.py             ← 一键环境诊断（只读，不领积分、不发消息）
-├── selftest.py           ← 自检（项数随环境浮动，0 失败为准；Windows 真机最近 347 项；
+├── selftest.py           ← 自检（项数随环境浮动，0 失败为准；Windows 真机最近 415 项；
 │                            Windows / mac 都能跑，缺 mac 版时自动跳过跨版本比对）
 │                            排除 `._*` 残留、不假设本机是 mac、不注册任何计划任务，
 │                            且把日志隔离到 `.selftest_logs/`（跑完即删，绝不写 runtime/logs）
@@ -158,11 +160,13 @@ mac 版改 `00_For_Mac/README.md`；**跨平台的功能改动两份都要改**�
 │   ├── api_discovery.py  ← ★ 接口前置校验（每次运行现读本机客户端，防接口漂移）
 │   ├── checkin.py        ← 签到
 │   ├── travel.py         ← 旅行派遣与领奖
-│   ├── credentials.py    ← 凭据装载
+│   ├── credentials.py    ← 凭据装载（含 5.6.2+ 加密信封自动解密）
+│   ├── atrest.py         ← WorkBuddy 5.6.2+ AtRestEncryption（AES-256-GCM）解密
 │   └── http_client.py    ← HTTP（UA 跟随真实客户端版本）
 │
 ├── install.cmd / uninstall.cmd / doctor.cmd
 ├── run_now.cmd / login.cmd / wait_token.cmd      ← 双击入口（纯 ASCII）
+├── check_channel.cmd                             ← 绑定 ClawBot 后的一次性验收
 │
 ├── paths.py              ← runtime 路径与日志裁剪的唯一收口
 ├── win_paths.json        ← （可选）路径覆盖，仅当自动探测找不到时创建
@@ -219,6 +223,7 @@ py -3 scripts\main.py preflight           :: 只跑接口前置校验
 py -3 notify.py status                    :: 看通道与今日配额（不发消息）
 py -3 notify.py                           :: 真发一条测试通知到微信
 py -3 notify.py localtest                 :: 只测本机 Toast 这一级（不碰微信、不耗配额）
+py -3 clawbot.py ready 90                 :: ★ 绑定后验收：微信推送到底能不能送达
 py -3 clawbot.py status                   :: 看凭据 / token / 游标
 py -3 renew.py where                      :: 看它到底读了哪个游标文件
 ```
@@ -346,7 +351,7 @@ Python 被卸载、文件夹被移走 —— 主脚本会**连告警机制一起
 
 cd ".../09_Workbuddy自动签到领积分/00_For_Win"
 
-# ① 自检：必须 0 失败（项数随环境浮动；Windows 真机最近基线为 347 项）
+# ① 自检：必须 0 失败（项数随环境浮动；Windows 真机最近基线为 415 项，2026-09-28）
 python3 selftest.py
 
 # ② 差异清单：逐字一致的那 6 个文件差异必须是 0
@@ -427,13 +432,19 @@ python3 -m py_compile *.py scripts/*.py && echo "COMPILE OK"
 | 提示「接口已自动切换」但你什么都没改 | 旧版把「客户端临时读不到而退回内置兜底表」也判成了端点变化 | 2026-09-20 已修：只有两次都是权威扫描才判定变化（见第 9 节末）。看到 `runtime/cache/api_endpoints.json` 里的 `degraded_scan_at` 就说明那几次只是**没读到**，不是端点变了 |
 | 双击 `.cmd` 闪一下就没了 | 脚本报错但窗口关太快 | 从 cmd 里手动运行同名 `.py`，或在文件夹里开 cmd 跑 `install.cmd` |
 | **已登录**却报「读不到登录态」 | 旧版 `credentials.py` 在 Windows 上只找 `%APPDATA%`（Roaming），而桌面端实测把明文登录态写在 `%LOCALAPPDATA%`（Local） | 2026-09-20 已修：两个布局都列、逐个探测。自查：`dir "%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth"` 看有没有 `workbuddy-desktop.info` |
+| **客户端更新到 5.6.2 后报「accessToken 已被加密，未能解出密钥」** | WorkBuddy 从 5.6.2 起把登录态 `accessToken` 从明文改成 AES-256-GCM 信封，密钥（`atRestSecretKey`）不落盘、只驻留运行中的客户端进程内存 | 本版 `atrest.py` 已自动解密：按顺序尝试 ① 环境变量 `WORKBUDDY_ATREST_KEY`（直接给 44 字符密钥）② `WORKBUDDY_ATREST_KEY_FILE` ③ 扫描登录态目录的 DPAPI blob ④ **扫描运行中 `WorkBuddy.exe` 进程内存取密钥**。前提：**客户端已启动并登录**、脚本与客户端同一 Windows 用户（客户端提权而脚本未提权时系统会拒读）。自测：`py -3 scripts\atrest.py` |
+| **签到恢复了，微信推送却照旧发不出去** | 5.6.2 的**同一处格式变更打断了另一条链路**：`settings.json` 里 `weixinClawBot.botToken` / `channelId` 也被换成了同款加密信封（而 `accountId` / `baseUrl` / `userId` 仍是明文）。只修签到那条链路就会留下这个**静默故障** | 本版 `clawbot.py` 的 `_plain()` 已同步解密；`channel_id` 优先取**明文 `accountId`**。自查：`py -3 clawbot.py status`；若 `found:false` 且 `reason` 里列出 `botToken` / `channelId` 等字段名，即「配置在、密钥没取到」→ 确认客户端已启动并登录 |
+| **`doctor.cmd` 报 `[FAIL] 计划任务未注册`，但任务列表里明明有** | 诊断进程**无权限**调用 `schtasks.exe` / `reg.exe`（沙箱或受限上下文），属**假阴性**，不是任务真没了 | 用 PowerShell 独立证实：`powershell -c "Get-ScheduledTask -TaskName 'WorkBuddyReward*' \| Select TaskName,State"`。只有真被删了才需重跑 `install.cmd` |
 | **把文件夹挪了位置之后就不再签到了** | 计划任务里存的是**绝对路径**，挪动文件夹后它仍指向旧位置；此后每次触发都以 `0x8007010B`（目录名无效）**静默失败** —— `pythonw` 没有控制台，旧位置的日志也不会再被写 | 在新位置**重跑一次 `install.cmd`** 覆盖注册（2026-09-21 本次搬迁就是这么修的）。`py -3 install.py status` 会显示任务实际指向哪个脚本；现在 `doctor.cmd` 会直接报「计划任务指向的是旧路径」，`watchdog` 也会报 `wrong_path` / `task_failed` |
 | **任务显示「已启用」、`下次运行时间` 也在往后滚，但从来没真正跑过一次** | ★ 计划任务 XML 的 `<Repetition>` 少了 `<Duration>` —— 省略它**不等于「无限重复」**，而是该触发器每次都被记成「错过的运行」而跳过 | 2026-09-20 已修（第 7 节第 6 条）。自查：`powershell -c "Get-ScheduledTaskInfo -TaskName WorkBuddyRewardCatchup \| fl NextRunTime,LastRunTime,NumberOfMissedRuns"`，**若 `LastRunTime` 一直不动、`NumberOfMissedRuns` 一直涨**，就是这个毛病 |
 | `catchup.log` 显示 `sent=True` 但你没收到微信 | `sent` 的语义是「**某个**通道送到了」（微信**或**本机弹窗），只有 `wechat=True` 才代表手机微信真收到了 | 看同一条日志里的 `wechat=`。`sent=True wechat=False channel=native` = 只弹了本机窗、微信没送到。2026-09-20 修：此前两个降级分支连 `sent` 都不置真，日志会自相矛盾 |
 | 日志里写 `无可用微信通道（请在 WorkBuddy 绑定 ClawBot…）` | 本机既没绑定 ClawBot，也没配 pushplus / serverchan —— **积分照领，只是收不到微信通知**（会降级成本机 Toast） | `py -3 notify.py status` 看 `channel_order`（为 `[]` 就是没通道）。恢复二选一：① 在 WorkBuddy 里绑定「微信助理 / ClawBot」；② 在 `runtime/config/notify_config.json` 填 `pushplus_token` 或 `serverchan_key` |
 | **明明在 WorkBuddy 里绑定过微信，工具却说「未绑定」** | 工具要的是 `settings.json` 里的 **ClawBot bot 凭据**（`botToken` + `userId`），而且桌面端在不同版本里写过**两种结构**：`claw.users.<uid>.channels.weixinClawBot` 与顶层 `claw.channels.weixinClawBot`。旧实现只读前者 | 2026-09-20 已改成**两种都认**（自检第 8l 节钉住）。自查：`py -3 clawbot.py status` 看 `found` 与 `settings_used`；若 `found: false` 而你以为绑过，多半是：① 绑的是「微信公众号 webhook」而不是「微信助理 / ClawBot」（`claw.channels.wechatmp` **不算**）；② 绑完没重启桌面端，配置还没落盘 |
 | `watchdog` 报 `healthy` 但主脚本其实早停了 | ① 任务被 `/Change /DISABLE` 或删除；② PowerShell 被策略禁用，状态判不了 | 2026-09-20 修：改用 PowerShell 的 `State` 枚举判定（此前中文系统上**任务真被停用也报健康**）。看 `runtime/logs/watchdog.log` 里有没有「无法判定计划任务状态」——有就说明两条路都读不到，它只能保守放行 |
+| **绑定 ClawBot 了，可微信里一条通知都没收到** | **「绑定好了」≠「能送达」**：主动推送还必须有 `context_token`，而它**只能在你给机器人发消息的那一刻**由长轮询拿到（服务端不落盘、客户端也不落盘，只活在内存里 —— 见第 9 节第 40 条）。没有令牌的推送，服务端照样回 `message_id`、照样扣每日配额，但**消息不会出现在微信里** | 双击 `check_channel.cmd`（= `py -3 clawbot.py ready 90`）：它先只读验活，必要时开 90 秒窗口等你发一条消息，然后**真发一条测试消息**并给出「能不能送达」的结论。只想看状态：`py -3 clawbot.py status` 看 `context_token` 字段 |
+| **`-14` 怎么修都修不好，扫了好几次码也没用** | 实测：**无效 `bot_token` 与真正过期的会话，服务端返回同一个错误码**（都是 `errcode=-14` / `session timeout`）。所以 `-14` 也可能是「本机读到的凭据不对」（token 空、解密没解开、读成另一个账号）—— 这种情况重新扫码不会好，还会白吃 120 分钟熔断 | 先分清成因，别盲目扫码：`py -3 clawbot.py status` 看 `found` / `source` / `bot_token`。若 `source` 是 `workbuddy-settings` 且 `found:true` 却仍 `-14` → 到 WorkBuddy 设置里**重新绑定**「微信助理」；若是 `local-login` 且确实很久没登录 → 双击 `login.cmd` 重新扫码。`doctor.cmd` 的「⑥ 微信通道」也会打印凭据来源与最近一次失败原因 |
 | **本机通知一直挂在屏幕上，要点叉才消失** | 2026-09-21 起这是**设计行为**：微信通道不可用时本机 Toast 是唯一可见通道，而签到结果偏偏弹在没人盯屏幕的时刻，所以默认**常驻**（`scenario="urgent"` + `duration="long"`） | 想恢复「几秒后自动消失」：设环境变量 `WORKBUDDY_TOAST_PERSISTENT=0`（手动运行立即生效；计划任务需重跑一次 `install.cmd` 或在任务里带上该变量）。若系统拒绝常驻写法，工具会**自动退回普通 Toast**，不会因此一条都弹不出来 |
+| **日志写 `sent=True`，但屏幕上根本没有窗口** | 跑脚本的那个解释器**没有 tkinter**（WorkBuddy 自带的托管 Python 就缺）。卡片 `notify_card.py` 在 `import tkinter` 那一行就退出，而旧实现只看 `Popen` 成功 → **报成功** | 2026-09-28 已修（第 9 节第 37 条）：① `winenv.dialog_python()` 会**真去试** `import tkinter`，自动换一个能画窗口的解释器；② spawn 后**等卡片写回真实 PID**，等不到就如实报失败并降级 Toast。自查：`py -3 notify.py localtest`（只测本机、不碰微信、不耗配额）。若想固定用某个解释器：设 `WB_REWARD_PYTHON_TK` |
 | **早上没看到通知弹窗** | 先分清「投递」与「显示」：**显示器关闭 / 没人在屏前时 Windows 不弹横幅**，通知只进通知中心（07:00 你多半还没坐到屏幕前） | 按 `Win + N` 看通知中心；或用本 README「通知投出去了，但屏幕上没看到」一节里的 `History.GetHistory` 命令查投递记录。**只有通知中心里也没有**才是真故障 → `py -3 notify.py status` 看 `local_notify_check`。开关清单与试用建议见同节 |
 | **睡醒 / 解锁后没有重新弹出通知** | 补弹要满足两个条件：① 投递那一刻判定「你不在场」（键鼠默认 5 分钟无操作）；② 你回来之后计划任务触发一次（≤5 分钟）才会补弹 | 看 `runtime/state/notify_reshow.json` 有没有积压、`catchup.log` 里有没有「补弹 N 条」；确认 `WORKBUDDY_RESHOW` 没被设成 `0`。熄屏/锁屏期间**不会**当场弹横幅（Windows 行为），补弹发生在那之后 |
 | **电脑睡眠时没有按时被唤醒去签到** | 先分清它到底是**睡眠(S3)**还是**休眠(S4)** —— 唤醒定时器**叫不醒休眠**。实测 `rundll32 powrprof.dll,SetSuspendState 0,1,0` 在本机进的是 S4 | 看事件 42 的 `TargetState`（**4=S3 / 5=S4**）：`Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'} -MaxEvents 5`；再 `powercfg /waketimers` 确认唤醒任务的定时器已武装；`powercfg -q SCHEME_CURRENT SUB_SLEEP RTCWAKE` 的交流/直流都必须为「启用」 |
@@ -599,10 +610,20 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
 
 1. 打开微信，进入 WorkBuddy / ClawBot 会话
 2. 发任意一条消息（比如 `1`）
-3. **立刻**双击 `wait_token.cmd`（长轮询 60 秒捕获）
+3. **立刻**双击 `check_channel.cmd`（开 90 秒捕获窗口，抓到就复验并实测一条）
 
 捕获后写入 `clawbot_state.json`。token 是临时的，失效后重复上面三步。
-判断有没有：`py -3 clawbot.py status` 看 `context_token` 字段。
+
+**「绑定好了」≠「能送达」** —— 这是全项目最容易误判的一处，所以专门分了两条命令：
+
+| 命令 | 回答的问题 | 会不会占推送配额 |
+|---|---|---|
+| `check_channel.cmd`（= `clawbot.py ready 90`） | **现在到底能不能送达**：凭据 → 令牌验活 → 真发一条实测 | 只占**最后那 1 条** |
+| `py -3 clawbot.py status` | 只读：凭据读到了什么、令牌在不在、游标在哪 | 不占 |
+
+`ready` 的判定是**分段**的（凭据 / 令牌 / 捕获 / 实测），缺哪一段就停在哪一段并说清下一步。
+关键一点：**没有可用令牌时它故意不发测试消息** —— 那种请求服务端照单受理、照样扣每日配额，
+但消息根本不会进微信（见本节开头那句）。
 
 ---
 
@@ -757,7 +778,7 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
 ## 9. 一次性完整验证（交付前做过）
 
 自检脚本**在 Windows 与 macOS 上都能跑**（不再假设本机是 mac），Windows 真机最近基线
-**347 项全部通过**（项数随环境浮动，判据是 0 失败）。它实际验证了：
+**415 项全部通过**（2026-09-28 复测；项数随环境浮动，判据是 0 失败）。它实际验证了：
 
 - 计划任务 XML 结构合法（命名空间、触发器、重复间隔、几个关键布尔值、UTF-16 编码往返），
   并单独钉死「**轮询主任务 `WakeToRun=false` / 唤醒任务 `WakeToRun=true` 且不带重复触发**」
@@ -1093,6 +1114,213 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
   而**唤醒定时器不会把机器从休眠叫醒**（唤醒事件里 `ProgrammedWakeTime` 为空）。
   所以要验证「睡眠唤醒」，必须先确认真的是 S3（`TargetState=4`）；
   否则会把「测试方法不对」误判成「唤醒定时器坏了」。
+
+### 2026-09-28 一轮修复（客户端 5.6.2 字段加密 —— 同一处变更打断**两条**链路）
+
+**起因**：软件更新到 5.6.2 后签到连续失败（12:40–14:25 连续 9 次 `checkin failed`），
+报「未找到可用登录态」。用户的最初判断是「路径失效」。
+
+**真因（实测）**：**路径没变，变的是字段形态。** 登录态文件仍在
+`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`；变的是里面的
+`auth.accessToken` —— 从明文字符串改成了加密信封 `{"$wbEncrypted":1,"envelope":"<base64>"}`。
+旧代码的 `isinstance(token, str)` 直接跳过，于是「有登录态」被判成「没有登录态」。
+
+**★ 关键教训：同一处格式变更打断了**两条**链路，只修一条会留下静默故障。**
+
+- 链路① 签到 token（`scripts/credentials.py` + `scripts/atrest.py`）—— 离线 bundle 的 `3fd5aa6` 已修；
+- 链路② **推送 token**（`settings.json` 的 `weixinClawBot.botToken` / `channelId`）——
+  实测本机这两个字段**也是加密信封**（而 `accountId` / `baseUrl` / `userId` 仍明文）。
+  只修①的话：签到恢复正常、微信推送却照旧静默发不出去，日志里还看不出真因。→ 本轮补修 `clawbot.py`。
+
+本轮具体改动：
+
+32. **`clawbot.py`：推送凭据解密。** 新增 `_plain()`（是信封则解密；**解不开返回 `None`
+    而不是把 dict 原样带下去** —— 原实现会拼出 `Authorization: Bearer {'$wbEncrypted': …}`
+    这种废请求，既发不出去、又看不出为什么）。`channel_id` **优先取明文的 `accountId`**
+    （实测与加密前的 `channelId` 同值、且**始终明文**），这样即使密钥取不到，
+    `renew.py` 仍能拼出正确的游标文件名，不至于退化成空串。
+33. **`scripts/atrest.py`：密钥定位加进程内缓存。** 定位一次要扫 `WorkBuddy.exe` 的进程内存，
+    本机实测 **~6.5 秒**，而一次 catchup 会多次读凭据（预检 / 签到 / 旅行 / 推送 / renew）
+    → 加缓存后降到 **0.09 秒**。**只缓存命中结果**（未命中不缓存，避免一次偶发失败永久卡死）；
+    缓存键用 `keyId`（客户端轮换密钥时 keyId 随之变化，天然失效；万一复用同 keyId 换密钥，
+    AES-GCM 认证会失败报错，**fail-closed**，不会静默给出错误明文）。
+34. **`scripts/credentials.py`：删掉已明确失效的整条 legacy 链路**（−128 行）。
+    证据链：① 4 个 `state.vscdb` 候选**全不存在**；② `CodeBuddyExtension` 下**没有**
+    `User/globalStorage`；③ 本机现存 `state.vscdb` 属 CodeBuddy CN / Trae CN
+    （密钥是 `tencent-cloud.coding-copilot`，与 WorkBuddy 无关）；④ `_find_electron()` 返回空。
+    删除 `legacy_vscdb_candidates()` / `_read_legacy_blob()` / `_find_electron()` /
+    `_ELECTRON_DECRYPT_JS` / `_decrypt_legacy_blob()` / `_load_legacy()`，原址留说明注释防误加回。
+    顺手**新增便携兜底路径** `~/.workbuddy/auth/workbuddy-desktop.info`。
+    另外把「未找到登录态文件」的报错**改为指向真实原因并列出已探测路径** ——
+    原来无论哪种失败都报「请先登录」，把排查方向带偏。
+35. **`scripts/checkin.py` / `scripts/api_discovery.py`：删掉 `checkin-status` 兜底端点。**
+    实测它**恒返回 `active=false` 且字段全空** —— 会被当成「合法但空洞」的数据接受，
+    正是 2026-09-17「整天零积分、日志却看着正常」那次故障的根因。**留着它就是留一条会把故障
+    伪装成「今天没活动」的路径。** 现在兜底只剩 `checkin-activity-status` 的 `/v2/…` 与无前缀两种形式
+    （`TRUST_FIELDS` 全零判据仍保留，用于防**将来**再出现同类改名）。
+36. **`renew.py`：区分「没配 ClawBot 通道」与「游标文件真丢了」。** 旧版一律打印
+    `cursor file not found: None` —— 那个 `None` 既看不出原因、又每 30 分钟刷一次，容易被误当成
+    「监测坏了」。未配通道时（正常状态，非故障）改为 `未配置 ClawBot 通道，跳过游标监测（非故障）`。
+
+37. **弹窗的"假成功"：起进程成功 ≠ 窗口建出来了。**
+    `notify_card.py` 是用 tkinter 画的，而**托管 Python**
+    （`…\.workbuddy\binaries\python\versions\…\pythonw.exe`）**没有 tkinter**
+    —— `import tkinter` 直接 `ModuleNotFoundError`。此时卡片在 import 那一行就死，
+    但父进程的 `Popen` 毫无异常 → `_notify_windows_dialog` 返回 True → 日志写 `sent=True`、
+    `local_sent` 记一笔、`notify.py status` 显示「会正常弹出」——
+    **而窗口从头到尾没出现过。** 所有能观测到的地方都说"通知正常"，只有屏幕是空的。
+
+    ★ **实测复现**：用托管 Python 跑 `notify.py localtest`，标记文件停在占位 `pid: 0`；
+      换成任务实际使用的 `…\Python311\pythonw.exe`（tkinter 8.6），标记立刻变成真实 PID。
+
+    ★ **这一条当时并未影响线上**：4 个已注册任务的执行体都是
+      `%LOCALAPPDATA%\Programs\Python\Python311\pythonw.exe`（**有** tkinter），弹窗一直在正常弹。
+      会踩到它的是**将来**：`install.cmd` 走 `py -3`（系统 Python）没问题，
+      但若有人（或某个 Agent 会话）用**托管 Python** 跑一次 `install.py install`，
+      任务就会被钉到没有 tkinter 的解释器上 —— 而 `install.py status` 打印的 `python_for_task`
+      正是**当前解释器**算出来的值，等于把这个坑摆在眼前。所以这是必须堵的隐患，不是空修。
+
+    修法（两道，缺一不可）：
+
+    - **`winenv.dialog_python()`**：**真的去试** `exe -c "import tkinter"`，按
+      `WB_REWARD_PYTHON_TK` → 当前解释器的孪生 → 常见系统 Python 安装位置 的顺序，
+      挑一个能画窗口的；挑不到返回 `None` → 退回 Toast。结果按**进程内**缓存
+      （探测要起子进程，一次运行里可能通知多条，不该每条都探一遍）。
+      —— 为什么必须真试：tkinter 依赖 tcl/tk 的 DLL 与 `_tkinter.pyd`，
+      **同为 CPython 也可能被裁掉**，靠版本号或路径猜都会猜错。
+    - **`winenv._wait_card_started()`**：spawn 之后**等卡片把真实 PID 写进标记**（≤2.5s）。
+      等不到就清掉占位标记、返回 `False`，让调用方降级到 Toast 并进补弹队列。
+      这一条把"静默死掉"变成"如实报失败" ——
+      **判"通不通"要看窗口有没有建出来，不能看进程起没起来。**
+
+38. **自检基线 364 → 372**：新增 8 条，其中 5 条专钉这次的"假成功"修复
+    （没有 tkinter 的解释器不得被选中 / 挑不到要返回 False / 起了进程但不写 PID 必须判失败 /
+    判失败后不留假「待处理」标记 / `dialog_python` 逐个真试且按进程缓存）；
+    并把第 8o 节的 `_spawn` 桩改成**照着真实卡片的行为写回 PID**
+    （不这么改，它会被新逻辑**正确地**判成"卡片没起来"）。
+
+**验证**：`selftest.py` **364 项全部通过**（bundle 基线 347，本轮净增/改写 17 项）。新增第 8n 节
+`test_atrest_chain`，用 `atrest.seal()` **动态造信封**（用被测模块自身的算法，不写死密文），
+覆盖：信封识别 / 往返 / 明文兼容 / 缓存命中只算一次 / 未命中不缓存 / `_plain` 各分支 /
+加密 `botToken` 能解出 / `channel_id` 取 `accountId` / 解不开返回 `None`。
+端到端 `scripts/main.py all` → `checkin=already_checked`（+100，streak 4）、
+`travel=daily_limit_reached`、`preflight ok=true source=asar client_version=5.6.2`。
+
+**真实收益**：修好后运行 `catchup.py`，**当场补回当天漏掉的旅行奖励 +9 积分**
+（`travel claimed reward_credit=9 record_id=10349371`），当日 `checkin_done=true / claim_done=true`，
+合计 **+109**。
+
+**关于 `doctor.cmd` 的 `[FAIL] 计划任务未注册`**：本次受限上下文拦截了 `schtasks.exe` / `reg.exe`，
+属**假阴性**；改用 PowerShell 独立证实 **4 个任务均已注册、`Result=0`**。正常权限下 `doctor` 为
+`OK 21 / WARN 2 / FAIL 0`。两条 WARN（`没有 ClawBot 凭据`、`settings.json 候选路径`）是本机环境所致 ——
+本机只绑了公众号 `wechatmp`（**不算** ClawBot），推送已正确降级为本机通知。
+
+**社区实现的可用结论**：可吸收的只有**登录态路径候选兜底**与
+**推送通道设计（wecom / pushplus / bark）**两点。本轮取了前者（第 34 条）；
+后者本版已有等价物（pushplus / serverchan / ClawBot，见第 6 节）。
+
+### 2026-09-28 二轮：把「绑定 ClawBot 后消息能否送达」变成**可验证的**
+
+用户的要求是「保证如果绑定 ClawBot 时，消息可送达」。本机**没有**绑定 ClawBot（`claw.users = {}`，
+`claw.channels` 里只有公众号 `wechatmp`，那是**收信** webhook，不是出站推送），
+所以这一轮做的是：**把"送达"这件事从"应该能行"变成"有实证、能自查、失败会自己说清"**。
+
+#### 一、先证明"最底层通不通"（真实端点实测，非推演）
+
+用**假 token** 直接打腾讯 iLink 真实端点（`ilinkai.weixin.qq.com`）：
+
+| 探测 | 结果 |
+|---|---|
+| DNS | 4 个 IP（`101.227.131.211` 等） |
+| TLS | 握手 0.12s，TLSv1.3，证书 `CN=weixin.qq.com`（腾讯，DigiCert 签发，有效期至 2027-02-24） |
+| `POST /ilink/bot/sendmessage` | **HTTP 200** → `{"errcode":-14,"errmsg":"session timeout"}` |
+| `POST /ilink/bot/getconfig` / `getupdates` | HTTP 200 → 同样的 `-14` |
+| `POST /ilink/bot/<伪造路径>`（对照组） | **HTTP 404** |
+| `GET /ilink/bot/get_bot_qrcode?bot_type=3`（无需认证） | HTTP 200 → 真实 `qrcode` + `qrcode_img_content` + `ret:0` |
+
+含义：**本机到 iLink 的网络、TLS、路径都存在且可用**；三条业务端点返回的是**业务错误码**
+而不是 404/400，说明请求被服务端按正常流程受理了。对照组的 404 证明上面那些 200 不是"万事皆 200"的假象。
+
+#### 二、请求形状与客户端权威实现逐条核对（读 `app.asar` 得到）
+
+从 `C:\Program Files\WorkBuddy\resources\app.asar` 里导出 `weixin-api.ts` / `WeixinClawBotClient`
+的权威实现，与 `clawbot.py` 逐条对照，**全部一致**：
+
+| 项 | 客户端实现 | `clawbot.py` |
+|---|---|---|
+| 请求头 | `Content-Type` + `AuthorizationType: ilink_bot_token` + `X-WECHAT-UIN`（`base64(随机 uint32 十进制串)`）+ `Authorization: Bearer {botToken}` | 同 |
+| `base_info` | `{channel_version: "workbuddy-desktop-1.0.0"}`，所有 POST 自动附上 | 同 |
+| 发消息 body | `{msg: {from_user_id: "", to_user_id, client_id: workbuddy-{ts}-{rand}, message_type: 2, message_state: 2, context_token, item_list: [{type: 1, text_item: {text}}]}}` | 同 |
+| `getupdates` / `getconfig` | `{get_updates_buf}` / `{ilink_user_id, context_token}` | 同 |
+| 扫码登录 | `get_bot_qrcode?bot_type=3`，状态轮询带 `iLink-App-ClientVersion: 1` | 同 |
+| 登录返回映射 | `accountId = ilink_bot_id`、`userId = ilink_user_id` | 同（`save_credentials(bot_id=…)`） |
+
+#### 三、两条**协议事实**（本轮实测挖出来，之前文档里没有）
+
+39. **无效 `bot_token` 与真正过期的会话，服务端返回的是同一个错误码**（都是 `errcode=-14`，
+    `errmsg="session timeout"`）。所以 `-14` 有**两种**成因，而正确动作相反：
+    ① 会话真的过期 → 重新扫码/重新绑定有效；② 本机读到的凭据不对（token 空 / 解密失败 /
+    读成另一个账号）→ **重新扫码一万次也没用**，还会白吃 120 分钟熔断。
+    旧文案一口咬定①，把人往"反复扫码"上带 —— 而本轮上一节故障的真因恰恰是②。
+    → 已重写 `_explain_error` 的 `-14` 分支：给出两种可能 + 一条自查路径（Windows 指向
+    `doctor.cmd` 的「⑥ 微信通道」，mac 给 `python3 clawbot.py status`）。
+
+40. **桌面端不持久化 `context_token`，只持久化游标。** 把 `.cursor.json` 的写入点找全了：
+    客户端只有 `persistCursor(accountId, cursor)` 一处落盘，路径是
+    `<runtimeConfigDir>/claw-state/weixin/<accountId 把非 [A-Za-z0-9._-] 换 _>.cursor.json`
+    （`getWorkbuddyRuntimeConfigDir()` = `WORKBUDDY_CONFIG_DIR` → `runtimeContext.configDir`
+    → `~/.workbuddy`）。`context_token` 只活在客户端内存里。
+    **推论（决定了整条链路的形态）**：没有任何办法从磁盘"读"到可用的主动推送令牌 ——
+    它只能在**用户给机器人发消息的那一刻**由长轮询拿到。所以「绑定后还差一步」是**平台事实**，
+    不是本项目的实现缺陷；`ready` 与 `doctor` 的文案都改成直说这一点，而不是含糊地说"未绑定"。
+
+#### 四、因此补的东西
+
+41. **新增 `clawbot.py ready` + `check_channel.cmd`（绑定后一键验收）。**
+    分四段判定，缺哪段就停在哪段并说清下一步：① 凭据（含"加密字段解不开"的具体字段名）
+    ② 令牌（`getconfig` 只读验活，**不占推送配额**）③ 捕获（开 90 秒窗口等用户发一条）
+    ④ 实测（只有前两段都过才真发一条）。**没有可用令牌时故意不发** —— 那种请求服务端照单受理、
+    照样扣每日配额，但消息不会进微信。这是全项目唯一直接回答"成了没有"的命令。
+
+42. **修掉一个会让"绑定后收不到消息"的冷却死锁。** 旧实现里：首次推送因缺令牌失败 →
+    熔断 60 分钟 → **冷却期内把 `clawbot` 整个摘出可选通道** → 没有任何人再轮询 →
+    `context_token_ts` 永不前进 → `_inbound_since_cooldown()` 恒为 `False` →
+    **用户照本机告警的提示给机器人发了消息，也解锁不了**，只能硬等满 60 分钟。
+    而告警文案对用户的承诺恰恰是「发一条消息，推送随即恢复」。
+    → 新增 `_recover_while_cooling()`：冷却期内仍允许一次**有界捕获**（默认 25 秒窗口），
+    **只捕获、不重发**（捕获走 `getupdates`，不消耗推送配额）；捕获成功即解除冷却、
+    本轮的正常发送路径随即把通知发出去。加最小间隔护栏（默认 15 分钟），
+    避免每 5 分钟就去和桌面端抢一次 `getupdates`。
+
+43. **频率限制不再冻结整条通道 20 分钟。** `ret=-2` 原本一并落进 `other` 档
+    → `clawbot_failure_cooldown_minutes = 20`。可服务端自己给的指引是「约 7 条 / 5 分钟，
+    等 60–120 秒重试」—— 把一次限流放大成 20 分钟通道停摆，期间的通知全被挤到本机弹窗，
+    甚至（默认配额 8 条/天）把后面的通知预算吃光。→ 独立档 `clawbot_ratelimit_cooldown_minutes`
+    （默认 **3** 分钟）。
+
+44. **`doctor.py` 给出可送达性结论**，而不是罗列"凭据有/无、令牌有/无"：
+    持令牌 → `可送达性：具备投递条件`，并提示令牌是**临时**的、要确认此刻请跑 `check_channel.cmd`；
+    缺令牌 → `可送达性：还差一步 —— 缺 context_token` + 明确的恢复动作。顺带把
+    `last_send_error`（最近一次失败原因）也带出来 —— "微信没收到"时不该只能靠猜。
+    doctor 仍然**不联网**（离线要能跑、要快），在线验活交给 `ready`。
+
+45. **自检基线 372 → 415**（净增 43 项）。核心是新增第 **8p** 节
+    `test_clawbot_delivery_chain`：起一个**本地 HTTP 桩**模拟 iLink，按 5.6.2 的真实结构造一份
+    带加密信封的 `settings.json`，把整条链路跑通并逐字段核对报文 ——
+    覆盖「解出来的真实 token 进 `Authorization` 而**不是**信封」「`X-WECHAT-UIN` 形态」
+    「`base_info.channel_version`」「`from_user_id` 必须空串」「`client_id` 每条唯一」
+    「无令牌时必须判失败（否则就是假成功）」「`-14` / `prepare failed` / `ret=-2` 三种错误语义」
+    「`probe_context` 的两种结果」「凭据解不开时**零请求**（不白烧配额）」以及
+    `ready` 的分段结论。另外钉住了 42 / 43 / 44 三条修复（含"冷却期内 `send()` 真的会去捕获"
+    这条**集成**断言 —— 只测辅助函数的话，接线写错照样测不出来）。
+
+**本节验证**：`selftest.py` 在 **Python 3.13.12 与 3.11.1 下均 415/415 全绿**；
+`clawbot.py ready 0` 在本机（无凭据）干净退出并给出准确的 `gap` / `next_action`；
+真实端点连通性、协议形状见上文第一、二小节。
+
+**仍然只能由用户完成的一步**：在 WorkBuddy 里连上「微信助理」（或在微信里给机器人发一条消息），
+然后双击 `check_channel.cmd`。本机没有绑定，所以"真机送达"这一格只能在那台绑定了的机器上验 ——
+但在这之前，凡是**能**在这台机器上验的（网络、协议、报文、错误语义、自愈路径、防假成功）都已经验过了。
 
 ---
 

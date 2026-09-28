@@ -52,6 +52,7 @@ context_token：
 
 自测（Windows 下把 `python` 换成 `py -3` 亦可）：
   python clawbot.py status        # 只读：凭据 / context_token / 游标（含路径探测结果）
+  python clawbot.py ready         # ★ 绑定后一键验收：能不能真的送达（唯一回答"成了没有"的命令）
   python clawbot.py login         # 扫码重新登录（会话过期时用）
   python clawbot.py wait [秒数]   # 长轮询捕获 context_token（默认 60s）
   python clawbot.py test          # 真实推一条测试消息到微信
@@ -71,10 +72,12 @@ import urllib.parse
 import urllib.request
 
 DIR = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(DIR))   # 同目录（winenv）
+sys.path.insert(0, str(DIR))              # 同目录（winenv）
+sys.path.insert(0, str(DIR / "scripts"))  # atrest（5.6.2+ 字段解密）
 
-import winenv  # noqa: E402  跨平台适配层（settings 路径候选）
-import paths   # noqa: E402  runtime / logs / credentials path contract
+import winenv   # noqa: E402  跨平台适配层（settings 路径候选）
+import paths    # noqa: E402  runtime / logs / credentials path contract
+import atrest   # noqa: E402  5.6.2+ at-rest 加密信封解密
 
 STATE = paths.state_path("clawbot_state.json")
 
@@ -129,20 +132,61 @@ def _apply_user_override(ch: dict | None) -> dict | None:
 # 桌面端写 ClawBot 通道时用过的名字（不同版本/不同分支见过不止一种）
 _CLAWBOT_CHANNEL_NAMES = ("weixinClawBot", "clawbot", "clawBot", "weixin_claw_bot")
 
+# 「读到了 ClawBot 配置，但字段是加密信封且解不开」的字段名记录。
+# 只用于诊断输出（不含任何密文/明文），让 `status` 能说清"为什么推不了"。
+_ATREST_FAILED: list[str] = []
+
+
+def _plain(value):
+    """把可能是 at-rest 加密信封的字段解成明文；非字符串或解不开时返回 None。
+
+    ★ 2026-09-28 为什么需要：客户端 **5.6.2** 把 `settings.json` 里的敏感字段也
+      改成了加密信封 —— 实测 `weixinClawBot.channelId` 与 `botToken` 都是
+      `{"$wbEncrypted":1,"envelope":"…"}`，而 `accountId` / `baseUrl` / `userId`
+      仍是明文。**同一处格式变更同时打断了两条链路**：签到 token（credentials.py
+      已修）与推送 token（这里）。只修前者的话，签到恢复了、微信推送却照旧
+      静默发不出去 —— 正是项目记忆里「别只修一个」那条教训。
+    ★ 解不开时返回 None（而不是把 dict 原样带下去）：原实现会把 dict 当 token 用，
+      拼出 `Authorization: Bearer {'$wbEncrypted': …}` 这种废请求，
+      既发不出去、又在日志里看不出真因。
+    """
+    if isinstance(value, str):
+        return value or None
+    if atrest.is_envelope(value):
+        try:
+            out = atrest.decrypt_token(value)
+        except atrest.AtRestError:
+            return None
+        return out or None
+    return None
+
 
 def _pick_clawbot_channel(ch: dict | None) -> dict | None:
-    """从一个 channels 字典里挑出可用的 ClawBot 凭据；挑不到返回 None。"""
+    """从一个 channels 字典里挑出可用的 ClawBot 凭据；挑不到返回 None。
+
+    ★ 字段可能是 5.6.2+ 加密信封 → 经 `_plain` 解密后再用。
+    ★ channel_id 优先取**明文的 `accountId`**：实测它就是 `…@im.bot` 那个 id
+      （与加密前的 channelId 同值），且**始终明文**。这样即便密钥取不到，
+      `renew.py` 仍能拼出正确的游标文件名，不至于退化成空串。
+    """
     ch = ch or {}
-    token = ch.get("botToken") or ch.get("bot_token")
-    user_id = ch.get("userId") or ch.get("user_id")
+    token = _plain(ch.get("botToken") or ch.get("bot_token"))
+    user_id = _plain(ch.get("userId") or ch.get("user_id"))
     if ch.get("enabled") and token and user_id:
+        channel_id = (ch.get("accountId") or _plain(ch.get("channelId"))
+                      or _plain(ch.get("channel_id")))
         return {
             "bot_token": token,
-            "base_url": (ch.get("baseUrl") or ch.get("base_url")
+            "base_url": (_plain(ch.get("baseUrl") or ch.get("base_url"))
                          or DEFAULT_BASE_URL).rstrip("/"),
             "user_id": user_id,
-            "channel_id": ch.get("channelId") or ch.get("channel_id"),
+            "channel_id": channel_id,
         }
+    if ch.get("enabled") and (ch.get("botToken") or ch.get("bot_token")):
+        # 配置在、但字段解不开 → 记下来供 status 说明原因
+        for name in ("botToken", "bot_token", "userId", "user_id", "channelId", "channel_id"):
+            if atrest.is_envelope(ch.get(name)) and name not in _ATREST_FAILED:
+                _ATREST_FAILED.append(name)
     return None
 
 
@@ -368,10 +412,24 @@ def _explain_error(data: dict) -> str:
     detail = "（errcode={} ret={} errmsg={}）".format(errcode, ret, errmsg or "-")
 
     if errcode == -14 or ret == -14 or "session timeout" in low:
-        return (SESSION_EXPIRED_MARK + "（errcode=-14）：微信登录会话已失效，"
-                "发送消息无法恢复。请重新扫码登录："
-                "{}，".format(winenv.login_hint()) +
-                "或在 WorkBuddy 设置里重新绑定「微信 ClawBot」。")
+        # ★ 2026-09-28 实测补正：**服务端对「无效 bot_token」与「真正过期的会话」
+        #   返回的是同一个错误码** —— 本机拿一个假 token 直接打
+        #   /ilink/bot/sendmessage，得到的就是 {"errcode":-14,"errmsg":"session timeout"}
+        #   （同一次探测里 sendmessage / getconfig / getupdates 三个端点表现一致）。
+        #   所以 -14 有两种成因，而两者的正确动作完全相反：
+        #     ① 会话真的过期 —— 很久没在微信里跟这个机器人说过话。重新扫码/重新绑定有效。
+        #     ② 凭据压根没读对 —— token 为空、解密没解开、或读成了另一个账号的。
+        #        这种情况重新扫码一万次也没用，还会白吃 clawbot_cooldown_minutes
+        #        （默认 120）分钟的熔断。
+        #   旧文案一口咬定①，把用户往「反复扫码」上带 —— 而 2026-09-28 这一轮故障的
+        #   真因恰恰是②（客户端 5.6.2 把凭据字段改成加密信封，旧代码读不到明文 token）。
+        return (SESSION_EXPIRED_MARK + "（errcode=-14，errmsg={}）：".format(errmsg or "-") +
+                "服务端拒认这个 bot_token。它有**两种**成因，而服务端返回的是同一个码："
+                "① 会话真的过期；② 本机读到的凭据不对（token 空 / 解密失败 / 读成别的账号）。"
+                "②重新扫码不会好，所以先自查：{}。"
+                "凭据来源为 local-login → {}；"
+                "来源为 settings.json → 到 WorkBuddy 设置 → 远程通道里重新绑定「微信 ClawBot」。".format(
+                    winenv.clawbot_status_hint(), winenv.login_hint()))
     # 实测（2026-09-18）：ret=-2 配 errmsg="prepare failed" —— 服务端拒绝为这条
     # 主动消息做准备。它与「频率限制」共用 ret=-2，含义却完全不同，所以必须先判 errmsg。
     if "prepare" in low:
@@ -550,7 +608,14 @@ def capture_context_token(*, wait_seconds: int = 60) -> tuple[bool, str]:
     """长轮询等待用户发消息，抓到 context_token 即持久化。
 
     用法：先在微信里给 ClawBot 机器人发一条消息（如「1」），再运行本函数。
-    注意：WorkBuddy 桌面端若也在轮询同一 bot，会与本脚本抢消息；排障用即可，勿长期挂后台。
+
+    ⚠️ 2026-09-28 更正：**这里不存在「和桌面端抢消息」**。
+      旧注释写「桌面端也在轮询同一 bot，会与本脚本抢消息」——那条结论在
+      2026-09-17 就被实测推翻了：同一条消息（msgId `7506022356920827000`）
+      脚本与桌面端**各收到一次**，两边各自持有独立游标
+      （桌面端 `<bot_id>.cursor.json`，脚本 `clawbot_state.json.get_updates_buf`），
+      互不干扰。见项目记忆「ClawBot 通道关键事实」。
+      → 所以抓令牌**不会**让桌面端漏消息；只是长连接本身该克制，别长期挂后台。
     """
     deadline = time.monotonic() + max(wait_seconds, 10)
     last_err = ""
@@ -761,6 +826,114 @@ def qr_login(*, out_html: pathlib.Path | None = None,
 
 
 # ---------------------------------------------------------------------------
+# 绑定后的一键验收
+# ---------------------------------------------------------------------------
+def check_ready(wait_seconds: int = 90) -> dict:
+    """一次性回答「现在到底能不能把消息送进微信」。返回结构化结论；永不抛异常。
+
+    ★ 为什么需要它（2026-09-28 新增）：
+      项目的核心承诺是「每天的消息一定微信通知到」，但**「绑定好了」≠「能送达」** ——
+      主动推送还必须有 context_token，而它只能从**用户发给机器人的那条消息**里捕获。
+      这一步以前散落在 `wait` 与 `test` 两条命令里，没有任何一条命令直接回答
+      「到底成了没有、还差什么」。刚绑完 ClawBot 的人恰恰最需要这个答案。
+
+    判定分四段，任何一段不过就停在那里并说清下一步：
+      ① 凭据 —— 有没有、从哪读到的（含"加密字段解不开"这种具体原因）
+      ② 令牌 —— context_token 在不在、还灵不灵（getconfig 只读验活，**不占推送配额**）
+      ③ 捕获 —— 缺令牌时开一个窗口等用户发一条消息
+      ④ 实测 —— 只有①②都过才真发一条；否则**故意不发**，免得白烧 iLink 每日配额
+    """
+    out: dict = {"deliverable": False, "credentials": {}, "context_token": {},
+                 "test_send": {}, "gap": "", "next_action": ""}
+
+    # ---------------------------------------------------------------- ① 凭据
+    ch = load_channel()
+    if not ch:
+        out["credentials"] = {"found": False,
+                              "settings_candidates": winenv.describe_paths(settings_candidates())}
+        out["gap"] = "没有可用 ClawBot 凭据"
+        if _ATREST_FAILED:
+            out["gap"] += "（settings.json 里有加密字段解不开：{}）".format(
+                "、".join(sorted(set(_ATREST_FAILED))))
+        out["next_action"] = ("在 WorkBuddy 设置 → 远程通道里连接「微信助理」，"
+                              "或 {} 自建凭据。".format(winenv.login_hint()))
+        return out
+
+    out["credentials"] = {
+        "found": True,
+        "source": ch.get("source"),
+        "settings_file": ch.get("settings_file"),
+        "base_url": ch["base_url"],
+        "bot_token": mask(ch["bot_token"]),
+        "user_id": _to_user_id(ch["user_id"]),
+        "channel_id": ch.get("channel_id"),
+    }
+
+    # ---------------------------------------------------------------- ② 令牌
+    def _ctx_age() -> float | None:
+        ts = _load_state().get("context_token_ts")
+        return round((time.time() - ts) / 3600, 1) if isinstance(ts, (int, float)) else None
+
+    def _describe(valid, reason: str) -> dict:
+        ctx = _load_state().get("context_token") or ""
+        return {"present": bool(ctx), "valid": valid,
+                "age_hours": _ctx_age(), "reason": reason}
+
+    ctx = _load_state().get("context_token") or ""
+    if ctx:
+        valid, why = probe_context()
+        out["context_token"] = _describe(valid, why)
+    else:
+        out["context_token"] = _describe(None, "本地没有 context_token")
+
+    # ---------------------------------------------------------------- ③ 捕获
+    captured_note = ""
+    if out["context_token"].get("valid") is not True and wait_seconds > 0:
+        print(json.dumps({
+            "step": "capture",
+            "hint": "请立刻在微信里给机器人发任意一条消息（如「1」）；"
+                    "本命令将在 {} 秒内捕获它。".format(wait_seconds),
+        }, ensure_ascii=False), flush=True)
+        ok, why = capture_context_token(wait_seconds=wait_seconds)
+        captured_note = why
+        if ok:
+            valid2, why2 = probe_context()
+            out["context_token"] = _describe(valid2, "捕获后复验：" + why2)
+        else:
+            out["context_token"] = _describe(False, why)
+
+    # ---------------------------------------------------------------- ④ 实测
+    ctx = _load_state().get("context_token") or ""
+    fresh_ok = bool(ctx) and out["context_token"].get("valid") is not False
+    if fresh_ok:
+        ok, reason = send_text(
+            "【WorkBuddy 积分助手 · 通道验收】\n"
+            "收到这条即表示微信直推已打通，以后的签到 / 积分通知会发到这里。")
+        out["test_send"] = {"ok": ok, "reason": reason}
+        out["deliverable"] = bool(ok)
+    else:
+        out["test_send"] = {
+            "ok": False, "skipped": True,
+            "reason": "没有可用的 context_token，**故意不发** —— 这种推送服务端会照单受理、"
+                      "照样占掉每日配额，但消息不会出现在微信里（这正是最容易误判成"
+                      "「通道正常」的坑）",
+        }
+
+    if out["deliverable"]:
+        out["next_action"] = "无需操作。"
+    elif not ctx:
+        out["gap"] = "缺 context_token：主动推送必须在会话窗口内，而令牌只能从「用户发给机器人的消息」里捕获"
+        out["next_action"] = ("在微信里打开与机器人的对话，发任意一条消息（如「1」），"
+                              "然后重跑本命令" + ("（本次捕获也失败了：{}）".format(captured_note)
+                                                  if captured_note else "") + "。")
+    else:
+        out["gap"] = "已持有令牌，但实测发送失败"
+        out["next_action"] = ("看 test_send.reason 里的错误码；"
+                              "若是 -14（会话过期 / 凭据读错），先跑 clawbot.py status 分清。")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -862,6 +1035,13 @@ if __name__ == "__main__":
         print(json.dumps({"token_valid": ok, "reason": reason}, ensure_ascii=False))
         sys.exit(0 if ok else 1)
 
+    if action == "ready":
+        # 用法：ready [捕获窗口秒数，默认 90；给 0 表示只检查现有令牌、不等待]
+        secs = int(sys.argv[2]) if len(sys.argv) > 2 else 90
+        res = check_ready(wait_seconds=secs)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        sys.exit(0 if res["deliverable"] else 1)
+
     if action == "race":
         # 用法：race [文本] [等待秒数]
         # 语义：盯着入站消息，一旦用户发来消息就**立刻**抢发推送。
@@ -906,5 +1086,5 @@ if __name__ == "__main__":
         print(json.dumps({"sent": ok, "reason": reason}, ensure_ascii=False))
         sys.exit(0 if ok else 1)
 
-    print("用法：python clawbot.py [status|login|wait [秒数]|test|probe]")
+    print("用法：python clawbot.py [status|ready [秒数]|login|wait [秒数]|test|probe|race]")
     sys.exit(2)

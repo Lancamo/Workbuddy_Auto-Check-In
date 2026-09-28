@@ -110,10 +110,20 @@ DEFAULT_CONFIG = {
     "dedupe_window_minutes": 360,
     "max_pushes_per_day": 8,
     "clawbot_cooldown_minutes": 120,
-    # 熔断时长（分钟），按失败类型分三档。为什么分档：三种故障的「重试有没有意义」
+    # 熔断时长（分钟），按失败类型分四档。为什么分档：四种故障的「重试有没有意义」
     # 完全不同 —— 登录失效和投递被拒都要等人工动作，重试纯属浪费配额；网络抖动则应尽快重试。
     "clawbot_blocked_cooldown_minutes": 60,    # 投递被拒（prepare failed）→ 等用户开窗
     "clawbot_failure_cooldown_minutes": 20,    # 网络/未知失败 → 下下轮就重试
+    # 频率限制（ret=-2，非 prepare failed）：服务端自己说了「等 60–120 秒重试」。
+    # 2026-09-28 新增独立档位 —— 它原先落进 failure 档被冻 20 分钟，
+    # 等于把一次限流放大成 20 分钟的整条通道停摆（默认配额才 8 条/天，
+    # 20 分钟里本该送达的通知会被挤到本机弹窗，甚至因超配额彻底发不出去）。
+    "clawbot_ratelimit_cooldown_minutes": 3,
+    # 冷却期内「再捕获一次 context_token」的窗口与最小间隔（见 _recover_while_cooling）。
+    # 窗口要够用户看到本机告警、掏出手机、打一个字（25 秒起步）；
+    # 最小间隔明显大于熔断检查频率（每 5 分钟一次），避免把长连接一直挂在后台。
+    "clawbot_recover_window_seconds": 25,
+    "clawbot_recover_min_interval_minutes": 15,
 }
 
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
@@ -312,6 +322,80 @@ def _inbound_since_cooldown(st: dict) -> bool:
     if not isinstance(prev, (int, float)):
         return False
     return _current_inbound_ts() > float(prev)
+
+
+def _cfg_int(cfg: dict, key: str, default: int) -> int:
+    """从配置里取一个整数，坏了就回落默认值（配置是用户手改的，不能信）。"""
+    try:
+        return int(cfg.get(key) if cfg.get(key) is not None else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clawbot_recoverable(st: dict) -> bool:
+    """当前冷却是否属于「用户发一条消息就能恢复」那一档。
+
+    判据就是 `cooldown_context_ts` 是否存在 —— 只有 blocked / token_missing
+    两类失败会写它（见 send() 里的 cd_key 分支）；session 档不写，因为
+    会话过期只能重新扫码，捕获再多消息也没用。
+    """
+    return isinstance(st.get("cooldown_context_ts"), (int, float))
+
+
+def _recover_while_cooling(st: dict, cfg: dict, now: float) -> tuple[bool, str]:
+    """冷却期内开一个**有界**捕获窗口：抓住用户新发的消息就解除冷却。
+
+    ★ 为什么必须有这一步（2026-09-28 修，实测发现）：
+      旧实现在冷却期内把 clawbot 整个摘出 `order` → **没有任何人再轮询** →
+      `context_token_ts` 永不前进 → `_inbound_since_cooldown()` 恒为 False →
+      用户即使照着本机告警的提示给机器人发了消息，也解锁不了，
+      只能硬等满 `clawbot_blocked_cooldown_minutes`（默认 60 分钟）。
+      而告警文案对用户的承诺恰恰是「发一条消息，推送随即恢复」——
+      这个函数就是让那句承诺成真的唯一手段。链路里没有别的轮询者
+      （桌面端只在内存里持有自己的 context_token，且它自己轮询的那份游标
+      与我们无关，见 README「桌面端不持久化 context_token」那节）。
+
+    ★ 为什么只「捕获」不「重发」：
+      冷却的本意是别拿注定失败的请求去烧 iLink 每日配额（默认 8 条）。
+      捕获走 getupdates，**不消耗推送配额**，所以照做无妨；
+      捕获成功后冷却即被清除，紧接着的正常发送路径自然就把这条通知发出去了。
+
+    ★ 为什么要有最小间隔：
+      捕获本身不抢桌面端的消息（各方游标独立，2026-09-17 实测同一条消息两边各收一份），
+      但它毕竟是一条长连接，长期高频地挂在后台没有意义 ——
+      所以最小间隔（默认 15 分钟）要明显大于熔断检查的频率（每 5 分钟一次）。
+
+    返回 (冷却是否已解除, 说明)。
+    """
+    if clawbot is None:
+        return False, "clawbot 模块未加载"
+
+    gap_min = _cfg_int(cfg, "clawbot_recover_min_interval_minutes", 15)
+    last = st.get("last_recover_ts")
+    if gap_min > 0 and isinstance(last, (int, float)) and now - last < gap_min * 60:
+        return False, "距上次恢复尝试不足 {} 分钟，先不抢轮询".format(gap_min)
+
+    st["last_recover_ts"] = now
+    _save_state(st)
+    window = max(_cfg_int(cfg, "clawbot_recover_window_seconds", 25), 10)
+    try:
+        ok, why = clawbot.capture_context_token(wait_seconds=window)
+    except Exception as e:  # noqa: BLE001
+        return False, "捕获异常：" + str(e)[:120]
+
+    # capture 内部会读写盘上的 state（新 token / 游标）。无条件刷新内存快照，
+    # 否则稍后 _save_state(st) 会用进入本函数前的旧值覆盖掉盘上最新状态。
+    fresh = _load_state()
+    st.clear()
+    st.update(fresh)
+
+    if ok:
+        _clear_clawbot_cooldown(st)
+        st.pop("cooldown_context_ts", None)
+        st.pop("last_send_error", None)
+        _save_state(st)
+        return True, why
+    return False, why
 
 
 # ---------------------------------------------------------------------------
@@ -570,8 +654,9 @@ def _recapture_and_resend(cfg: dict, title: str, content: str,
       3. 抓到新 token 立即重发一次。
 
     代价与边界：
-      · 捕获用 getupdates 会与桌面端抢消息，抢到的那条桌面端看不到（bot 不回复它）。
-        自愈场景一次的代价可接受，与 clawbot.py「排障用即可」的结论一致。
+      · 捕获走 getupdates，**不消耗推送配额**。它**不会**抢走桌面端的消息：
+        2026-09-17 实测同一条消息两边各收一次（各自独立游标），
+        旧注释里「会与桌面端抢消息」的说法已作废（见项目记忆）。
       · 最坏阻塞约 90 秒；计划任务每 5 分钟触发一次，可接受。
       · 重发这次请求单独计入每日配额（请求即消耗，与 iLink 规则一致）；
         原始失败那次由主循环照常计入。
@@ -729,9 +814,21 @@ def send(title: str, content: str, level: str = "info", force: bool = False,
         st.pop("cooldown_context_ts", None)
         st.pop("last_send_error", None)
         cooldown_min = 0
+    if cooldown_min and "clawbot" in order and _clawbot_recoverable(st):
+        # ★ 2026-09-28：冷却期内也要留一次「捕获」机会。
+        #   旧实现到这里就把 clawbot 摘掉 → 没人轮询 → 用户照告警提示发来的那条
+        #   消息永远接不住 → 冷却必然走满 60 分钟（详见 _recover_while_cooling）。
+        recovered, rec_note = _recover_while_cooling(st, cfg, now)
+        if recovered:
+            cooldown_min = 0
+            out["reason"] = "冷却期内捕获到新消息，已解除冷却（{}）".format(rec_note)
+        else:
+            out["reason"] = ("ClawBot 会话冷却中（还剩约 {} 分钟）；"
+                             "本轮已尝试捕获新消息：{}".format(cooldown_min, rec_note))
     if cooldown_min and "clawbot" in order:
         order = [c for c in order if c != "clawbot"]
-        out["reason"] = "ClawBot 会话冷却中（还剩约 {} 分钟）".format(cooldown_min)
+        if not out["reason"]:
+            out["reason"] = "ClawBot 会话冷却中（还剩约 {} 分钟）".format(cooldown_min)
 
     if not order:
         if not out["reason"]:
@@ -763,6 +860,12 @@ def send(title: str, content: str, level: str = "info", force: bool = False,
         return out
 
     reasons = []
+    # 保住循环之前写下的前置说明（目前只可能是「冷却中 / 冷却已解除」那一段）。
+    # 为什么要保住：失败时下面会用 reasons 整体覆盖 out["reason"]，于是
+    # 「冷却期内捕获到你的消息、已解除冷却」这条**对用户最有用的证据**会被抹掉 ——
+    # 而它正是告诉用户「你刚发的那条消息我们收到了」的唯一信号。
+    if out["reason"]:
+        reasons.append(out["reason"])
     for ch in order:
         ok, reason = _send_via(ch, cfg, title, content)
         # 原始尝试的送达结果（配额按它记；自愈重发在辅助函数里单独记）
@@ -791,6 +894,15 @@ def send(title: str, content: str, level: str = "info", force: bool = False,
                     # 结果是把配额耗尽、连本该能送达的通知也只能降级成本机弹窗。
                     # 归进「要等人工动作」那一档（与 blocked 同为 60 分钟）。
                     kind = "token_missing"
+                elif (clawbot is not None
+                      and getattr(clawbot, "RATE_LIMIT_MARK", "频率限制") in r_str):
+                    # ★ 2026-09-28：频率限制单独成档。
+                    #   它原先落进 other 档 → 被 clawbot_failure_cooldown_minutes 冻 20 分钟。
+                    #   可服务端自己给的指引是「约 7 条/5 分钟，等 60–120 秒重试」——
+                    #   把一次限流放大成 20 分钟通道停摆，会让这期间本该送达的通知
+                    #   全被挤到本机弹窗，甚至（默认配额 8 条/天）把后面的通知预算吃光。
+                    #   capture 类的自愈对它也无意义：限流不是「窗口没开」，等一会儿就好。
+                    kind = "ratelimit"
                 else:
                     kind = "other"            # 网络/未知：短冷却，允许较早重试
 
@@ -809,6 +921,7 @@ def send(title: str, content: str, level: str = "info", force: bool = False,
                         "session": "clawbot_cooldown_minutes",
                         "blocked": "clawbot_blocked_cooldown_minutes",
                         "token_missing": "clawbot_blocked_cooldown_minutes",
+                        "ratelimit": "clawbot_ratelimit_cooldown_minutes",
                         "other": "clawbot_failure_cooldown_minutes",
                     }[kind]
                     try:

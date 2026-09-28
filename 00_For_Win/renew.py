@@ -318,12 +318,19 @@ def check(*, now: datetime.datetime | None = None, force: bool = False) -> dict:
                  "cursor_age_hours": cs["age_hours"],
                  "last_session_expired": last_expired_at()}
 
-    # 游标文件不存在 —— 桌面端从未用过该 bot，或路径规则变了
+    # 游标文件不存在。两种情况处置完全不同，日志必须分得开：
+    #   ① **根本没配 ClawBot 通道**（如本机只绑了公众号 webhook）→ 这是**正常状态**，
+    #      不是故障。旧版会打印 `cursor file not found: None` —— 那个 None 既看不出
+    #      原因，又每 30 分钟刷一次，容易被误当成"监测坏了"。
+    #   ② 配了通道，但桌面端从未用过该 bot / 路径规则变了 → 这才需要排查。
     if not cs["found"]:
         out["action"] = "no_cursor"
         st["last_cursor_ok_ts"] = None
         save_state(st)
-        log("cursor file not found: {}".format(cs.get("path")))
+        if not _cursor_name():
+            log("未配置 ClawBot 通道，跳过游标监测（非故障）")
+        else:
+            log("cursor file not found: {}".format(cs.get("path")))
         return out
 
     stale_hours = float(cfg.get("cursor_stale_hours") or 24)

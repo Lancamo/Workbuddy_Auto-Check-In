@@ -461,6 +461,52 @@ def test_windows_output_decoding() -> None:
         clawbot.settings_candidates = saved_candidates
         clawbot.load_channel = saved_load
 
+    # ★ 2026-09-28：凭据在、但缺 context_token 时，doctor 必须直说「可送达性还差一步」。
+    #   为什么单独钉：「绑定好了」≠「能送达」—— 主动推送还必须有 context_token，
+    #   而它只能从「用户发给机器人的那条消息」里捕获。旧检查只罗列两条事实
+    #   （凭据有/无、令牌有/无），不回答用户真正关心的那个问题。
+    saved_state = clawbot.internal_state
+    try:
+        clawbot.settings_candidates = lambda: [pathlib.Path("C:/nonexistent/settings.json")]
+        clawbot.load_channel = lambda: {
+            "source": "workbuddy-settings", "bot_token": "TOK-1234567890",
+            "base_url": "https://ilinkai.weixin.qq.com",
+            "user_id": "u@im.wechat", "channel_id": "acc@im.bot"}
+
+        clawbot.internal_state = lambda: {}
+        report = doctor.Report()
+        doctor.check_clawbot(report)
+        blob = json.dumps(report.items, ensure_ascii=False)
+        check("凭据在但缺 context_token：doctor 明确报「还差一步」，不只罗列事实",
+              "可送达性" in blob and "还差一步" in blob, blob)
+        check("并把用户导向一键验收入口（check_channel.cmd）",
+              "check_channel.cmd" in blob, blob)
+        check("同时仍不产生 FAIL（微信是可选通道，不该阻塞签到）",
+              not [i for i in report.items if i["level"] == doctor.FAIL],
+              json.dumps([i["name"] for i in report.items
+                          if i["level"] == doctor.FAIL], ensure_ascii=False))
+
+        clawbot.internal_state = lambda: {"context_token": "CTX",
+                                          "context_token_ts": time.time()}
+        report = doctor.Report()
+        doctor.check_clawbot(report)
+        blob2 = json.dumps(report.items, ensure_ascii=False)
+        check("持令牌时报「具备投递条件」，并说明令牌是临时的",
+              "具备投递条件" in blob2 and "临时" in blob2, blob2)
+
+        clawbot.internal_state = lambda: {"context_token": "CTX",
+                                          "context_token_ts": time.time(),
+                                          "last_send_error": "会话已过期（errcode=-14）"}
+        report = doctor.Report()
+        doctor.check_clawbot(report)
+        blob3 = json.dumps(report.items, ensure_ascii=False)
+        check("把最近一次失败原因也带出来（「微信没收到」时别只能靠猜）",
+              "最近一次发送失败原因" in blob3, blob3)
+    finally:
+        clawbot.internal_state = saved_state
+        clawbot.settings_candidates = saved_candidates
+        clawbot.load_channel = saved_load
+
 
 # ---------------------------------------------------------------------------
 # 3. asar 版本解析（Windows 没有 Info.plist，只能走这条路）
@@ -661,20 +707,30 @@ def test_credential_paths() -> None:
         if ra:
             check("Windows：候选仍含 %APPDATA%（向后兼容，不删旧路径）",
                   any(p.lower().startswith(ra.lower()) for p in cands), "\n".join(cands))
-        vscdb = C.legacy_vscdb_candidates()
-        if la:
-            check("Windows：旧版 state.vscdb 候选也含 %LOCALAPPDATA%",
-                  any(p.lower().startswith(la.lower()) for p in vscdb), "\n".join(vscdb))
-        if ra:
-            check("Windows：旧版 state.vscdb 候选仍含 %APPDATA%",
-                  any(p.lower().startswith(ra.lower()) for p in vscdb), "\n".join(vscdb))
         # 诊断信息（恒真）：把本机实际命中情况打出来，排障时一眼可见
         hit = [p for p in cands if os.path.isfile(p)]
         check("（提示）本机登录态候选的实际命中情况", True,
               "命中 {} 个：{}".format(len(hit), hit or "(无 —— 说明尚未登录或路径未覆盖)"))
     else:
-        check("非 Windows：登录态候选只有 1 条（不混入 Windows 路径）",
-              len(cands) == 1, "\n".join(cands))
+        check("非 Windows：候选 = 平台路径 + 便携兜底（共 2 条，不混入 Windows 路径）",
+              len(cands) == 2, "\n".join(cands))
+
+    # 便携 / 未知布局兜底（社区实现常用的候选表）
+    portable = os.path.join(os.path.expanduser("~"), ".workbuddy", "auth",
+                            "workbuddy-desktop.info")
+    check("候选末尾含 ~/.workbuddy/auth 便携兜底",
+          any(p == portable for p in cands), "\n".join(cands))
+
+    # ★ 2026-09-28 的「删除」也要被钉住：旧版 state.vscdb + Electron safeStorage
+    #   回退链路在 5.6.2 上已明确失效（候选路径全不存在、找不到 Electron、
+    #   现存 state.vscdb 属于别的应用），整链已移除。
+    #   这条断言的作用：若日后有人「顺手」把它加回来，测试会立刻提醒去核对
+    #   —— 加回来要么有新的实测依据，要么就是在复活一条死路径。
+    check("旧版 state.vscdb 回退链路已按计划移除（防误加回）",
+          not hasattr(C, "legacy_vscdb_candidates")
+          and not hasattr(C, "_load_legacy")
+          and not hasattr(C, "_find_electron"),
+          "credentials.py 仍暴露 legacy_vscdb_candidates/_load_legacy/_find_electron")
 
 
 # ---------------------------------------------------------------------------
@@ -997,7 +1053,7 @@ def test_structure() -> None:
                 "renew.py", "clawbot.py", "selftest.py", "README.md",
                 "watchdog.py",
                 "install.cmd", "uninstall.cmd", "doctor.cmd", "run_now.cmd",
-                "login.cmd", "wait_token.cmd",
+                "login.cmd", "wait_token.cmd", "check_channel.cmd",
                 "scripts/main.py", "scripts/checkin.py", "scripts/travel.py",
                 "scripts/api_discovery.py", "scripts/credentials.py",
                 "scripts/http_client.py"]
@@ -1127,11 +1183,14 @@ def test_platform_hints() -> None:
         real = winenv.platform()
         sc_real = winenv.selfcheck_hint()
         lh_real = winenv.login_hint()
+        ch_real = winenv.clawbot_status_hint()
         if real == "win":
             check("真机是 Windows：selfcheck_hint 给 doctor.cmd 且不含 python3",
                   "doctor.cmd" in sc_real and "python3" not in sc_real, sc_real)
             check("真机是 Windows：login_hint 给 login.cmd 且不含 python3",
                   "login.cmd" in lh_real and "python3" not in lh_real, lh_real)
+            check("真机是 Windows：clawbot_status_hint 给 doctor.cmd 且不含 python3",
+                  "doctor.cmd" in ch_real and "python3" not in ch_real, ch_real)
         else:
             check("真机非 Windows：selfcheck_hint 给 mac/linux 命令",
                   "python3" in sc_real, sc_real)
@@ -1147,10 +1206,13 @@ def test_platform_hints() -> None:
         winenv.IS_WIN = True
         sc = winenv.selfcheck_hint()
         lh = winenv.login_hint()
+        ch = winenv.clawbot_status_hint()
         check("win 上 selfcheck_hint 不含 python3", "python3" not in sc, sc)
         check("win 上 selfcheck_hint 指向 doctor.cmd", "doctor.cmd" in sc, sc)
         check("win 上 login_hint 不含 python3", "python3" not in lh, lh)
         check("win 上 login_hint 指向 login.cmd", "login.cmd" in lh, lh)
+        check("win 上 clawbot_status_hint 不含 python3", "python3" not in ch, ch)
+        check("win 上 clawbot_status_hint 指向 doctor.cmd", "doctor.cmd" in ch, ch)
 
         # --- ③ 再翻回非 Windows 做反向断言（旧测试缺这一半，
         #        所以「文案有没有真的跟着平台走」其实没被验证过）---
@@ -1159,6 +1221,9 @@ def test_platform_hints() -> None:
         sc_mac = winenv.selfcheck_hint()
         check("翻回 mac 后 selfcheck_hint 给回 mac 命令（文案确实跟着平台走）",
               "python3" in sc_mac, sc_mac)
+        ch_mac = winenv.clawbot_status_hint()
+        check("翻回 mac 后 clawbot_status_hint 给回 mac 命令（同上，别漏了它）",
+              "python3" in ch_mac, ch_mac)
         # 回到 Windows，供下面 clawbot / renew / catchup 的正文断言使用
         winenv.platform = lambda: "win"
         winenv.IS_WIN = True
@@ -1241,9 +1306,9 @@ def test_notification_split() -> None:
         {"level": level, "sent": False, "channel": "stub", "reason": "selftest"},
     )[1]
 
-    def run(c: dict, t: dict) -> None:
+    def run(c: dict, t: dict, done: dict | None = None) -> None:
         captured.clear()
-        catchup._report(c, t, {"checkin_done": True, "claim_done": True}, {})
+        catchup._report(c, t, done or {"checkin_done": True, "claim_done": True}, {})
 
     try:
         run({"status": "success", "credit": 100, "streak_days": 3,
@@ -1290,13 +1355,26 @@ def test_notification_split() -> None:
               all(x["level"] != "success" for x in captured),
               str([(x["level"], x["title"]) for x in captured]))
 
+        # ★ 2026-09-28 修正：这两条原先用 done=全 True 去测「失败必须照报」，
+        #   与 catchup.py 的现行语义（**失败告警只针对真正待办的事项**，
+        #   见 _report 里 failed 的 done_map 过滤）自相矛盾 —— 测试自己也过期了
+        #   （在未改动的 bundle 上同样失败）。这里按真实语义拆成两个方向来钉。
         run({"status": "failed", "reason": "网络异常"},
-            {"status": "claimed", "reward_credit": 7})
-        check("签到失败但旅行成功 → 到账一条 + 失败一条（互不吞掉）",
+            {"status": "claimed", "reward_credit": 7},
+            {"checkin_done": False, "claim_done": True})
+        check("签到未完成 + 本次查询失败 → 到账一条 + 失败一条（互不吞掉）",
               len(captured) == 2, "实际 {} 条".format(len(captured)))
         check("成功与失败分别成条",
               any(x["level"] == "success" for x in captured)
               and any(x["level"] == "failure" for x in captured),
+              str([(x["level"], x["title"]) for x in captured]))
+
+        # 反向：当日已完成的事项，其查询失败**不该**惊动用户
+        run({"status": "failed", "reason": "网络异常"},
+            {"status": "claimed", "reward_credit": 7},
+            {"checkin_done": True, "claim_done": True})
+        check("签到当日已完成时的查询失败 → 不报 failure（不惊动）",
+              not any(x["level"] == "failure" for x in captured),
               str([(x["level"], x["title"]) for x in captured]))
     finally:
         catchup.notify.send = orig
@@ -2098,6 +2176,501 @@ def test_clawbot_channel_shapes() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 8n. 5.6.2 at-rest 加密：签到链路 + 推送链路 + 密钥缓存
+# ---------------------------------------------------------------------------
+def test_atrest_chain() -> None:
+    """客户端 5.6.2 的 at-rest 字段加密，**两条链路**都要能解。
+
+    ★ 为什么两条都要钉（2026-09-28）：同一处格式变更同时打断了两个受害者 ——
+        ① `workbuddy-desktop.info` 的 `auth.accessToken`  → 签到用
+        ② `settings.json` 的 `weixinClawBot.botToken`/`channelId` → 推送用
+      只修①的话，签到恢复了、微信推送却照旧发不出去；更糟的是旧代码会把
+      **dict 当成 token** 拼进 `Authorization: Bearer {...}` —— 请求注定失败，
+      日志里还看不出真因。所以两条链路各自钉住。
+
+    ★ 同时钉住本轮的**密钥缓存**：定位一次要扫客户端进程内存（实测 ~6 秒），
+      同一次运行里必须只扫一次；但**未命中不得缓存**，否则一次偶发失败
+      （客户端还没起）会把后续所有运行永久卡死。
+    """
+    section("8n. 5.6.2 at-rest 加密（签到 + 推送两条链路）")
+    import base64 as b64
+    import atrest
+    import clawbot
+
+    secret = b64.b64encode(bytes(range(32))).decode("ascii")
+    key, key_id = atrest.derive_key(secret)
+
+    def seal(text: str) -> dict:
+        """按客户端同款算法造一个加密信封（不依赖真实客户端）。"""
+        nonce = bytes(range(12))
+        blob = atrest.aes_gcm_encrypt(key, nonce, text.encode("utf-8"),
+                                      atrest.build_aad(key_id, 1))
+        ct, tag = blob[:-16], blob[-16:]
+        inner = {"suite": 1, "keyId": key_id,
+                 "nonce": b64.b64encode(nonce).decode("ascii"),
+                 "authTag": b64.b64encode(tag).decode("ascii"),
+                 "ciphertext": b64.b64encode(ct).decode("ascii")}
+        return {"$wbEncrypted": 1,
+                "envelope": b64.b64encode(json.dumps(inner).encode("utf-8")).decode("ascii")}
+
+    env = seal("hello-at-rest")
+    check("is_envelope 认得出加密信封", atrest.is_envelope(env))
+    check("is_envelope 不把明文串误判成信封", not atrest.is_envelope("eyJhbGciOi.J9.x"))
+    check("信封解析出 5 个标准字段",
+          sorted(atrest.parse_envelope(env).keys())
+          == ["authTag", "ciphertext", "keyId", "nonce", "suite"])
+
+    saved_key = os.environ.get("WORKBUDDY_ATREST_KEY")
+    saved_cache = dict(atrest._SECRET_CACHE)
+    try:
+        os.environ["WORKBUDDY_ATREST_KEY"] = secret
+        atrest._SECRET_CACHE.clear()
+        check("密封 → 解密 往返一致", atrest.decrypt_token(env) == "hello-at-rest")
+        check("非信封值原样返回（明文 JWT 向后兼容）",
+              atrest.decrypt_token("plain.jwt.token") == "plain.jwt.token")
+
+        # 缓存：必须只对「命中」生效
+        atrest._SECRET_CACHE.clear()
+        calls = {"n": 0}
+        orig_locate = atrest._locate_secret_key_uncached
+
+        def counting(kid):
+            calls["n"] += 1
+            return orig_locate(kid)
+
+        atrest._locate_secret_key_uncached = counting
+        try:
+            for _ in range(3):
+                atrest.locate_secret_key(key_id)
+            check("命中后的密钥定位只真正执行一次（进程内缓存）", calls["n"] == 1,
+                  "实际执行 {} 次".format(calls["n"]))
+        finally:
+            atrest._locate_secret_key_uncached = orig_locate
+
+        atrest._SECRET_CACHE.clear()
+        atrest._locate_secret_key_uncached = lambda kid: None
+        try:
+            atrest.locate_secret_key("0000000000000000")
+            atrest.locate_secret_key("0000000000000000")
+            check("未命中不写缓存（下次运行应重新尝试）",
+                  "0000000000000000" not in atrest._SECRET_CACHE)
+        finally:
+            atrest._locate_secret_key_uncached = orig_locate
+        atrest._SECRET_CACHE.clear()
+
+        # ② 推送链路
+        check("_plain：明文原样返回", clawbot._plain("TOK") == "TOK")
+        check("_plain：空串 → None", clawbot._plain("") is None)
+        check("_plain：None → None", clawbot._plain(None) is None)
+        check("_plain：加密信封 → 解出明文",
+              clawbot._plain(seal("BOT-TOKEN")) == "BOT-TOKEN")
+        check("_plain：信封损坏 → None（绝不把密文当 token 用）",
+              clawbot._plain({"$wbEncrypted": 1, "envelope": "not-base64"}) is None)
+
+        got = clawbot._pick_clawbot_channel({
+            "enabled": True, "botToken": seal("BOT-TOKEN"),
+            "userId": seal("user@im.wechat"),
+            "accountId": "example-current-bot@im.bot",
+            "channelId": seal("example-current-bot@im.bot"),
+            "baseUrl": "https://ilinkai.weixin.qq.com",
+        })
+        check("加密的 botToken / userId 能解出",
+              bool(got) and got.get("bot_token") == "BOT-TOKEN"
+              and got.get("user_id") == "user@im.wechat",
+              json.dumps(got, ensure_ascii=False))
+        check("channel_id 取**明文** accountId（即使 channelId 也被加密）",
+              bool(got) and got.get("channel_id") == "example-current-bot@im.bot",
+              json.dumps(got, ensure_ascii=False))
+
+        failed_before = len(clawbot._ATREST_FAILED)
+        bad = clawbot._pick_clawbot_channel({
+            "enabled": True, "botToken": {"$wbEncrypted": 1, "envelope": "broken"},
+            "userId": "u@im.wechat"})
+        check("botToken 解不开 → 不返回凭据（退回本机通知，而不是发废请求）",
+              bad is None)
+        check("并记下失败字段，供 status 说明原因",
+              len(clawbot._ATREST_FAILED) > failed_before,
+              str(clawbot._ATREST_FAILED))
+    finally:
+        atrest._SECRET_CACHE.clear()
+        atrest._SECRET_CACHE.update(saved_cache)
+        if saved_key is None:
+            os.environ.pop("WORKBUDDY_ATREST_KEY", None)
+        else:
+            os.environ["WORKBUDDY_ATREST_KEY"] = saved_key
+
+
+# ---------------------------------------------------------------------------
+# 8p. 推送链路端到端：加密凭据 → 请求形状 → 响应语义（本地桩，不联网）
+# ---------------------------------------------------------------------------
+def test_clawbot_delivery_chain() -> None:
+    """ClawBot 推送的**端到端**回归：从 5.6.2 的加密 settings.json 一路走到 HTTP 响应。
+
+    ★ 为什么必须有这一节（2026-09-28）：
+      在这之前，自检只覆盖到「字段能不能解出来」（见 8n），**没有任何一节**验证过
+      「解出来之后请求长什么样、响应怎么判」。于是两类缺陷完全测不出来：
+        · 请求头 / 报文形状写错 —— 服务端会拒，但本地一切正常；
+        · 判断送达的条件写错 —— 服务端受理了、日志记成功，消息却到不了微信。
+      本节起一个本地 HTTP 桩模拟 iLink，把整条链路跑通，并**逐字段核对报文**
+      与客户端权威实现（app.asar 里的 `weixin-api.ts` / `WeixinClawBotClient`）一致。
+      桩是本地的，不联网、不消耗任何真实配额。
+
+    ★ 顺带把一条协议事实钉成回归：**无效 token 与过期会话同码**。
+      本机拿假 token 打真实端点实测得到 `{"errcode":-14,"errmsg":"session timeout"}` ——
+      所以 -14 不能一口咬定「会话过期」，文案必须给出「也可能是凭据读错」的第二可能。
+    """
+    section("8p. ClawBot 推送端到端（本地桩：加密凭据 → 报文 → 响应语义）")
+    import base64 as b64
+    import http.server
+    import threading
+    import atrest
+    import clawbot
+    import notify
+    import paths as paths_mod
+
+    secret = b64.b64encode(bytes(range(32))).decode("ascii")
+    key, key_id = atrest.derive_key(secret)
+
+    def seal(text: str) -> dict:
+        """按客户端同款算法造一个加密信封（与 8n 同构，不依赖真实客户端）。"""
+        nonce = bytes(range(12))
+        blob = atrest.aes_gcm_encrypt(key, nonce, text.encode("utf-8"),
+                                      atrest.build_aad(key_id, 1))
+        ct, tag = blob[:-16], blob[-16:]
+        inner = {"suite": 1, "keyId": key_id,
+                 "nonce": b64.b64encode(nonce).decode("ascii"),
+                 "authTag": b64.b64encode(tag).decode("ascii"),
+                 "ciphertext": b64.b64encode(ct).decode("ascii")}
+        return {"$wbEncrypted": 1,
+                "envelope": b64.b64encode(json.dumps(inner).encode("utf-8")).decode("ascii")}
+
+    def is_uin(v) -> bool:
+        """X-WECHAT-UIN 必须是 base64(十进制 uint32) —— 与客户端 randomWechatUin 同构。"""
+        try:
+            raw = b64.b64decode(str(v).encode("ascii")).decode("ascii")
+            return raw.isdigit() and 0 <= int(raw) <= 0xFFFFFFFF
+        except Exception:  # noqa: BLE001
+            return False
+
+    REAL_TOKEN = "REAL-BOT-TOKEN-abcdefghijklmnop"
+    USER_ID = "user-openid-xyz"
+    ACCOUNT_ID = "example-current-bot@im.bot"
+
+    seen: list = []
+    # reply = 所有路径的统一回答；by_path 可按端点覆盖（getconfig 与 sendmessage
+    # 需要不同的回答，才能把 check_ready 这条多段流程走完）
+    script: dict = {"reply": {"ret": 0, "errcode": 0, "message_id": 1}, "by_path": {}}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):  # noqa: D102  静音，别污染自检输出
+            pass
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n).decode("utf-8", "replace")
+            seen.append({
+                "path": self.path,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": json.loads(raw) if raw else {},
+            })
+            reply = (script.get("by_path") or {}).get(self.path, script["reply"])
+            out = json.dumps(reply).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    base_url = "http://127.0.0.1:{}".format(port)
+
+    def write_settings(path: pathlib.Path, token_field) -> pathlib.Path:
+        path.write_text(json.dumps({
+            "claw": {"users": {"u1": {"channels": {"weixinClawBot": {
+                "enabled": True,
+                "botToken": token_field,
+                "userId": USER_ID,
+                "accountId": ACCOUNT_ID,          # 明文，始终可读
+                "baseUrl": base_url,
+            }}}}},
+        }, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    with tmpdir() as td:
+        td = pathlib.Path(td)
+        settings = write_settings(td / "settings.json", seal(REAL_TOKEN))
+        bad_settings = write_settings(td / "bad.json",
+                                      {"$wbEncrypted": 1, "envelope": "broken"})
+
+        saved = {
+            "cands": clawbot.settings_candidates,
+            "state": clawbot.STATE,
+            "secure": paths_mod.secure_runtime_files,
+            "nstate": notify.STATE,
+            "nconfig": notify.CONFIG,
+            "env": os.environ.get("WORKBUDDY_ATREST_KEY"),
+            "cache": dict(atrest._SECRET_CACHE),
+        }
+        try:
+            os.environ["WORKBUDDY_ATREST_KEY"] = secret
+            atrest._SECRET_CACHE.clear()
+            clawbot.settings_candidates = lambda: [settings]
+            clawbot.STATE = td / "clawbot_state.json"
+            notify.STATE = td / "notify_state.json"
+            notify.CONFIG = td / "notify_config.json"
+            # 这两个模块写盘后都会 secure 一次 runtime 目录；自检不该动真实 ACL
+            paths_mod.secure_runtime_files = lambda: None
+
+            # ---------------------------------------------------------- ① 凭据
+            ch = clawbot.load_channel()
+            check("加密 settings.json → 解出可用凭据，且 channel_id 取明文 accountId",
+                  bool(ch) and ch.get("bot_token") == REAL_TOKEN
+                  and ch.get("channel_id") == ACCOUNT_ID,
+                  json.dumps({k: ("…" if k == "bot_token" else v)
+                              for k, v in (ch or {}).items()}, ensure_ascii=False))
+
+            # ------------------------------------------- ② 缺 token：不得假成功
+            seen.clear()
+            script["reply"] = {"ret": 0, "errcode": 0, "message_id": 12345}
+            ok, reason = clawbot.send_text("t1")
+            check("★ 无 context_token：服务端受理了也必须判失败（否则就是假成功）",
+                  ok is False and clawbot.TOKEN_MISSING_MARK in reason, reason)
+            check("  请求确实发出去了（受理也占配额，所以不能靠「没报错」当送达）",
+                  len(seen) == 1 and seen[0]["path"].endswith("/ilink/bot/sendmessage"),
+                  json.dumps([s["path"] for s in seen]))
+
+            req = seen[0]
+            hdr = req["headers"]
+            body = req["body"]
+            msg = body.get("msg") or {}
+            cid1 = msg.get("client_id")
+
+            # 请求头：逐字段对齐客户端 buildHeaders()
+            check("Authorization 用的是**解出来的真实 token**，不是加密信封",
+                  hdr.get("authorization") == "Bearer " + REAL_TOKEN,
+                  str(hdr.get("authorization")))
+            check("AuthorizationType: ilink_bot_token",
+                  hdr.get("authorizationtype") == "ilink_bot_token",
+                  str(hdr.get("authorizationtype")))
+            check("X-WECHAT-UIN 是 base64(十进制 uint32)（防重放，与 randomWechatUin 同构）",
+                  is_uin(hdr.get("x-wechat-uin")), str(hdr.get("x-wechat-uin")))
+            check("Content-Type: application/json",
+                  (hdr.get("content-type") or "").startswith("application/json"),
+                  str(hdr.get("content-type")))
+
+            # 报文：逐字段对齐客户端 sendTextReply()
+            check("base_info.channel_version 与客户端一致",
+                  (body.get("base_info") or {}).get("channel_version")
+                  == "workbuddy-desktop-1.0.0",
+                  json.dumps(body.get("base_info"), ensure_ascii=False))
+            check("from_user_id 必须是空串（不能省字段）", msg.get("from_user_id") == "",
+                  json.dumps(msg.get("from_user_id"), ensure_ascii=False))
+            check("to_user_id 补上 @im.wechat 后缀",
+                  msg.get("to_user_id") == USER_ID + "@im.wechat",
+                  str(msg.get("to_user_id")))
+            check("message_type=2 且 message_state=2",
+                  msg.get("message_type") == 2 and msg.get("message_state") == 2,
+                  "{}/{}".format(msg.get("message_type"), msg.get("message_state")))
+            check("文本项形状 item_list[0].text_item.text",
+                  ((msg.get("item_list") or [{}])[0].get("text_item") or {}).get("text")
+                  == "t1", json.dumps(msg.get("item_list"), ensure_ascii=False))
+            check("无令牌时不带 context_token 字段（带了会误导服务端）",
+                  "context_token" not in msg, json.dumps(msg, ensure_ascii=False))
+
+            # ------------------------------------------------- ③ 有 token：送达
+            clawbot.remember_context_token("CTX-123")
+            seen.clear()
+            ok, reason = clawbot.send_text("t2")
+            check("有 context_token：受理 + 持令牌 → 判送达", ok is True, reason)
+            msg2 = (seen[0]["body"] or {}).get("msg") or {}
+            check("带上了 context_token", msg2.get("context_token") == "CTX-123",
+                  str(msg2.get("context_token")))
+            check("client_id 每条唯一（重复会被服务端按幂等去重而不再投递）",
+                  bool(cid1) and msg2.get("client_id") != cid1,
+                  "{} vs {}".format(cid1, msg2.get("client_id")))
+
+            # ------------------------------------------------------------- ④ -14
+            st = clawbot._load_state()
+            st["get_updates_buf"] = "BUF-1"
+            clawbot._save_state(st)
+            script["reply"] = {"errcode": -14, "errmsg": "session timeout"}
+            ok, reason = clawbot.send_text("t3")
+            check("★ -14 → 会话已过期（notify 靠这个字面量做熔断）",
+                  ok is False and clawbot.SESSION_EXPIRED_MARK in reason, reason)
+            check("  -14 文案必须同时给出「也可能是凭据读错」这一种可能",
+                  "凭据" in reason, reason)
+            check("  -14 时清空同步游标（协议要求：-14 后不得沿用旧游标）",
+                  "get_updates_buf" not in clawbot.internal_state())
+
+            # ------------------------------------------- ⑤ prepare failed（被拒）
+            script["reply"] = {"ret": -2, "errmsg": "prepare failed"}
+            ok, reason = clawbot.send_text("t4")
+            check("★ prepare failed → 投递被拒（与频率限制共用 ret=-2，必须先判 errmsg）",
+                  ok is False and clawbot.DELIVER_BLOCKED_MARK in reason, reason)
+
+            # ------------------------------------------------ ⑥ ret=-2 频率限制
+            script["reply"] = {"ret": -2, "errmsg": "freq limit"}
+            ok, reason = clawbot.send_text("t5")
+            check("ret=-2（无 prepare 字样）→ 频率限制",
+                  ok is False and clawbot.RATE_LIMIT_MARK in reason, reason)
+
+            # ------------------------------------------- ⑦ probe_context 验活
+            script["reply"] = {"ret": 0, "typing_ticket": "TK-1"}
+            ok, reason = clawbot.probe_context()
+            check("probe_context：getconfig ret=0 + typing_ticket → 令牌有效", ok, reason)
+            script["reply"] = {"ret": 0}
+            ok, reason = clawbot.probe_context()
+            check("probe_context：ret=0 但没有 typing_ticket → 判令牌失效",
+                  ok is False, reason)
+
+            # ------------------------------------------- ⑧ 凭据解不开：零请求
+            clawbot.settings_candidates = lambda: [bad_settings]
+            seen.clear()
+            ok, reason = clawbot.send_text("never")
+            check("★ 凭据解不开时一条请求都不发（不白烧 iLink 配额）且判失败",
+                  ok is False and not seen, reason)
+            clawbot.settings_candidates = lambda: [settings]
+
+            # ------------------------------- ⑨ check_ready 的结论字段完整可用
+            #   ready 一条命令要走完「凭据 → 令牌验活 → 实测发送」，
+            #   所以桩必须对 getconfig 与 sendmessage 分别回答。
+            clawbot.remember_context_token("CTX-READY")
+            script["by_path"] = {
+                "/ilink/bot/getconfig": {"ret": 0, "typing_ticket": "TK-2"},
+                "/ilink/bot/sendmessage": {"ret": 0, "errcode": 0, "message_id": 777},
+            }
+            res = clawbot.check_ready(wait_seconds=0)
+            check("★ check_ready 报 deliverable=True 并给出四段结论",
+                  res.get("deliverable") is True
+                  and set(res) >= {"credentials", "context_token", "test_send",
+                                   "gap", "next_action"}
+                  and res.get("next_action") == "无需操作。",
+                  json.dumps(res, ensure_ascii=False))
+
+            # 反向：令牌已被判失效且不等待 → 必须**故意不发**，免得白烧配额
+            script["by_path"] = {"/ilink/bot/getconfig": {"ret": 0}}
+            res2 = clawbot.check_ready(wait_seconds=0)
+            check("★ check_ready：令牌验活失败时不发测试消息（省配额）并说清差距",
+                  res2.get("deliverable") is False
+                  and (res2.get("test_send") or {}).get("skipped") is True
+                  and bool(res2.get("gap")),
+                  json.dumps({"gap": res2.get("gap"),
+                              "test_send": res2.get("test_send")}, ensure_ascii=False))
+            script["by_path"] = {}
+
+            # ------------------------- ⑩ 冷却死锁修复（notify 侧，纯本地判定）
+            check("可恢复型冷却被识别（blocked / token_missing）",
+                  notify._clawbot_recoverable(
+                      {"clawbot_cooldown_until": time.time() + 3600,
+                       "cooldown_context_ts": time.time() - 60}))
+            check("session 型冷却不算可恢复（只能重新扫码，捕获再多也没用）",
+                  not notify._clawbot_recoverable(
+                      {"clawbot_cooldown_until": time.time() + 3600}))
+
+            cap_calls = {"n": 0}
+            saved_cap = clawbot.capture_context_token
+
+            def _fake_capture(wait_seconds=60):
+                cap_calls["n"] += 1
+                clawbot.remember_context_token("CTX-NEW")
+                return True, "stub 捕获成功"
+
+            clawbot.capture_context_token = _fake_capture
+            try:
+                st2 = {"clawbot_cooldown_until": time.time() + 3600,
+                       "cooldown_context_ts": time.time() - 60}
+                got, note = notify._recover_while_cooling(st2, {}, time.time())
+                check("★ 冷却期内能捕获并**解除冷却**"
+                      "（旧实现在这里根本不轮询 → 用户发了消息也得硬等满）",
+                      got is True and "clawbot_cooldown_until" not in st2, note)
+
+                st3 = {"clawbot_cooldown_until": time.time() + 3600,
+                       "cooldown_context_ts": time.time() - 60,
+                       "last_recover_ts": time.time()}
+                got2, note2 = notify._recover_while_cooling(st3, {}, time.time())
+                check("最小间隔内不再抢轮询（避免每 5 分钟和桌面端抢一次 getupdates）",
+                      got2 is False and cap_calls["n"] == 1, note2)
+            finally:
+                clawbot.capture_context_token = saved_cap
+
+            check("频率限制有独立冷却档，且远短于 20 分钟（限流不该冻结整条通道）",
+                  notify.DEFAULT_CONFIG.get("clawbot_ratelimit_cooldown_minutes") is not None
+                  and int(notify.DEFAULT_CONFIG["clawbot_ratelimit_cooldown_minutes"]) <= 5,
+                  str(notify.DEFAULT_CONFIG.get("clawbot_ratelimit_cooldown_minutes")))
+
+            # ---------- ⑪ 集成：send() 在冷却期内真的会去捕获，并继续发送 ----------
+            #   ⑩ 只直接测了辅助函数；这里钉住 notify.send() 的**接线** ——
+            #   旧实现在 send() 里就把 clawbot 摘出了 order，辅助函数写得再对也白搭。
+            #   ⚠️ 场景必须造准：`cooldown_context_ts` 是「失败发生那一刻的入站基线」，
+            #   只有在**之后没有新的入站消息**时冷却才真的挂着。所以这里把
+            #   clawbot 记录的入站时刻设成更早（2 小时前），失败基线设成 1 小时前 ——
+            #   否则 `_inbound_since_cooldown` 会（正确地）判定窗口已重开、直接放行，
+            #   根本走不到「冷却期内捕获」这条分支。
+            stx = clawbot._load_state()
+            stx["context_token_ts"] = time.time() - 7200
+            clawbot._save_state(stx)
+            notify.STATE.write_text(json.dumps({
+                "clawbot_cooldown_until": time.time() + 3600,
+                "cooldown_context_ts": time.time() - 3600,
+            }, ensure_ascii=False), encoding="utf-8")
+
+            saved_load_ch = clawbot.load_channel
+            saved_send_text = clawbot.send_text
+            saved_native_on = notify._native_enabled
+            saved_send_via = notify._send_via
+            tried = {"n": 0}
+
+            def _fake_send_via(ch_name, cfg, title, content):
+                tried["n"] += 1
+                return False, "stub：投递被拒（prepare failed）"
+
+            clawbot.load_channel = lambda: {
+                "bot_token": REAL_TOKEN, "base_url": base_url,
+                "user_id": USER_ID, "channel_id": ACCOUNT_ID, "source": "stub"}
+            # 本机通知关掉：只关心「有没有去捕获 / 有没有继续尝试发送」，
+            # 别真弹一张卡片出来打扰用户
+            notify._native_enabled = lambda cfg: False
+            notify._send_via = _fake_send_via
+            cap_calls["n"] = 0
+            clawbot.capture_context_token = _fake_capture
+            try:
+                res = notify.send("t", "b", level="success",
+                                  force=False, allow_recapture=False)
+            finally:
+                clawbot.load_channel = saved_load_ch
+                clawbot.send_text = saved_send_text
+                clawbot.capture_context_token = saved_cap
+                notify._native_enabled = saved_native_on
+                notify._send_via = saved_send_via
+
+            check("★ 冷却期内 notify.send() 仍去捕获新消息"
+                  "（旧实现在这里根本不碰 clawbot → 用户发了消息也得硬等满）",
+                  cap_calls["n"] == 1, str(res.get("reason")))
+            check("★ 捕获成功 → 本轮继续尝试发送（冷却被解除，不再被跳过）",
+                  tried["n"] == 1, json.dumps(res, ensure_ascii=False))
+            check("★ 失败文案里保住「已解除冷却」——它是「你那条消息我们收到了」的唯一信号",
+                  "解除冷却" in str(res.get("reason")),
+                  json.dumps(res, ensure_ascii=False))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            clawbot.settings_candidates = saved["cands"]
+            clawbot.STATE = saved["state"]
+            notify.STATE = saved["nstate"]
+            notify.CONFIG = saved["nconfig"]
+            paths_mod.secure_runtime_files = saved["secure"]
+            atrest._SECRET_CACHE.clear()
+            atrest._SECRET_CACHE.update(saved["cache"])
+            if saved["env"] is None:
+                os.environ.pop("WORKBUDDY_ATREST_KEY", None)
+            else:
+                os.environ["WORKBUDDY_ATREST_KEY"] = saved["env"]
+
+
+# ---------------------------------------------------------------------------
 # 8m. 本机通知必须「看得见」（常驻 Toast + 常驻被拒时退回普通 Toast）
 # ---------------------------------------------------------------------------
 def test_native_toast_persistent() -> None:
@@ -2329,7 +2902,8 @@ def test_modal_alert() -> None:
 
     calls: list = []
     orig_spawn = W._spawn
-    saved_default_python = W.default_python
+    saved_dialog_python = W.dialog_python
+    saved_start_timeout = W._DIALOG_START_TIMEOUT
     saved_subprocess_flags = W.subprocess_flags
     with tmpdir() as td:
         logdir = pathlib.Path(td) / "logs"
@@ -2338,12 +2912,26 @@ def test_modal_alert() -> None:
                 pid = 424242
 
             def _fake_spawn(args, **kw):
+                """模拟卡片进程：**真的把 PID 写进标记文件**。
+
+                ★ 2026-09-28 起 `_notify_windows_dialog` 会等卡片写回真实 PID，
+                  以此确认"窗口真的建出来了"（起进程成功 ≠ 窗口建出来了）。
+                  桩必须照着真实卡片的行为做，否则会被（正确地）判成"没起来"。
+                """
                 calls.append((args, kw))
+                mark = (kw.get("env") or {}).get("WB_DLG_MARK")
+                if mark:
+                    pathlib.Path(mark).write_text(
+                        json.dumps({"pid": _FakeProc.pid, "ts": time.time()}),
+                        encoding="utf-8")
                 return _FakeProc()
 
             # 自检在 macOS 上运行时，真实 `platform()`/解释器探测会返回 mac 路径；
             # 这里只替换被 `_notify_windows_dialog` 实际调用的两个边界，保持产品逻辑不变。
-            W.default_python = lambda windowless=False: r"C:\Python312\pythonw.exe"
+            # ★ 2026-09-28 起换的是 `dialog_python`（弹窗专用、要求解释器真有 tkinter），
+            #   不再是 `default_python` —— 后者只保证"是运行自己的那个解释器"。
+            W.dialog_python = lambda windowless=True: r"C:\Python312\pythonw.exe"
+            W._DIALOG_START_TIMEOUT = 0.3   # 失败分支别真等 2.5 秒
             W.subprocess_flags = lambda: {"creationflags": 8}  # DETACHED_PROCESS
             W._spawn = _fake_spawn
             ok = W._notify_windows_dialog("标题", "正文", logdir)
@@ -2374,6 +2962,35 @@ def test_modal_alert() -> None:
             check("弹窗后留下「待处理」标记（用于限制堆积）",
                   len(list((pathlib.Path(td) / "state").glob("notify_dialog_*.json"))) == 1)
 
+            # ------------------------------------------------------------------
+            # ★ 2026-09-28 新增：两条防「假成功」的断言。
+            #   起因是真实故障 —— 解释器没有 tkinter，卡片在 `import tkinter` 就死，
+            #   而旧实现只看 `Popen` 成功，于是日志写 `sent=True`、状态显示"会正常弹出"，
+            #   **窗口却从没出现过**。判"通不通"必须看"窗口有没有建出来"。
+            # ------------------------------------------------------------------
+            sd0 = pathlib.Path(td) / "state"
+            calls.clear()
+            W.dialog_python = lambda windowless=True: None
+            check("★ 没有能画 tkinter 的解释器 → 返回 False（退回 Toast，不假成功）",
+                  not W._notify_windows_dialog("t", "b", logdir) and not calls,
+                  "spawn 次数={}".format(len(calls)))
+            W.dialog_python = lambda windowless=True: r"C:\Python312\pythonw.exe"
+
+            # 起了进程、但卡片始终不写真实 PID（= 窗口没建出来，如 import 后即死）
+            def _spawn_no_pid(args, **kw):
+                calls.append((args, kw))     # 仍然要记下来：证明**确实起过进程**
+                return _FakeProc()
+
+            calls.clear()
+            W._spawn = _spawn_no_pid
+            check("★ 卡片起来却不写 PID（=窗口没建出来）→ 判失败，不记成功",
+                  not W._notify_windows_dialog("t", "b", logdir) and calls,
+                  "spawn 次数={}".format(len(calls)))
+            check("★ 判失败后清掉占位标记（不留假「待处理」）",
+                  len(list(sd0.glob("notify_dialog_*.json"))) == 0,
+                  str(sorted(p.name for p in sd0.glob("notify_dialog_*.json"))))
+            W._spawn = _fake_spawn
+
             # 屏幕上已经堆了 N 个没人点的弹窗 → 不再堆（退回 Toast + 补弹队列）
             sd = pathlib.Path(td) / "state"
             for i in range(W._DIALOG_MAX):
@@ -2386,9 +3003,49 @@ def test_modal_alert() -> None:
             check("_live_dialogs 按 PID 存活判定（自己这个进程算活着）",
                   W._live_dialogs(logdir) == W._DIALOG_MAX,
                   str(W._live_dialogs(logdir)))
+
+            # ------------------------------------------------------------------
+            # dialog_python()：必须**真的去试**「能不能 import tkinter」。
+            #   tkinter 依赖 tcl/tk 的 DLL 与 `_tkinter.pyd`，**同为 CPython 也可能被裁掉**
+            #   （托管/嵌入式发行版常缺），所以不能靠版本号或路径猜，只能真跑一次。
+            # ------------------------------------------------------------------
+            W.dialog_python = saved_dialog_python        # 先还原真身，再测它自己
+            saved_tk_ok = W._tkinter_ok
+            saved_cands = W._tkinter_candidates
+            saved_cache = dict(W._TK_CACHE)
+            try:
+                probes: list = []
+                W._tkinter_candidates = lambda windowless=True: [
+                    "C:\\NoTk\\pythonw.exe", "C:\\HasTk\\pythonw.exe"]
+                W._tkinter_ok = lambda exe: (probes.append(exe), "HasTk" in exe)[1]
+                W._TK_CACHE.clear()
+                got = W.dialog_python()
+                check("★ dialog_python 跳过没有 tkinter 的解释器，选中能画窗口的那个",
+                      got == "C:\\HasTk\\pythonw.exe",
+                      "选中={} 探测序列={}".format(got, probes))
+                check("★ 按优先级逐个真试，命中即停",
+                      probes == ["C:\\NoTk\\pythonw.exe", "C:\\HasTk\\pythonw.exe"],
+                      str(probes))
+                n = len(probes)
+                W.dialog_python()
+                check("★ 结果按进程缓存（一次运行里通知多条不重复起子进程探测）",
+                      len(probes) == n, "多探测了 {} 次".format(len(probes) - n))
+
+                W._tkinter_ok = lambda exe: False
+                W._TK_CACHE.clear()
+                check("★ 候选全都没有 tkinter → 返回 None（调用方退回 Toast）",
+                      W.dialog_python() is None)
+                check("★ 未命中也缓存：一次运行里不反复探测（进程一退即失效再探）",
+                      True in W._TK_CACHE)
+            finally:
+                W._tkinter_ok = saved_tk_ok
+                W._tkinter_candidates = saved_cands
+                W._TK_CACHE.clear()
+                W._TK_CACHE.update(saved_cache)
         finally:
             W._spawn = orig_spawn
-            W.default_python = saved_default_python
+            W.dialog_python = saved_dialog_python
+            W._DIALOG_START_TIMEOUT = saved_start_timeout
             W.subprocess_flags = saved_subprocess_flags
 
         # 组合：走弹窗时不再补弹（否则同一条会弹两次）；弹窗不可用才退回 Toast + 补弹
@@ -2595,6 +3252,8 @@ def main() -> int:
         test_watchdog_job_state()
         test_localized_console_text()
         test_clawbot_channel_shapes()
+        test_atrest_chain()
+        test_clawbot_delivery_chain()
         test_native_toast_persistent()
         test_notify_reshow()
         test_modal_alert()

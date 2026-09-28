@@ -452,12 +452,102 @@ def default_python(windowless: bool = False) -> str:
     两侧语义一致：**用运行自己的那个解释器**，拷到任何机器都成立，无需改任何常量。
     mac 版等价实现是 `catchup.py` 里的 `PY = sys.executable`；
     Windows 这里多一层 python.exe ↔ pythonw.exe 的切换（计划任务要无控制台的 pythonw）。
+
+    ⚠️ 但「运行自己的解释器」**不保证能画窗口** —— 见下面的 `dialog_python()`。
     """
     env = os.environ.get("WB_REWARD_PYTHON")
     if env and pathlib.Path(env).is_file():
         return env
     paths = python_exe_paths()
     return paths["windowless"] if windowless else paths["console"]
+
+
+# ---------------------------------------------------------------------------
+# 弹窗卡片专用解释器：必须**真能 import tkinter**
+# ---------------------------------------------------------------------------
+# ★ 为什么不能沿用 default_python（2026-09-28 修的真实缺陷，本机实测）：
+#   `notify_card.py` 是用 tkinter 画的，而计划任务跑的解释器是「WorkBuddy 自带的
+#   托管 Python」（`…\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe`）
+#   —— **它没有 tkinter**（`import tkinter` 直接 ModuleNotFoundError）。
+#   后果是最恶劣的一类"假成功"：
+#     · 卡片进程在 import 那一行就死了 → **窗口从头到尾没出现过**；
+#     · 而父进程的 `Popen` 已经成功返回 → `_notify_windows_dialog` 报 True；
+#     · 于是日志写 `sent=True`、`local_sent` 记一笔、`notify.py status` 显示
+#       "会正常弹出" —— **所有可观测的地方都说通知正常，只有屏幕是空的。**
+#   用户 2026-09-28 的一句话点破了它：「已经可以成功签到并通知吗」。
+#
+# 所以这里**不再假设"运行自己的解释器就能画窗口"**，而是真的去起子进程试一下 import；
+# 试不出来的机器就老实退回 Toast（宁可弹一条会自己消失的，也不能假装弹过了）。
+_TK_CACHE: dict[bool, str | None] = {}
+
+
+def _tkinter_ok(exe: str) -> bool:
+    """这个解释器能不能 `import tkinter`。起不来/超时/任何异常都算不能。
+
+    用 `-c "import tkinter"` 而不是看版本号或猜路径：tkinter 依赖 tcl/tk 的 DLL
+    与 `_tkinter.pyd`，**同为 CPython 也可能缺**（托管/嵌入式发行版常被裁掉），
+    只有真跑一次才作数。
+    """
+    try:
+        r = subprocess.run([exe, "-c", "import tkinter"],
+                           capture_output=True, timeout=15)
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _tkinter_candidates(windowless: bool = True) -> list[str]:
+    """候选解释器，按优先级。宁可多列几个 —— 逐个探测没有副作用。"""
+    out: list[str] = []
+
+    def add(p) -> None:
+        if p and pathlib.Path(str(p)).is_file() and str(p) not in out:
+            out.append(str(p))
+
+    # ① 显式指定：部署方/用户的逃生口（托管运行时不可用的机器靠它一劳永逸）
+    add(os.environ.get("WB_REWARD_PYTHON_TK"))
+    # ② 当前解释器的孪生（多数"正常装了 Python"的机器上到这里就命中）
+    paths = python_exe_paths()
+    add(paths["windowless"] if windowless else paths["console"])
+    add(paths["console"] if windowless else paths["windowless"])
+    # ③ 常见系统 Python 安装位置：托管运行时没有 tkinter 时的正解
+    #    （实测 `%LOCALAPPDATA%\Programs\Python\Python311\pythonw.exe` 有 tkinter 8.6）
+    if platform() == "win":
+        roots: list[pathlib.Path] = []
+        la = localappdata()
+        if la:
+            roots.append(la / "Programs" / "Python")
+            roots.append(la / "Programs" / "Python" / "Launcher")
+        roots.extend(programfiles())
+        roots.append(pathlib.Path("C:\\"))
+        names = ("pythonw.exe",) if windowless else ("python.exe",)
+        for root in roots:
+            try:
+                # Python311 之类的目录，版本高的优先（sorted 逆序）
+                for d in sorted(root.glob("Python3*"), reverse=True):
+                    for n in names:
+                        add(d / n)
+            except OSError:
+                continue
+    return out
+
+
+def dialog_python(windowless: bool = True) -> str | None:
+    """挑一个**真能画 tkinter 卡片**的解释器；挑不到返回 `None`（调用方退回 Toast）。
+
+    结果按 `windowless` 缓存在**进程内**：探测要起子进程，而一次运行里可能通知多条
+    （成功 / 失败 / 补弹），不该每条都探一遍。命中与未命中都缓存 —— 缓存的生命周期
+    就是本次进程，进程一退就没了，所以"用户刚装了个 Python"下次运行自然会重新探。
+    """
+    if windowless in _TK_CACHE:
+        return _TK_CACHE[windowless]
+    found: str | None = None
+    for exe in _tkinter_candidates(windowless):
+        if _tkinter_ok(exe):
+            found = exe
+            break
+    _TK_CACHE[windowless] = found
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +579,20 @@ def login_hint() -> str:
     if platform() == "win":
         return "双击本文件夹下的 login.cmd"
     return '"{}" clawbot.py login'.format(default_python())
+
+
+def clawbot_status_hint() -> str:
+    """让用户自查「微信通道凭据读到了什么」的方式。
+
+    ★ 为什么 -14 的文案需要它（2026-09-28）：实测发现服务端对**无效 bot_token**
+      与**真正过期的会话**返回的是**同一个**错误码（假 token 打 sendmessage 也得到
+      `{"errcode":-14,"errmsg":"session timeout"}`）。所以 -14 有可能只是「凭据没读对」，
+      此时重新扫码毫无用处 —— 必须先让用户看到凭据的来源与形态。
+      同样必须调 `platform()`（理由见 selfcheck_hint）。
+    """
+    if platform() == "win":
+        return "双击本文件夹下的 doctor.cmd，看「⑥ 微信通道」一节"
+    return "python3 clawbot.py status"
 
 
 # ---------------------------------------------------------------------------
@@ -717,6 +821,39 @@ _DIALOG_MAX = 3          # 屏幕上最多同时存在几个待处理弹窗
 #   ② 它的相对路径基准不是脚本目录，标记文件会被写到别处 —— Python 版都没有。
 _DIALOG_SCRIPT = HERE / "notify_card.py"
 
+# 卡片启动握手的时间上限（秒）。卡片启动后会**立刻**用自己的真实 PID 覆盖占位标记；
+# 本机实测预热后 ~0.2s 就写好，给 2.5s 留足冷启动余量。
+# 超时只意味"这一张没弹出来"，不会久拖主脚本 —— 而它换来的是**不再假成功**。
+_DIALOG_START_TIMEOUT = 2.5
+
+
+def _wait_card_started(mark: pathlib.Path,
+                       timeout: float | None = None) -> bool:
+    """等卡片把**自己的真实 PID** 写进标记文件；等不到返回 False。
+
+    ★ 为什么不看 `Popen` 成不成功：**起进程成功 ≠ 窗口建出来了**。
+      实测解释器缺 tkinter 时，卡片在 `import tkinter` 那一行就退出，
+      而 `Popen` 毫无异常 —— 正是这个缺口让 2026-09-28 的"假成功"瞒了整整一轮。
+      卡片是在窗口构建完成、算好坐标之后才写 PID 的（见 notify_card.py），
+      所以"看到真实 PID"≈"窗口真的建出来了"。
+
+    `timeout` 默认取模块常量 `_DIALOG_START_TIMEOUT`（**在调用时读**，
+    这样自检可以把常量调小、不必真等 2.5 秒）。
+    """
+    if timeout is None:
+        timeout = _DIALOG_START_TIMEOUT
+    deadline = time.time() + timeout
+    while True:
+        try:
+            pid = int(json.loads(mark.read_text(encoding="utf-8")).get("pid") or 0)
+        except Exception:  # noqa: BLE001
+            pid = 0
+        if pid > 0:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
+
 
 def _alert_style() -> str:
     """本机通知用哪种通道：`dialog`（默认，必须点掉）或 `toast`（几秒后自动消失）。"""
@@ -764,9 +901,18 @@ def _notify_windows_dialog(title: str, content: str,
 
     弹不出来返回 False（调用方退回常驻 Toast）。另起一个进程，绝不阻塞主脚本；
     不出现控制台窗口（`-WindowStyle Hidden` + `CREATE_NO_WINDOW`）。
+
+    ★ 2026-09-28：这里**不再用 `default_python()`**，改用 `dialog_python()` ——
+      因为 tkinter 不是每个解释器都有，而"起进程成功"并不等于"窗口建出来了"。
+      挑不到能画窗口的解释器，或卡片起来后迟迟不写 PID，一律返回 False 让调用方降级。
     """
     try:
         if _live_dialogs(log_dir) >= _DIALOG_MAX:
+            return False
+        # ★ 先确认这台机器上**真的有一个能画 tkinter 的解释器**。
+        #   没有就当场放弃（退回 Toast），不要等 spawn 完再发现窗口没出来。
+        exe = dialog_python(windowless=True)
+        if not exe:
             return False
         # ★ 必须用**绝对路径**：PowerShell 的相对路径基准不是本脚本所在目录
         #   （实测：传相对路径时它把标记写去了别处，于是"卡片还开着"被判成已关闭）。
@@ -800,11 +946,20 @@ def _notify_windows_dialog(title: str, content: str,
         mark.write_text(json.dumps({"pid": 0, "ts": time.time()}, ensure_ascii=False),
                         encoding="utf-8")
         _spawn(
-            [default_python(windowless=True), str(_DIALOG_SCRIPT)],
+            [exe, str(_DIALOG_SCRIPT)],
             env=env, close_fds=True, creationflags=flags, cwd=str(HERE),
         )
-        # 卡片关闭时会自己删标记（见 notify_card.py 的 finally）
-        return True
+        # ★ 等卡片把真实 PID 写进来，确认窗口**真的建出来了**（不是只看 spawn 成功）。
+        #   起不来 → 清掉占位标记并报失败，让调用方退回 Toast + 进补弹队列。
+        #   这样"卡片静默死掉"就再也不会被记成一次成功投递。
+        if _wait_card_started(mark):
+            # 卡片关闭时会自己删标记（见 notify_card.py 的 finally）
+            return True
+        try:
+            mark.unlink()
+        except OSError:
+            pass
+        return False
     except Exception:  # noqa: BLE001
         return False
 

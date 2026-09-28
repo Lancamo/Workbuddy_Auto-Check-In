@@ -89,11 +89,13 @@ HERE = _HERE
 CACHE = paths.cache_path("api_endpoints.json")
 
 # app.asar 读不到时的兜底候选（顺序即优先级）
+# ⚠️ 2026-09-28 移除 `/billing/meter/checkin-status`（无 `-activity` 后缀的旧接口）：
+#    实测**恒返回 active=false 且字段全空**，是 2026-09-17 静默零积分故障的根因。
+#    留作兜底＝留一条会把故障伪装成「今天没活动」的路径（TRUST_FIELDS 全零判据
+#    仍保留，用于防**将来**再出现同类改名）。
 FALLBACK_STATUS = (
     "/v2/billing/meter/checkin-activity-status",
     "/billing/meter/checkin-activity-status",
-    "/v2/billing/meter/checkin-status",
-    "/billing/meter/checkin-status",
 )
 FALLBACK_CLAIM = (
     "/v2/billing/meter/daily-checkin",

@@ -22,7 +22,7 @@
   ③ 登录态        WorkBuddy 桌面端是否已登录（脚本靠它拿 access_token）
   ④ 接口端点      当前应该调哪个路径（客户端现读 + 候选列表）
   ⑤ 账号状态      签到活动是否在进行中（真实联网只读查询）
-  ⑥ 微信通道      ClawBot 凭据从哪读到、有没有 context_token
+  ⑥ 微信通道      ClawBot 凭据从哪读到 + **可送达性结论**（缺 context_token 就明说还差这一步）
   ⑦ 定时任务      计划任务是否注册、关键设置是否真的生效
   ⑧ 最近运行      日志与 state.json 的时间戳、最近几条记录
 
@@ -280,18 +280,40 @@ def check_clawbot(r: Report) -> None:
     ts = st.get("context_token_ts")
     age = (round((datetime.datetime.now().timestamp() - ts) / 3600, 1)
            if isinstance(ts, (int, float)) else None)
+
+    # ★ 2026-09-28：这里改成给一个**明确的可送达性结论**，而不是罗列两条事实。
+    #   理由：「绑定好了」≠「能送达」—— 主动推送还必须有 context_token，
+    #   而它只能从「用户发给机器人的那条消息」里捕获。刚绑完通道的人最想知道的
+    #   是「现在到底能不能送达、还差什么」，而不是自己去把这几个事实拼起来。
+    #   注意本检查刻意**不联网**（doctor 要能离线跑、要快）：真正的在线验活
+    #   交给 check_channel.cmd / clawbot.py ready。
     if ctx:
-        r.ok("context_token 已有", "捕获于 {} 小时前".format(age))
+        r.ok("可送达性：具备投递条件",
+             "已持有 context_token（捕获于 {} 小时前）".format(age))
+        r.add(WARN, "context_token 是临时令牌",
+               "服务端不保证长期有效；失效后主动推送会变成「受理了、也扣了配额，"
+               "但消息不进微信」",
+               "想确认**此刻**还能不能送达，双击 check_channel.cmd"
+               "（= clawbot.py ready 90）：它只读验活，再真发一条测试消息。")
     else:
-        r.warn("context_token 缺失",
-               "主动推送会被服务端受理（照样占配额）但**不会出现在微信里**",
-               "在微信里给该机器人发一条消息（如「1」），"
-               "然后运行 wait_token.cmd（= python clawbot.py wait 60）。")
+        r.warn("可送达性：还差一步 —— 缺 context_token",
+               "主动推送会被服务端受理（照样占每日配额）但**不会出现在微信里**",
+               "在微信里给该机器人发一条消息（如「1」），然后双击 check_channel.cmd "
+               "（= clawbot.py ready 90）完成验收：它会自动捕获令牌并实测一条。")
+
+    last_err = st.get("last_send_error")
+    if last_err:
+        r.add(WARN, "最近一次发送失败原因", last_err,
+              "已恢复可忽略；若持续出现，按 README 第 6 节排错表逐条对照。")
+
     if st.get("last_session_expired_ts"):
         r.warn("历史上出现过会话失效（-14）",
                datetime.datetime.fromtimestamp(
                    st["last_session_expired_ts"]).strftime("%Y-%m-%d %H:%M"),
-               "若现在仍收不到，按上面 context_token 的提示做。")
+               "注意 -14 有**两种**成因：会话真的过期（重新扫码/重新绑定），"
+               "或本机读到的凭据不对（token 空/解密失败/读成别的账号）——"
+               "实测服务端给两者的错误码相同。若重新绑定后依旧 -14，"
+               "查「⑥ 微信通道」上面那几条里的凭据来源。")
 
 
 # ---------------------------------------------------------------------------

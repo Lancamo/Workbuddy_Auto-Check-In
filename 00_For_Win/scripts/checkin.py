@@ -8,7 +8,7 @@ checkin.py — WorkBuddy 积分助手 · Buddy加油站每日签到模块（Phas
 
 职责（本模块只做这几件事）：
   1. 通过 credentials.py 获取登录态（access_token）
-  2. 调用签到相关接口（checkin-status / daily-checkin）
+  2. 调用签到相关接口（checkin-activity-status / daily-checkin）
   3. 判断签到状态（含幂等 code=10001）
   4. 返回结构化结果（绝不含 access_token / refresh_token / 完整响应敏感字段）
 
@@ -26,6 +26,10 @@ checkin.py — WorkBuddy 积分助手 · Buddy加油站每日签到模块（Phas
   桌面端实际调用的是 `/v2/billing/meter/checkin-activity-status`（返回完整活动数据：
   activity_name / theme_name / season / claim_button_text / daily_credit / checkin_dates /
   start_time / end_time），且 `/v2/...` 与去掉 `/v2` 的路径服务端都接受。
+
+  ⚠️ 2026-09-28 后续：既然已确认旧接口**恒返回空洞数据**，就不再把它当兜底候选，
+  已从本文件的 STATUS_PATHS 与 api_discovery 的 FALLBACK_STATUS 中**删除**。
+  现在兜底只有 `/v2/...` 与 `/...`（无前缀）两种形式的 checkin-activity-status。
 
 🔁 端点不由本文件硬编码决定 —— 见 `api_discovery.py`
   端点会随腾讯发版而变（无固定周期），硬编码迟早再次失效。因此候选顺序改为：
@@ -76,14 +80,20 @@ CHECKIN_HOSTS = ("https://copilot.tencent.com", "https://www.workbuddy.cn")
 
 # 【兜底】内置候选 —— 仅在 api_discovery 读不到本机客户端时才使用。
 # 【现行】首选由 api_discovery 从 app.asar 现读（见 _candidates）。
+# ⚠️ 2026-09-28 移除 `/billing/meter/checkin-status`（无 `-activity` 后缀的旧接口）：
+#    实测它**恒返回 active=false 且字段全空**，会被当成「合法但空洞」的数据接受 ——
+#    这正是 2026-09-17「整天零积分、日志却看着正常」那次故障的根因。
+#    留着它就是留一条**会静默吞掉故障**的兜底路径，故删除。
+#    保留 `/billing/meter/checkin-activity-status`（同一接口的无 /v2 形式，
+#    服务端两者都接受），作为客户端读不到时的降级候选。
 STATUS_PATH = "/v2/billing/meter/checkin-activity-status"
-STATUS_PATH_LEGACY = "/billing/meter/checkin-status"
+STATUS_PATH_NOPREFIX = "/billing/meter/checkin-activity-status"
 
 CHECKIN_PATH = "/v2/billing/meter/daily-checkin"
-CHECKIN_PATH_LEGACY = "/billing/meter/daily-checkin"
+CHECKIN_PATH_NOPREFIX = "/billing/meter/daily-checkin"
 
-STATUS_PATHS = (STATUS_PATH, "/billing/meter/checkin-activity-status", STATUS_PATH_LEGACY)
-CHECKIN_PATHS = (CHECKIN_PATH, CHECKIN_PATH_LEGACY)
+STATUS_PATHS = (STATUS_PATH, STATUS_PATH_NOPREFIX)
+CHECKIN_PATHS = (CHECKIN_PATH, CHECKIN_PATH_NOPREFIX)
 
 CODE_SUCCESS = 0
 CODE_ALREADY_CHECKED = 10001  # 实测幂等码（客户端 mapCheckinStatus 的 1001 是另一套，勿混用）
