@@ -234,7 +234,7 @@ python3 scripts/main.py status | python3 -m json.tool
 | `clawbot.py` | **微信直推模块**：腾讯 iLink / ClawBot 官方个人微信通道（仅标准库） |
 | `runtime/config/notify_config.json` | 通知开关与备用通道凭据（**默认 auto，无需填写任何凭据**） |
 | `runtime/config/renew_config.json` | 连接守护配置（首次运行自动生成，默认 24 小时阈值） |
-| `scripts/` | **内联引擎**（6 个脚本）：`main.py`（入口）、`checkin.py`（签到）、`travel.py`（旅行）、`api_discovery.py`（**接口前置校验**）、`credentials.py`（读登录态 + 域名）、`http_client.py`（HTTP 封装） |
+| `scripts/` | **内联引擎**（8 个脚本）：`main.py`（入口）、`checkin.py`（签到）、`travel.py`（旅行）、`api_discovery.py`（**接口前置校验**）、`credentials.py`（读登录态 + 域名）、`atrest.py`（**5.6.2+ 字段加密信封解密** + 密钥定位）、`cdp_token.py`（**路线 B 兜底**：回环 CDP 取明文 token）、`http_client.py`（HTTP 封装） |
 | `install.sh` | **安装 / 查看 / 卸载**两个 LaunchAgent。plist 不放进仓库 —— 它必须写死本文件夹的绝对路径，作为文件存在就会「拷到别处即失效」，所以改为安装时现场生成（含「回读确认」，不会报假 ✓） |
 | `watchdog.py` | **存活监控**：独立于主脚本，只查心跳与计划任务是否还在，异常时弹本机通知 |
 | `runtime/state/state.json` / `runtime/state/state.bak.json` | 运行后生成：当日进度与备份（损坏时自动回落） |
@@ -254,6 +254,39 @@ python3 scripts/main.py status | python3 -m json.tool
 依赖：WorkBuddy 桌面端已登录（引擎读登录态）+ ClawBot 通道可用 + Python 3.10+（**仅标准库，零第三方包**）。
 不再依赖任何 Skill —— 引擎脚本已内联到本目录，可完全独立运行。
 微信推送与 WorkBuddy 桌面端**共用同一个 ClawBot**（2026-09-16 起，详见下文「为什么改为共用桌面端 bot」）。
+
+## ⚠️ 2026-09-28：客户端 5.6.2 登录态字段加密（已适配）
+
+WorkBuddy 桌面端从 **5.6.2** 起给敏感字段加了 at-rest 加密：`workbuddy-desktop.info` 里的
+`auth.accessToken` 不再是明文 JWT，而是 `{"$wbEncrypted":1,"envelope":"<base64>"}`
+（AES-256-GCM，字段级）；`~/.workbuddy/settings.json` 里的
+`weixinClawBot.botToken` / `channelId` **同样**被加密。**这一个格式变更同时打断两条链路** ——
+签到（`credentials.py` / `checkin.py`）与微信推送（`clawbot.py`）—— 两者都已适配。
+
+密钥 `atRestSecretKey`（44 字符 base64）不落盘，本目录用**两条独立的路**取：
+
+| 路线 | 做法 | 前提 | 状态 |
+|---|---|---|---|
+| **A（主路径）** | 以 `ELECTRON_RUN_AS_NODE=1` 启动客户端**自带的 Electron 二进制**，调用其内置原生绑定 `electron_browser_workbuddy_storage.loggerGet()` 取回密钥，再用纯标准库 AES-256-GCM 解信封 | `WorkBuddy.app` 完整（Electron fuse `RunAsNode` 未禁用） | **本机实测通过**（含 launchd 定时任务） |
+| **B（抗版本兜底）** | 客户端以 `--remote-debugging-port` 启动时，走回环 CDP 直接取**明文** token（`scripts/cdp_token.py`） | 客户端带调试端口启动（`WORKBUDDY_CDP_PORT` 可指定） | 已实现；**未端到端实测** |
+
+- 路线 A **不需要** root、不需要 lldb/`task_for_pid`、不需要 dylib 注入、也**不需要客户端正在运行**——
+  它只是让 App 自己把密钥交出来。本机实测解密正常。
+- 手动自检（只打印公开指纹，不打印密钥本体）：
+  ```bash
+  # keyId 是 16 位小写 hex，明文写在登录态信封里
+  python3 scripts/atrest.py --keycheck <keyId>
+  ```
+- 若报「accessToken 已被 5.6.2+ 客户端加密，且未能取到解密密钥」：先确认
+  `/Applications/WorkBuddy.app` 没被改名或搬走；必要时用环境变量 `WORKBUDDY_APP_EXEC`
+  指向它的 `Contents/MacOS/Electron`。
+- **不要碰 `WorkBuddy AI.app`** —— 那是另一款应用（BundleId `com.workbuddy.workbuddy-ai`），
+  本工具不会去启动它，也不以它为凭据来源。
+
+> 本轮同时移除了已失效的旧版 `state.vscdb` + Electron safeStorage 回退链路：本机
+> `.../WorkBuddy/User/globalStorage/state.vscdb` **不存在**，而存在的那一份属于
+> **CodeBuddy CN**；一旦命中它就会抛「需要 Electron 运行时解密」，
+> **掩盖真正的原因（字段加密）**。移除后错误信息才指得准。
 
 ## 通知（微信推送）
 

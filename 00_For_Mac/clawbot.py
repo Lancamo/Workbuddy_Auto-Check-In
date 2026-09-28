@@ -66,7 +66,9 @@ import urllib.request
 
 DIR = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(DIR))
-import paths  # noqa: E402
+sys.path.insert(0, str(DIR / "scripts"))  # atrest（5.6.2+ 字段解密）
+import paths    # noqa: E402
+import atrest   # noqa: E402  5.6.2+ at-rest 加密信封解密
 
 SETTINGS = pathlib.Path.home() / ".workbuddy" / "settings.json"
 STATE = paths.state_path("clawbot_state.json")
@@ -97,11 +99,43 @@ ITEM_TYPE_TEXT = 1
 # ---------------------------------------------------------------------------
 # 凭据：优先用本机 login 得到的，其次复用 WorkBuddy 的
 # ---------------------------------------------------------------------------
+# 「读到了 ClawBot 配置，但字段是加密信封且解不开」的字段名记录。
+# 只用于诊断输出（不含任何密文/明文），让 `status` 能说清"为什么推不了"。
+_ATREST_FAILED: list[str] = []
+
+
+def _plain(value):
+    """把可能是 at-rest 加密信封的字段解成明文；非字符串或解不开时返回 None。
+
+    ★ 2026-09-28 为什么需要：客户端 **5.6.2** 把 `settings.json` 里的敏感字段也
+      改成了加密信封 —— 实测 `weixinClawBot.botToken` 与 `channelId` 都是
+      `{"$wbEncrypted":1,"envelope":"…"}`，而 `baseUrl` / `userId` 仍是明文。
+      **同一处格式变更同时打断了两条链路**：签到 token（credentials.py 已修）
+      与推送 token（这里）。只修前者的话，签到恢复了、微信推送却照旧静默发不出去。
+    ★ 解不开时返回 None（而不是把 dict 原样带下去）：原实现会把 dict 当 token 用，
+      `mask()` 里的 `token[:4]` 会直接抛 KeyError 崩溃，
+      拼出来的请求也只会是 `Authorization: Bearer {'$wbEncrypted': …}` 这种废请求。
+    """
+    if isinstance(value, str):
+        return value or None
+    if atrest.is_envelope(value):
+        try:
+            out = atrest.decrypt_token(value)
+        except atrest.AtRestError:
+            return None
+        return out or None
+    return None
+
+
 def _read_local_credentials() -> dict | None:
     d = _load_state()
     c = d.get("credentials")
     if isinstance(c, dict) and c.get("bot_token"):
-        return c
+        tok = _plain(c.get("bot_token"))
+        if tok:
+            c = dict(c)
+            c["bot_token"] = tok
+            return c
     return None
 
 
@@ -136,16 +170,27 @@ def load_channel() -> dict | None:
 
     for u in candidates:
         ch = ((u or {}).get("channels") or {}).get("weixinClawBot") or {}
-        token = ch.get("botToken")
-        user_id = ch.get("userId")
+        # ★ 字段可能是 5.6.2+ 加密信封 → 经 `_plain` 解密后再用。
+        # ★ channel_id 优先取**明文的 `accountId`**：实测它就是 `…@im.bot` 那个 id
+        #   （与加密前的 channelId 同值），且始终明文 —— 这样即便密钥取不到，
+        #   renew.py 仍能拼出正确的游标文件名，不至于退化成空串。
+        token = _plain(ch.get("botToken") or ch.get("bot_token"))
+        user_id = _plain(ch.get("userId") or ch.get("user_id"))
         if ch.get("enabled") and token and user_id:
             return _apply_user_override({
                 "bot_token": token,
-                "base_url": (ch.get("baseUrl") or DEFAULT_BASE_URL).rstrip("/"),
+                "base_url": (_plain(ch.get("baseUrl") or ch.get("base_url"))
+                             or DEFAULT_BASE_URL).rstrip("/"),
                 "user_id": user_id,
-                "channel_id": ch.get("channelId"),
+                "channel_id": (ch.get("accountId") or _plain(ch.get("channelId"))
+                               or _plain(ch.get("channel_id"))),
                 "source": "workbuddy-settings",
             })
+        if ch.get("enabled") and (ch.get("botToken") or ch.get("bot_token")):
+            # 配置在、但字段解不开 → 记下来供 status 说明原因
+            for name in ("botToken", "bot_token", "userId", "user_id", "channelId", "channel_id"):
+                if atrest.is_envelope(ch.get(name)) and name not in _ATREST_FAILED:
+                    _ATREST_FAILED.append(name)
     return None
 
 
@@ -185,9 +230,12 @@ def clear_credentials() -> None:
     _save_state(st)
 
 
-def mask(token: str | None) -> str:
+def mask(token) -> str:
     if not token:
         return "(空)"
+    if not isinstance(token, str):
+        # 5.6.2+ 加密信封没解出来时，绝不能在这里切片崩溃（原来会 KeyError）
+        return "(非明文字符串)"
     return "{}{}（共 {} 位）".format(token[:4], "·" * 6, len(token))
 
 
@@ -727,6 +775,13 @@ if __name__ == "__main__":
         else:
             out["found"] = False
             out["reason"] = "没有可用凭据：WorkBuddy 未绑定 ClawBot，且本机未 login"
+            if _ATREST_FAILED:
+                # 别把「字段被加密、密钥没取到」误报成「未绑定」
+                out["reason"] = (
+                    "读到 ClawBot 配置，但字段被 5.6.2+ 客户端加密且密钥未取到（字段："
+                    + "、".join(_ATREST_FAILED)
+                    + "）。请确认 WorkBuddy.app 完整（脚本会启动其自带 Electron 取密钥）。"
+                )
         print(json.dumps(out, ensure_ascii=False, indent=2))
         sys.exit(0 if ch else 1)
 

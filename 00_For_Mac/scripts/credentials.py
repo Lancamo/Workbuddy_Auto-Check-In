@@ -4,64 +4,77 @@
 credentials.py — WorkBuddy 积分助手 · 统一登录态读取（Phase 1）
 
 设计要点：
-  - 新版明文登录态优先，旧版 state.vscdb 作为回退
-  - 提供跨平台路径候选和统一安全规则
-  - 登录态结构使用 account.uid + auth.accessToken
+  - 明文登录态优先；v5.6.2+ 起改为解 at-rest 加密信封（见同目录 atrest.py）
+  - 提供跨平台路径候选与统一安全规则
+  - 登录态结构使用 account.uid + auth.accessToken（含 auth.domain）
 
-支持两类登录态：
-  A. 新版明文（WorkBuddy 桌面端 v5.3.8+，纯 Python 读取，主路径）
-     文件：workbuddy-desktop.info
+登录态只有一个来源：`workbuddy-desktop.info`（纯 Python 读取，无需外部运行时）。
        macOS:   ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
-       Windows: %APPDATA%/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
+       Windows: %LOCALAPPDATA%（优先）/ %APPDATA% 下的 CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
        Linux:   ~/.config/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
-     结构：{ account: { uid, ... }, auth: { accessToken, refreshToken, expiresAt, ... }, ... }
-  B. 旧版加密（回退路径，需要 Electron safeStorage 解密）
-     文件：state.vscdb
-       macOS:   ~/Library/Application Support/{WorkBuddy,CodeBuddy}/User/globalStorage/state.vscdb
-       Windows: %APPDATA%/{WorkBuddy,CodeBuddy}/User/globalStorage/state.vscdb
-       Linux:   ~/.config/{WorkBuddy,CodeBuddy}/User/globalStorage/state.vscdb
-     说明：本模块仅用标准库 sqlite3 只读取出加密会话，再委托 Electron 的
-           safeStorage.decryptString() 解密（macOS 命中钥匙串 / Windows DPAPI / Linux keyring）。
-           纯 Python 无法解 Electron safeStorage，因此旧版分支必须能找到 Electron 二进制；
-           找不到时抛出带指引的 CredentialError。
+     结构：{ account: { uid, ... }, auth: { accessToken, refreshToken, expiresAt, domain, ... }, ... }
+
+同一个文件里的 `auth.accessToken` 有两种形态，本模块都要能读：
+  ① **明文 JWT** —— v5.5.x 及更早，或客户端关闭了字段加密。
+  ② **at-rest 加密信封** `{"$wbEncrypted":1,"envelope":"<base64>"}` —— **v5.6.2 起默认开启**，
+     委托同目录的 `atrest.py` 解密（AES-256-GCM；密钥获取见 atrest 的密钥定位链）。
+     本机实测解密正常。
+  ⟹ 两种形态都试；解不开时报**准确原因**（见下），不要笼统地说「未找到登录态」。
+
+兜底（**路线 B**）：若客户端是以 `--remote-debugging-port` 启动的，则改走回环 CDP
+直接取**明文** token（模块 `cdp_token.py`）。它不复刻 at-rest 算法，因此**客户端将来
+改加密格式也不受影响** —— 这是「抗版本」的保险，不是主路径。
 
 统一返回结构（load_credentials()）：
   {
     "access_token": "...",   # 真实 token。等同账号密码，调用方负责保密：勿打印 / 勿写日志 / 勿落盘
-    "uid": "...",            # 可能为空字符串（旧版会话若无 uid 字段）
-    "source": "workbuddy-desktop.info" | "state.vscdb"
+    "uid": "...",            # 可能为空字符串
+    "domain": "https://...", # 可能为空字符串；接口 host 以此优先
+    "source": "workbuddy-desktop.info" | "cdp-remote-debug"
   }
+
+⚠️ 2026-09-28 移除：旧版 `state.vscdb` + Electron safeStorage 回退链路（与 Windows 侧同步）。
+  证据（macOS 本机实测）：
+    · `~/Library/Application Support/WorkBuddy/User/globalStorage/state.vscdb` **不存在**；
+    · 存在的那个 `.../CodeBuddy/User/globalStorage/state.vscdb` 属于 **CodeBuddy CN**，
+      与 WorkBuddy 桌面端登录态无关；
+    · 本机既无 `~/.workbuddy/tools/electron`，PATH 里也没有 electron —— 一旦命中那个无关的
+      vscdb，就会抛「需要 Electron 运行时解密」，**掩盖真正的失败原因（字段加密）**。
+  故整链（sqlite3 读取 + 子进程调 Electron safeStorage + 临时文件）一并移除，
+  同时省掉 `shutil`/`sqlite3`/`subprocess`/`tempfile` 四个依赖。
+  副作用：`source` 字段不再可能是 `"state.vscdb"`。
 
 安全规则（务必遵守）：
   - access_token 等同账号密码：仅在内存中使用，禁止输出到 stdout/日志、禁止保存副本、禁止提交仓库、禁止上传任何第三方
-  - 只读：不修改 WorkBuddy 客户端的任何文件（state.vscdb 以只读模式打开）
-  - 本模块不做任何网络请求
-  - 解密得到的明文只在内存中流转，用完即弃，临时文件仅存放"加密"会话并立即删除
+  - 只读：不修改 WorkBuddy 客户端的任何文件
+  - 本模块不发任何外部网络请求（唯一的连接是**可选**的回环 CDP 兜底，且只连 127.0.0.1）
+  - 解密得到的明文只在内存中流转，用完即弃，绝不落盘
+  - atRestSecretKey 由 atrest.py 取回后**同样不落盘**
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
-import sqlite3
-import subprocess
 import sys
-import tempfile
 
-APP_NAMES = ("WorkBuddy", "CodeBuddy")
-
-# 旧版 vscdb 中的会话 key
-LEGACY_SESSION_KEYS = (
-    'secret://{"extensionId":"tencent-cloud.coding-copilot","key":"planning-genie.new.accessTokencn"}',
-)
+# 允许在同目录找到 atrest（WorkBuddy 5.6.2+ 登录态字段加密信封的解密模块）。
+# checkin.py / main.py 会先把自己目录插入 sys.path，这里再兜底一次，
+# 保证 credentials.py 无论被直接运行还是被上层模块 import 都能 import atrest。
+if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import atrest  # noqa: E402
 
 SOURCE_DESKTOP_INFO = "workbuddy-desktop.info"
-SOURCE_VSCDB = "state.vscdb"
+SOURCE_CDP = "cdp-remote-debug"
 
 # 候选登录态文件「存在但被系统拒读」（如 macOS 隐私保护/TCC）的记录，
 # 仅用于生成准确的错误信息，不含任何敏感内容。
 _PERM_DENIED: list[str] = []
+
+# 候选登录态文件「存在、accessToken 是加密信封、但密钥没解出来」的记录，
+# 仅用于生成准确的错误信息，不含任何敏感内容。
+_ENCRYPTED_FOUND: list[str] = []
 
 
 class CredentialError(RuntimeError):
@@ -87,7 +100,7 @@ def _xdg_config() -> str:
 # 候选路径
 # ---------------------------------------------------------------------------
 def desktop_info_candidates() -> list[str]:
-    """新版明文登录态候选路径（按平台）。"""
+    """登录态候选路径（按平台）。"""
     rel = os.path.join(
         "CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info"
     )
@@ -96,17 +109,6 @@ def desktop_info_candidates() -> list[str]:
     if sys.platform == "win32":
         return [os.path.join(_appdata(), rel)]
     return [os.path.join(_xdg_config(), rel)]
-
-
-def legacy_vscdb_candidates() -> list[str]:
-    """旧版 state.vscdb 会话库候选路径（按平台）。"""
-    if sys.platform == "darwin":
-        roots = [os.path.join(_home(), "Library", "Application Support", a) for a in APP_NAMES]
-    elif sys.platform == "win32":
-        roots = [os.path.join(_appdata(), a) for a in APP_NAMES]
-    else:
-        roots = [os.path.join(_xdg_config(), a) for a in APP_NAMES]
-    return [os.path.join(r, "User", "globalStorage", "state.vscdb") for r in roots]
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +125,7 @@ def normalize_domain(raw) -> str:
 
 
 # ---------------------------------------------------------------------------
-# A. 新版明文（纯 Python）
+# A. 路线 A：明文 JWT 或 at-rest 加密信封（纯 Python + atrest）
 # ---------------------------------------------------------------------------
 def _load_plaintext() -> dict | None:
     """返回登录态 dict；找不到返回 None；若候选路径存在但被系统拒读，
@@ -143,187 +145,68 @@ def _load_plaintext() -> dict | None:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError):
-            # 文件损坏 / 写入中 / 权限问题：忽略，尝试下一个候选 / 落入旧版分支
+            # 文件损坏 / 写入中 / 权限问题：忽略，尝试下一个候选
             continue
         account = data.get("account") or {}
         auth = data.get("auth") or {}
         token = auth.get("accessToken")
+        # ① 明文 JWT（5.5.x 及更早 / 加密未开启）
         if isinstance(token, str) and token:
-            uid = account.get("uid") or auth.get("uid") or ""
-            return {
-                "access_token": token,
-                "uid": uid,
-                "domain": normalize_domain(auth.get("domain") or data.get("domain")),
-                "source": SOURCE_DESKTOP_INFO,
-            }
-    return None
-
-
-# ---------------------------------------------------------------------------
-# B. 旧版 state.vscdb（sqlite3 读加密会话 + Electron safeStorage 解密）
-# ---------------------------------------------------------------------------
-def _read_legacy_blob(db_path: str) -> str | None:
-    """只读打开 state.vscdb，取出加密会话原始字符串（未解密）。绝不写库。"""
-    uri = "file:{}?mode=ro".format(db_path)
-    try:
-        conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.Error as e:
-        raise CredentialError("无法只读打开 state.vscdb: {}".format(e))
-    try:
-        cur = conn.cursor()
-        for key in LEGACY_SESSION_KEYS:
+            return _result(token, account, auth, data)
+        # ② 5.6.2+ 字段加密信封：AES-256-GCM 解密后取明文 JWT
+        if atrest.is_envelope(token):
             try:
-                row = cur.execute(
-                    "SELECT value FROM ItemTable WHERE key = ?", (key,)
-                ).fetchone()
-            except sqlite3.Error:
+                plain = atrest.decrypt_token(token)
+            except atrest.AtRestError:
+                _ENCRYPTED_FOUND.append(path)
                 continue
-            if row and row[0]:
-                return row[0]
-    finally:
-        conn.close()
+            if isinstance(plain, str) and plain:
+                return _result(plain, account, auth, data)
     return None
 
 
-def _find_electron() -> str:
-    """定位 Electron 二进制（仅旧版分支需要）。可用 WB_REWARD_ELECTRON 显式指定。"""
-    candidates = []
-    env_path = os.environ.get("WB_REWARD_ELECTRON")
-    if env_path:
-        candidates.append(env_path)
-    candidates += [
-        os.path.join(
-            _home(), ".workbuddy", "tools", "electron",
-            "Electron.app", "Contents", "MacOS", "Electron",
-        ),
-        os.path.join(_home(), ".workbuddy", "tools", "electron", "electron.exe"),
-        shutil.which("electron") or "",
-    ]
-    for c in candidates:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
-            return c
-    return ""
-
-
-# 委托 Electron 解密的内嵌脚本：读取"加密"会话文件 → safeStorage 解密 →
-# 仅把明文经 stdout 单行输出（DECRYPT_RESULT:<json>），不落盘。
-# 解密脚本只处理本项目识别到的旧版会话格式。
-_ELECTRON_DECRYPT_JS = r"""
-"use strict";
-const fs = require("fs");
-const { app, safeStorage } = require("electron");
-const APP_NAME = process.env.WB_REWARD_APP_NAME || "WorkBuddy";
-app.setName(APP_NAME); // 必须在 ready 之前，保证钥匙串/DAPPI 绑定名正确
-function emit(line) {
-  process.stdout.write(line + "\n");
-  setTimeout(() => app.exit(0), 150); // 延迟退出，确保 stdout flush
-}
-const blobPath = process.argv[process.argv.length - 1];
-app.whenReady().then(() => {
-  if (!safeStorage.isEncryptionAvailable()) {
-    emit("DECRYPT_RESULT:ERR 系统加密不可用");
-    return;
-  }
-  try {
-    const raw = fs.readFileSync(blobPath, "utf8");
-    const parsed = JSON.parse(raw);
-    let buf = null;
-    if (parsed && parsed.type === "Buffer" && Array.isArray(parsed.data)) {
-      buf = Buffer.from(parsed.data);
-    } else if (typeof parsed === "string") {
-      buf = Buffer.from(parsed, "base64");
-    } else if (Buffer.isBuffer(parsed)) {
-      buf = parsed;
+def _result(token: str, account: dict, auth: dict, data: dict) -> dict:
+    """按统一结构组装登录态（token 只在内存流转）。"""
+    return {
+        "access_token": token,
+        "uid": account.get("uid") or auth.get("uid") or "",
+        "domain": normalize_domain(auth.get("domain") or data.get("domain")),
+        "source": SOURCE_DESKTOP_INFO,
     }
-    if (!buf) throw new Error("未知的存储格式");
-    const decrypted = safeStorage.decryptString(buf);
-    emit("DECRYPT_RESULT:" + decrypted);
-  } catch (e) {
-    emit("DECRYPT_RESULT:ERR " + e.message);
-  }
-});
-"""
 
 
-def _decrypt_legacy_blob(blob: str) -> str:
-    """用 Electron safeStorage 解密加密会话，返回解密后的明文字符串（不落盘）。"""
-    electron = _find_electron()
-    if not electron:
-        raise CredentialError(
-            "旧版 state.vscdb 需要 Electron 运行时解密（safeStorage），但未找到 Electron。"
-            "请安装 Electron 或设置环境变量 WB_REWARD_ELECTRON 指向可用的 Electron 二进制；"
-            "若你是 v5.3.8+ 新版账户，应走明文分支（请确认 workbuddy-desktop.info 存在）。"
-        )
-    js_path = blob_path = None
+# ---------------------------------------------------------------------------
+# B. 路线 B 兜底：经回环 CDP 直接取明文 token（抗客户端改版）
+# ---------------------------------------------------------------------------
+def _load_via_cdp() -> dict | None:
+    """客户端以 `--remote-debugging-port` 启动时，走 CDP 直接取**明文** token。
+
+    这是「抗版本」兜底：不解密、不复刻 at-rest 算法，客户端将来改加密格式也不受影响。
+    前置条件是客户端带着调试端口启动（端口可用 WORKBUDDY_CDP_PORT 指定）。
+    模块 `cdp_token.py` 可能不存在（精简部署），缺失时静默跳过；任何异常都吞掉。
+    """
     try:
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as jf:
-            jf.write(_ELECTRON_DECRYPT_JS)
-            js_path = jf.name
-        with tempfile.NamedTemporaryFile("w", delete=False) as bf:
-            bf.write(blob)  # 注意：临时文件存的是"加密"会话，不是明文 token
-            blob_path = bf.name
-
-        env = dict(os.environ)
-        env.pop("ELECTRON_RUN_AS_NODE", None)  # Agent 沙箱常设此变量，需显式去除
-        proc = subprocess.run(
-            [electron, js_path, blob_path],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=env,
-        )
-        payload = ""
-        for line in proc.stdout.splitlines():
-            if line.startswith("DECRYPT_RESULT:"):
-                payload = line[len("DECRYPT_RESULT:"):]
-                break
-        if not payload:
-            raise CredentialError(
-                "Electron 解密无有效输出（可能并非以 Electron 运行，或脚本输出被截断）。"
-            )
-        if payload.startswith("ERR"):
-            raise CredentialError("Electron 解密失败：" + payload[3:].strip())
-        return payload
-    finally:
-        for p in (js_path, blob_path):
-            if p:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
-
-
-def _load_legacy() -> dict | None:
-    for db_path in legacy_vscdb_candidates():
-        try:
-            os.stat(db_path)
-        except FileNotFoundError:
-            continue
-        except PermissionError:
-            _PERM_DENIED.append(db_path)
-            continue
-        except OSError:
-            continue
-        blob = _read_legacy_blob(db_path)
-        if not blob:
-            continue
-        decrypted = _decrypt_legacy_blob(blob)
-        try:
-            session = json.loads(decrypted)
-        except json.JSONDecodeError:
-            continue
-        auth = session.get("auth") or {}
-        account = session.get("account") or {}
-        token = auth.get("accessToken")
-        if isinstance(token, str) and token:
-            uid = account.get("uid") or auth.get("uid") or ""
-            return {
-                "access_token": token,
-                "uid": uid,
-                "domain": normalize_domain(auth.get("domain") or session.get("domain")),
-                "source": SOURCE_VSCDB,
-            }
-    return None
+        import cdp_token
+    except ImportError:
+        return None
+    try:
+        port = cdp_token.cdp_port() or cdp_token.probe()
+        if not port:
+            return None
+        cred = cdp_token.load_via_cdp(port)
+    except Exception:  # noqa: BLE001  兜底路径绝不因为自身异常打断主流程
+        return None
+    if not cred:
+        return None
+    token = cred.get("access_token")
+    if not isinstance(token, str) or not token:
+        return None
+    return {
+        "access_token": token,
+        "uid": cred.get("uid") or "",
+        "domain": normalize_domain(cred.get("domain")),
+        "source": SOURCE_CDP,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -331,14 +214,19 @@ def _load_legacy() -> dict | None:
 # ---------------------------------------------------------------------------
 def load_credentials() -> dict:
     """
-    读取本地登录态，返回统一结构 {"access_token","uid","source"}。
-    优先新版明文，缺失时回退旧版 state.vscdb。
+    读取本地登录态，返回统一结构 {"access_token","uid","domain","source"}。
+    顺序：路线 A（明文 / 加密信封）→ 路线 B（回环 CDP 兜底）。
     失败时抛出 CredentialError（信息中不含任何 token）。
+
+    ★ 错误信息必须指向**真实原因**（2026-09-28）：以前无论哪种失败都报
+      「新版明文文件与旧版 state.vscdb 均未命中，请先安装并登录 WorkBuddy」——
+      客户端 5.6.2 引入字段加密后，这句话把人引向「重新登录」，
+      而真正该做的是「让脚本能取到解密密钥」。故分三档报错。
     """
     cred = _load_plaintext()
     if cred:
         return cred
-    cred = _load_legacy()
+    cred = _load_via_cdp()
     if cred:
         return cred
     if _PERM_DENIED:
@@ -347,9 +235,18 @@ def load_credentials() -> dict:
             + "；".join(_PERM_DENIED)
             + "。请给运行终端授权「完全磁盘访问」，或改在 WorkBuddy 自动化/桌面端上下文运行。"
         )
+    if _ENCRYPTED_FOUND:
+        raise CredentialError(
+            "登录态存在但 accessToken 已被 5.6.2+ 客户端加密，且未能取到解密密钥："
+            + "；".join(_ENCRYPTED_FOUND)
+            + "。macOS 侧请确认 WorkBuddy.app 完整（脚本会启动其自带 Electron 取密钥）；"
+            "Windows 侧请确认客户端**正在运行**并已登录、脚本与客户端同一用户；"
+            "或设置环境变量 WORKBUDDY_ATREST_KEY / WORKBUDDY_ATREST_KEY_FILE 显式指定密钥。"
+        )
     raise CredentialError(
-        "未找到可用登录态：新版明文文件与旧版 state.vscdb 均未命中。"
-        "请先安装并登录 WorkBuddy 桌面端。"
+        "未找到登录态文件（workbuddy-desktop.info）。请先安装并登录 WorkBuddy 桌面端，"
+        "并确认脚本与客户端以**同一用户**运行。已探测："
+        + "；".join(desktop_info_candidates())
     )
 
 
@@ -378,6 +275,7 @@ def describe(cred: dict) -> dict:
         "source": cred.get("source", ""),
         "access_token": mask_secret(cred.get("access_token", "")),
         "uid": mask_uid(cred.get("uid", "")),
+        "domain": cred.get("domain", ""),
     }
 
 
@@ -392,3 +290,4 @@ if __name__ == "__main__":
     print("✅ 找到登录态来源：{}".format(d["source"]))
     print("✅ access_token：{}".format(d["access_token"]))
     print("✅ uid：{}".format(d["uid"]))
+    print("✅ domain：{}".format(d["domain"] or "<空>"))

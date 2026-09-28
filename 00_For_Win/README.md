@@ -162,6 +162,8 @@ mac 版改 `00_For_Mac/README.md`；**跨平台的功能改动两份都要改**�
 │   ├── travel.py         ← 旅行派遣与领奖
 │   ├── credentials.py    ← 凭据装载（含 5.6.2+ 加密信封自动解密）
 │   ├── atrest.py         ← WorkBuddy 5.6.2+ AtRestEncryption（AES-256-GCM）解密
+│   │                       密钥定位含两条路：Windows = 进程内存扫描；
+│   │                       macOS = 借客户端自带 Electron 取密钥。两平台目录下逐字一致
 │   └── http_client.py    ← HTTP（UA 跟随真实客户端版本）
 │
 ├── install.cmd / uninstall.cmd / doctor.cmd
