@@ -105,7 +105,19 @@ DEFAULT_CONFIG = {
     # 完全不同 —— 登录失效和投递被拒都要等人工动作，重试纯属浪费配额；网络抖动则应尽快重试。
     "clawbot_blocked_cooldown_minutes": 60,    # 投递被拒（prepare failed）→ 等用户开窗
     "clawbot_failure_cooldown_minutes": 20,    # 网络/未知失败 → 下下轮就重试
+    # 「投递被拒」状态下两次**补发**之间的最小间隔（分钟）。2026-09-29 新增，原因见
+    # _blocked_state_skip_send：失败请求同样烧 iLink 配额，补发若无节制地每 5 分钟
+    # 重试一次，几小时就能把当日额度烧光，等用户真去开窗时反而没配额可用。
+    # 240 分钟按配额反推：每天最多 6 次补发 + 2 次正常到账通知 = 8，
+    # 恰好等于 max_pushes_per_day，不会出现「补发把正常通知的额度吃光」。
+    # 注意：刚捕获到用户新的入站消息时不受此间隔限制（立即重发），
+    # 所以「发一条消息即刻恢复」这条承诺仍然成立，本间隔只约束「无人开窗时的盲目重试」。
+    "clawbot_blocked_retry_minutes": 240,
 }
+
+# 补发前「先收一次信箱」的短轮询上限（秒）。有消息时立即返回，这里的值只决定
+# 「没有新消息时最多等多久」。取 5 秒是为了不拖慢每 5 分钟一次的 catchup。
+_INBOUND_PEEK_TIMEOUT = 5
 
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
 SERVERCHAN_URL = "https://sctapi.ftqq.com/{key}.send"
@@ -247,10 +259,13 @@ def _prune_sent(st: dict, now: float) -> None:
 # 而且**失败的请求同样计入 iLink 每日配额**，等于把配额烧在注定失败的请求上。
 # 故失败后进入冷却期，期间直接走本机通知，冷却结束再探一次。
 #
-# ⚠️ 成因未确认：早先认为这是「距用户上次发消息超过会话窗口时长」，但 2026-09-18
-# 的数据否掉了这个模型 —— 距上次发消息 38 小时后反而推送成功（当时桌面端在持续轮询，
-# 见 renew.py 里「桌面端正常轮询间隔约 18 秒」）。现有证据更支持「与本机客户端是否在
-# 持续轮询该 bot 有关」。所以熔断时长只是「别把配额烧光」的工程取舍，不代表对成因的判断。
+# ⚠️ 成因（2026-09-29 已定位）：真正的闸门是服务端那个「用户最近是否给机器人发过消息」
+# 的**会话窗口** —— 窗口关了就 prepare failed，与令牌新旧无关（同一枚令牌跨 4 天两次发送
+# 成功），也与桌面端是否在轮询无关（09-27 起连续两天推送全失败，而桌面端全程按约 18 秒
+# 轮询，见 renew.py）。早先两个模型都已作废：①「距上次发消息超过 N 小时」（09-18 数据否掉：
+# 38 小时后反而成功）；②「取决于本机客户端是否持续轮询」（09-29 否掉）。
+# 熔断时长仍只是「别把配额烧光」的工程取舍 —— 窗口何时重开不由本地决定，但可靠检测入站
+# 消息（见 _inbound_since_cooldown）提前解除冷却。
 #
 # 2026-09-18 补：熔断从「只对 -14」扩大到「任何失败」。
 # 原因就是上面那句 —— 触发频率提高后，未熔断的失败会在 1 小时内烧光配额，
@@ -397,17 +412,45 @@ def _send_via(channel: str, cfg: dict, title: str, content: str) -> tuple[bool, 
     return False, "未知通道 " + channel
 
 
+# 最近一次 osascript 本机通知的失败原因（供 status / localtest 显示，不含敏感内容）
+_last_macos_error = ""
+
+
 def _send_macos(title: str, content: str) -> bool:
+    """本机通知兜底（osascript display notification）。
+
+    ★ 2026-09-29 修掉「假成功」：旧实现只 catch 异常、**不看 returncode** ——
+      osascript 非零退出（通知权限被拒、无 GUI 会话、脚本语法错）时照样 return True，
+      于是「降级到本机通知」这条唯一的可见信号会静默失败，
+      而 notify_state 里却记着 local_sent，下次还被去重拦下不再重试 —— 故障彻底隐身。
+      这与 Windows 侧 b6777b3（"卡片没出现就不许报已发送"）属同一类缺陷，Mac 侧当时漏改。
+      现在非零返回码一律判失败，并把 stderr 留在 `_last_macos_error` 里供诊断。
+
+    ⚠️ **仍覆盖不到的情况**：系统「专注模式 / 勿扰」会在 osascript **成功返回之后**
+      把通知吞掉，`display notification` 不提供任何回执。这层无法在此判定
+      （若把「可能被吞」也当失败，正常发送会被误判成失败、反复重弹）。
+      只能靠 `_focus_status()` 提示用户；判断依据见它的注释。
+    """
+    global _last_macos_error
     try:
-        # osascript 的字符串里不能直接出现双引号，统一替换并截断
+        # osascript 的字符串里不能直接出现双引号，统一替换并截断。
+        # title 也必须同样处理 —— 旧实现漏了它，标题里一旦带 `"` 就会生成非法 AppleScript，
+        # 而当时的假成功掩盖了它（修复后至少会明确报失败，但根本不该让它发生）。
         safe = content.replace('"', "'").replace("\\", "/")[:200]
-        subprocess.run(
+        safe_title = title.replace('"', "'").replace("\\", "/")[:100]
+        p = subprocess.run(
             ["osascript", "-e",
-             'display notification "{}" with title "{}"'.format(safe, title)],
+             'display notification "{}" with title "{}"'.format(safe, safe_title)],
             capture_output=True, timeout=10,
         )
+        if p.returncode != 0:
+            _last_macos_error = ((p.stderr or b"").decode("utf-8", "replace").strip()
+                                or "osascript 退出码 {}".format(p.returncode))[:200]
+            return False
+        _last_macos_error = ""
         return True
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _last_macos_error = repr(e)[:200]
         return False
 
 
@@ -471,6 +514,8 @@ def local_check() -> dict:
     out["verdict"] = ("会正常弹出" if out["enabled"] and out["osascript"] == "ok"
                       and out["focus"] in ("none", "unknown")
                       else "可能看不到（见上面各项）")
+    # 注意：这只是**能力预检**。osascript 能跑 ≠ 通知有权限发出去。
+    # 真正的送达证据要用 `notify.py localtest`（它会实发一条并检查 returncode）。
     return out
 
 
@@ -510,10 +555,15 @@ def _recapture_and_resend(cfg: dict, title: str, content: str,
     """「投递被拒 / 缺 context_token」的自动自愈（2026-09-25 新增）。
 
     背景：主动推送依赖本地捕获的 context_token，而捕获此前是**纯手动**操作
-    （python3 clawbot.py wait）。token 过期后推送进入 prepare failed 死状态且
-    永不自愈 —— 2026-09-24/25 的漏推即此因：用户其实一直在微信里发消息
-    （桌面端正常回复「知道了」），但没人跑 wait，脚本一条也没捕获到，
-    9/17 捕获的旧 token 失效（9/24 起）后主动推送就全断了。
+    （python3 clawbot.py wait）。主动推送的闸门是**服务端会话窗口**：窗口一关，
+    推送就进入 `prepare failed` 死状态且永不自愈 —— 2026-09-24/25 的漏推即此因：
+    用户其实一直在微信里发消息（桌面端正常回复「知道了」），但脚本没在开窗的
+    那一刻捕获到 context_token，于是在窗口关闭期间一条也发不出去。
+
+    ⚠️ 2026-09-29 更正：当时把原因写成「9/17 捕获的 token 失效（9/24 起）」——
+    那是错的。令牌不会过期（同枚跨 4 天两次发送成功）。关掉通道的是**会话窗口**，
+    窗口何时重开由用户是否给机器人发消息决定，与令牌新旧无关。
+    所以本函数的实质是「开窗 + 捕获」，**不是**「换一枚令牌」。
 
     自愈流程：
       1. 弹 macOS 告警，引导用户「给机器人发条消息」（与告警承诺的恢复动作一致）；
@@ -521,8 +571,9 @@ def _recapture_and_resend(cfg: dict, title: str, content: str,
       3. 抓到新 token 立即重发一次。
 
     代价与边界：
-      · 捕获用 getupdates 会与桌面端抢消息，抢到的那条桌面端看不到（bot 不回复它）。
-        自愈场景一次的代价可接受，与 clawbot.py「排障用即可」的结论一致。
+      · 捕获走 getupdates，**不消耗推送配额**。它**不会**抢走桌面端的消息：
+        2026-09-17 实测同一条消息两边各收一次（各自独立游标），
+        旧注释里「会与桌面端抢消息」的说法已作废（见项目记忆）。
       · 最坏阻塞约 90 秒；catchup 由 launchd 每 5 分钟触发，可接受。
       · 重发这次请求单独计入每日配额（请求即消耗，与 iLink 规则一致）；
         原始失败那次由主循环照常计入。
@@ -550,9 +601,9 @@ def _enqueue_pending(st: dict, level: str, title: str, content: str, now: float)
     """把「本应送达微信、却只降级了本机（或完全没送出）」的关键通知入队。
 
     为什么需要：签到到账 / 旅行到账 / 失败告警这类 success/failure 通知是**一次性**的
-    —— 当天任务完成后 catchup 不会再触发。若发送时刻恰好 token 过期、当场自愈又没接住
+    —— 当天任务完成后 catchup 不会再触发。若发送时刻恰好会话窗口关着、当场自愈又没接住
     （用户不在场），这条通知就会永久漏掉微信。入队后由 catchup 每次触发时 flush_pending
-    补发，token 一恢复就能补上，兑现「每天的消息一定微信通知到」。
+    补发，窗口一重开就能补上，兑现「每天的消息一定微信通知到」。
     """
     fp = _fingerprint(title, content, level)
     pending = st.setdefault("pending", [])
@@ -563,10 +614,55 @@ def _enqueue_pending(st: dict, level: str, title: str, content: str, now: float)
             return
     pending.append({"fp": fp, "level": level, "title": title,
                     "content": content, "ts": now})
-    # 只保留最近 48 小时、最多 12 条，防止 token 长期失效时无限堆积
+    # 只保留最近 48 小时、最多 12 条，防止窗口长期关闭时无限堆积
     cutoff = now - 48 * 3600
     st["pending"] = [it for it in pending
                      if isinstance(it, dict) and it.get("ts", 0) >= cutoff][-12:]
+
+
+def _blocked_state_skip_send(cfg: dict, st: dict, now: float, refreshed: bool) -> int:
+    """「投递被拒」状态下是否应当**跳过**本次补发发送；返回还要等几分钟（0 = 照发）。
+
+    ★ 2026-09-29 新增。真实故障：`prepare failed` = 服务端拒绝为这条**主动消息**建立
+      会话（会话窗口已关），而失败请求**同样计入 iLink 配额**。当天 08:05 冷却一结束，
+      flush 就每 5 分钟重试一次，3 次把当日 8 条配额烧光 —— 等用户 09:31 真按提示发了
+      消息，反而没配额可用了。所以「投递被拒」状态下必须限制重试频率。
+
+    规则（顺序即优先级）：
+      1. 本次刚捕获到入站消息（= 窗口已重开）→ 状态变了，立刻照发（真正能成功的路径）；
+      2. 上一次不是失败收场（last_send_error 已被清）→ 照发；
+      3. 上一次是网络/未知类失败 → 照发（短冷却已经管住了）；
+      4. 上一次是「投递被拒 / 缺 context_token」→ 距上次失败不足
+         `clawbot_blocked_retry_minutes` 就跳过。
+
+    为什么用「间隔」而不是「必须捕获到入站消息才发」：实测存在**自发恢复** ——
+    令牌本身是耐用的会话句柄（同一枚 09-25 09:45 的令牌，在 09-27 11:01 与 09-29 10:42
+    两次都发送成功），能否发出去只取决于服务端的会话窗口何时重开，而那一刻本地不一定
+    捕捉得到（桌面端在同一个 bot 上抢游标、或用户发消息时周期任务正好没在跑）。
+    硬性要求"捕获到入站"会把自发恢复这条路堵死；按间隔限流则既省配额、
+    又保留撞上窗口重开的机会。
+    """
+    if refreshed:
+        return 0
+    if not st.get("last_send_error"):
+        return 0
+    if clawbot is None:
+        return 0
+    txt = str(st.get("last_send_error") or "")
+    if clawbot.DELIVER_BLOCKED_MARK not in txt and "缺 context_token" not in txt:
+        return 0
+    try:
+        gap_min = int(cfg.get("clawbot_blocked_retry_minutes") or 0)
+    except (TypeError, ValueError):
+        gap_min = 0
+    if gap_min <= 0:
+        return 0
+    try:
+        last = float(st.get("last_send_error_ts") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    left = gap_min - (now - last) / 60.0
+    return int(left + 0.999) if left > 0 else 0
 
 
 def flush_pending(day_done: bool = False) -> dict:
@@ -576,6 +672,14 @@ def flush_pending(day_done: bool = False) -> dict:
     补发走 send(..., allow_recapture=False)：不在批量补发里触发 90 秒自愈窗口
     （自愈只该由正常通知路径触发一次，避免 flush 里多条失败把单次运行拖到几分钟）。
 
+    ★ 2026-09-29 新增「补发前先收一次信箱」：入站消息是本地判断**会话窗口是否重开**的
+    唯一信号 —— 窗口才是能否主动推送的闸门，不是 context_token 本身（见 clawbot.py 里的
+    实测说明）。而此前只有 send() 失败后的 90 秒窗口会捕获（见 _recapture_and_resend），
+    周期任务从不轮询 → 用户按告警提示发了消息也没有任何人接住，补发只能按固定间隔硬撞
+    `prepare failed`。现在每次有 pending 待补发时先短轮询一次（无消息则最多等
+    `_INBOUND_PEEK_TIMEOUT` 秒），一旦确认窗口重开就绕开 `_blocked_state_skip_send`
+    的间隔限制、立即补发。没有 pending 时不轮询，常规 tick 零额外开销。
+
     day_done=True（当天任务已全部完成）时，队列里的 failure 一律**作废**：它说的是
     「当时没办成」，而当天既然已经办成了，这条告警就永远不该再发出去。
     2026-09-26 的教训 —— 10:23 的网络故障告警排进队列，当天 19:02 其实已领取成功，
@@ -583,14 +687,40 @@ def flush_pending(day_done: bool = False) -> dict:
     success（到账）不受影响：领到多少分是既成事实，晚到也比漏掉好。
     （warning / info 根本不会入队，见 send() 末尾的入队条件，故这里无需处理。）
     """
+    cfg = load_config()
     st = _load_state()
     pending = st.get("pending") or []
     if not pending:
-        return {"flushed": 0, "dropped": 0, "remaining": 0}
+        return {"flushed": 0, "dropped": 0, "already": 0, "remaining": 0}
     now = time.time()
+
+    # ① 先收信箱：短轮询一次，有入站消息就把 context_token 换成新的
+    refreshed = False
+    if clawbot is not None:
+        try:
+            refreshed = clawbot.capture_inbound_once(timeout=_INBOUND_PEEK_TIMEOUT)
+        except Exception:  # noqa: BLE001
+            refreshed = False
+    if refreshed:
+        st = _load_state()   # capture 内部写盘了，重载后再读 last_send_error 等字段
+
+    # ② 「投递被拒」状态下不给无谓重试烧配额（见 _blocked_state_skip_send 的长注释）
+    wait_min = _blocked_state_skip_send(cfg, st, now, refreshed)
+    if wait_min > 0:
+        return {"flushed": 0, "dropped": 0, "already": 0, "remaining": len(pending),
+                "skipped": "投递被拒，{} 分钟后再试（避免烧配额）".format(wait_min)}
+
     cutoff = now - 48 * 3600
+    # 已经送到过微信的指纹。这些条目若继续留在队列里会**永久卡住**：
+    # 再发一次会被 `_dedupe_lookup` 拦下（返回 wechat=False），于是既排不空队列、
+    # 又让每次 catchup 都白跑一遍补发分支。2026-09-29 实测踩到 ——
+    # 手工 force 补发两条后，pending 仍是 2 条、sent 表里已有这两条指纹，
+    # 队列只能靠人工清；下一次 flush 甚至会被误记成"补发失败"。
+    # 送达过的就是送达过了，无论由哪条路径送出去的。
+    delivered = set((st.get("sent") or {}).keys())
     ok_n = 0
     dropped = 0
+    already = 0
     rest = []
     for item in pending:
         if not isinstance(item, dict):
@@ -601,6 +731,9 @@ def flush_pending(day_done: bool = False) -> dict:
         if day_done and (item.get("level") or "") == "failure":
             dropped += 1
             continue                      # 当天已办成 → 这条失败告警已过时，作废
+        if item.get("fp") and item.get("fp") in delivered:
+            already += 1
+            continue                      # 已送达 → 不能再发一次（否则重复推给用户）
         r = send(item.get("title", ""), item.get("content", ""),
                  item.get("level") or "info", allow_recapture=False,
                  cooldown_on_fail=False)
@@ -613,7 +746,8 @@ def flush_pending(day_done: bool = False) -> dict:
     st = _load_state()
     st["pending"] = rest
     _save_state(st)
-    return {"flushed": ok_n, "dropped": dropped, "remaining": len(rest)}
+    return {"flushed": ok_n, "dropped": dropped, "already": already,
+            "remaining": len(rest)}
 
 
 # ---------------------------------------------------------------------------
@@ -713,7 +847,13 @@ def send(title: str, content: str, level: str = "info", force: bool = False,
         first_attempt_ok = ok
 
         # ClawBot 熔断：成功则解除冷却；**任何失败**都进入冷却，避免无谓重试（见上方长注释）
-        if ch == "clawbot" and not force:
+        #
+        # 判据是 `not force or ok` 而不是 `not force`（2026-09-29 修）：
+        # force=True 只该跳过"失败后的冷却"，不该在**成功**时把过期的失败标记留在状态里。
+        # 踩过的坑：手工 force 补发成功后，`last_send_error` 仍停在几个小时前的
+        # 「投递被拒」，于是 `_blocked_state_skip_send` 认定通道仍被拒，
+        # 接下来 240 分钟内每一次 flush 都直接跳过 —— 成功反倒把队列锁死了。
+        if ch == "clawbot" and (not force or ok):
             if ok:
                 _clear_clawbot_cooldown(st)
                 st.pop("last_send_error", None)
@@ -726,7 +866,7 @@ def send(title: str, content: str, level: str = "info", force: bool = False,
                     kind = "session"          # 登录失效：必须重新扫码
                 elif clawbot is not None and (clawbot.DELIVER_BLOCKED_MARK in r_str
                                               or "缺 context_token" in r_str):
-                    kind = "blocked"          # 投递被拒 / token 失效：可自动自愈
+                    kind = "blocked"          # 投递被拒（会话窗口关）：可自动自愈
                 else:
                     kind = "other"            # 网络/未知：短冷却，允许较早重试
 
@@ -863,6 +1003,11 @@ if __name__ == "__main__":
         ok = _send_macos("WorkBuddy 积分助手 · 本机通知自测",
                          "看到这条就说明本机兜底通知是通的。")
         r["sent"] = ok
+        # 实发之后的真实失败原因（osascript 的非零退出 / stderr）。
+        # 这条比 local_check 的能力预检更有说服力：没弹出就一定非 None。
+        r["error"] = _last_macos_error or None
+        if not ok:
+            r["verdict"] = "发不出去：本机通知实际调用失败（见 error）"
         print(json.dumps(r, ensure_ascii=False, indent=2))
         sys.exit(0 if (ok and r["focus"] != "active") else 1)
 

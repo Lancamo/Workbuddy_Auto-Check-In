@@ -45,7 +45,14 @@ clawbot.py — 腾讯 iLink / 微信 ClawBot 直推模块（零第三方依赖�
 context_token：
   主动推送必须携带「从入站消息捕获」的 context_token。
   获取方式：让用户在微信里给 ClawBot 发一条消息，本模块 `wait` 长轮询捕获并持久化。
-  ⚠️ context_token 是临时的，不保证长期有效；失效后需重新捕获。
+  ⚠️ 2026-09-29 更正：**令牌本身不会过期，别再当它是短命物**。
+     macOS 侧实测：同一枚 09-25 09:45 捕获的令牌，在 09-27 与 09-29 两次都发送成功，
+     中间隔着整段 `prepare failed`。它是**耐用的会话句柄**。
+     真正决定「这条主动消息能不能进微信」的是服务端那个
+     「用户最近是否给机器人发过消息」的**会话窗口** —— 窗口关了就 prepare failed，
+     与令牌新旧无关。所以恢复动作是「等窗口重开」（发一条消息，或按
+     clawbot_blocked_retry_minutes 间隔撞一次），**不是**重新抓令牌。
+     相关：notify._blocked_state_skip_send / clawbot.capture_inbound_once。
 
 历史教训：errcode 才是业务错误码（不是 ret）。早期版本只查 ret，导致会话过期被误判为
 "发送成功"，日志恒显示正常而微信实际收不到。已修。
@@ -436,10 +443,13 @@ def _explain_error(data: dict) -> str:
         return (DELIVER_BLOCKED_MARK + "：服务端拒绝为这条主动消息建立会话" + detail + "。"
                 "**具体判据服务端没有公开，不要相信任何「N 小时不过期」的说法** ——"
                 "实测有两个相反的数据点：距上次给机器人发消息 9 小时能发、32 小时发不出"
-                "（那次刚过夜休眠醒来），但 38 小时后又能发出（当时桌面端在持续轮询）。"
-                "现有证据更支持「与本机客户端是否在持续轮询这个 bot 有关」，样本太少，仍属推测。"
-                "恢复动作：① 在微信里给机器人随便发一条消息（如「1」）；"
-                "② 保持 WorkBuddy 桌面端运行。两者都可恢复，都不需要重新扫码。")
+                "（那次刚过夜休眠醒来），但 38 小时后又能发出。"
+                "★ 2026-09-29 实测更正：「与桌面端是否持续轮询有关」这条推测已被推翻 ——"
+                "09-27 起连续两天推送全失败，而桌面端全程按约 18 秒轮询、游标文件一直在刷新；"
+                "随后用**同一枚**旧令牌发送成功。真正决定能否送达的是服务端那个"
+                "「用户最近是否给机器人发过消息」的**会话窗口**。"
+                "恢复动作：**去微信里给机器人随便发一条消息（如「1」）** —— "
+                "窗口一重开推送即恢复，不需要重新扫码。")
     if ret == -2 or errcode == -2:
         return (RATE_LIMIT_MARK + detail +
                 "：同一 bot 约 7 条 / 5 分钟，请等 60–120 秒重试。")
@@ -457,11 +467,16 @@ def _is_session_expired(data: dict) -> bool:
 def probe_context(timeout: int = 15) -> tuple[bool, str]:
     """只读探针：用本地 context_token 调 `getconfig`，判断令牌是否仍被服务端认可。
 
-    这是**唯一可以在本地自证「会话是否还活着」的手段**（发消息接口只回 message_id，
+    这是本地**唯一能验证令牌是否还被服务端接受**的手段（发消息接口只回 message_id，
     没有投递状态字段）。桌面端用同一接口取 typing_ticket，所以它的返回可作判据：
-      ret=0 且带 typing_ticket  → 令牌有效、会话活着
-      ret!=0 / 无 typing_ticket  → 令牌已失效，需重新 `wait` 捕获
+      ret=0 且带 typing_ticket  → 令牌被认可
+      ret!=0 / 无 typing_ticket  → 令牌未被认可（≠「过期」；恢复手段见下方 ⚠️）
     不发送任何消息、不占用推送配额。
+
+    ⚠️ 「令牌有效」≠「现在能主动推送出去」（2026-09-29 实测）：probe 报 valid 的同时，
+    sendmessage 仍连续被 `prepare failed` 拒绝；随后窗口重开，用**同一枚**令牌发送成功。
+    主动推送的闸门是服务端的会话窗口，不是令牌。所以本探针只能用来排除
+    「登录失效、必须重新扫码」，**不能**当作"此刻能发出去"的判据。
     """
     ch = load_channel()
     if not ch:
@@ -486,7 +501,7 @@ def probe_context(timeout: int = 15) -> tuple[bool, str]:
         return False, "getconfig ret={} errmsg={}".format(ret, data.get("errmsg") or "")
     if data.get("typing_ticket"):
         return True, "context_token 有效（getconfig ret=0，拿到 typing_ticket）"
-    return False, "getconfig ret=0 但未返回 typing_ticket，令牌可能已过期"
+    return False, "getconfig ret=0 但未返回 typing_ticket，令牌未被服务端认可"
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +661,56 @@ def capture_context_token(*, wait_seconds: int = 60) -> tuple[bool, str]:
     suffix = ("；最后错误：" + last_err) if last_err else ""
     return False, ("等待超时：未收到消息。请在微信里打开 ClawBot 对话，"
                    "随便发一条消息（如「1」），然后重跑本命令" + suffix)
+
+
+def capture_inbound_once(*, timeout: int = 5) -> bool:
+    """短轮询**一次**：只要有入站消息就刷新 context_token，返回是否刷新。
+
+    与 `capture_context_token` 的分工：
+      · `capture_context_token` 是**排障用**的阻塞等待，最长 90 秒，只等用户当场发消息，
+        顺带补全可能缺失的 ilink_user_id；
+      · 本函数是**周期任务用**的轻量探针，问一次就返回 —— 有消息立即返回，
+        没有则最多等 `timeout` 秒。可安全地放进每 5 分钟一次的 catchup。
+
+    ★ 2026-09-29 为什么必须新增（与 macOS 侧同步修的真实缺口）：
+      此前全项目只有 `capture_context_token` 会调用 `remember_context_token`，它又只在
+      `notify._recover_while_cooling` / `_recapture_and_resend` 里被调用；
+      而**补发路径 `flush_pending` 从来不轮询**。于是用户按告警提示在微信里发了消息，
+      补发那侧没有人在听，只能按固定间隔硬撞 `prepare failed`，
+      当天 8 条配额被无效重试烧光，用户反而收不到任何消息。
+
+    ★ 它真正的作用是**检测"窗口重开"**，而不是"必须换一枚新令牌"（2026-09-29 实测修正）：
+      能否主动推送，取决于服务端那个「用户最近是否给机器人发过消息」的会话窗口，
+      **不是** context_token 本身。macOS 侧实测：同一枚 09-25 捕获的令牌，
+      在 09-27 与 09-29 两次发送成功，中间隔着整段 `prepare failed`。
+      所以只要发现"有入站消息"，就足以判定窗口已重开、可以立刻重试；
+      顺带存下一枚（可能更新的）令牌是无害的附赠，但**不要**把它写成病因。
+
+    多条消息时取 `create_time_ms` 最新的一条（游标被重置后可能一次带回一批历史消息，
+    若取到最旧的那条，token 反而更旧）。
+    永不抛异常；任何失败都只返回 False。
+    """
+    try:
+        data, err = poll_updates(timeout=timeout)
+        if err or not data:
+            return False
+        best, best_ts = "", -1.0
+        for m in (data.get("msgs") or []):
+            ctx = m.get("context_token")
+            if not ctx:
+                continue
+            try:
+                ts = float(m.get("create_time_ms") or m.get("create_time") or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts >= best_ts:
+                best, best_ts = ctx, ts
+        if not best:
+            return False
+        remember_context_token(best)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ---------------------------------------------------------------------------

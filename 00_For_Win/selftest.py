@@ -491,8 +491,12 @@ def test_windows_output_decoding() -> None:
         report = doctor.Report()
         doctor.check_clawbot(report)
         blob2 = json.dumps(report.items, ensure_ascii=False)
-        check("持令牌时报「具备投递条件」，并说明令牌是临时的",
-              "具备投递条件" in blob2 and "临时" in blob2, blob2)
+        check("持令牌时报「具备投递条件」，并指向真正的变量（会话窗口）",
+              "具备投递条件" in blob2 and "会话窗口" in blob2, blob2)
+        # ★ 2026-09-29 反向断言：不许再把「令牌是临时的、会过期」写回来 ——
+        #   那条结论已被实测推翻（同一枚令牌跨 4 天两次发送成功）。
+        check("★ 且不再沿用已推翻的「令牌是临时令牌」旧说法",
+              "临时令牌" not in blob2, blob2[:200])
 
         clawbot.internal_state = lambda: {"context_token": "CTX",
                                           "context_token_ts": time.time(),
@@ -3210,6 +3214,161 @@ def test_online() -> None:
 
 
 # ---------------------------------------------------------------------------
+def test_notify_selfheal_paths() -> None:
+    """补发自愈路径：收信箱 / 间隔限流 / 队列排空 / force 成功清状态（2026-09-29）。
+
+    为什么必须钉住（macOS 侧先行踩到的真实事故）：用户按告警提示给机器人发了消息，
+    **补发那侧没有人在听** —— 补发路径从来不轮询入站，context_token 停在几天前，
+    补发每 5 分钟硬撞一次 `prepare failed`，把当日 8 条配额烧光，
+    等用户真去开窗时反而没配额可用。这一节把修法钉死：
+      ① 有积压时先短轮询收一次信箱 → 窗口重开就立刻放行；
+      ② 「投递被拒 / 缺令牌」状态下两次补发之间必须隔够间隔（失败同样烧配额）；
+      ③ 已送达过的条目必须被作废，否则队列会永久卡死（再发被去重拦下、又排不空）；
+      ④ force 成功也必须清掉过期的失败标记，否则 240 分钟内每次都跳过 —— 成功反锁队列。
+    """
+    section("8q. 补发自愈路径（收信箱 / 限流 / 排空 / force 清状态）")
+    import notify as N
+    import clawbot as CB
+
+    check("notify 具备自愈所需函数",
+          all(hasattr(N, n) for n in ("_blocked_state_skip_send", "flush_pending")),
+          "缺函数")
+    check("clawbot 具备轻量入站探针 capture_inbound_once",
+          hasattr(CB, "capture_inbound_once"), "缺函数")
+
+    cfg = dict(N.DEFAULT_CONFIG)
+    now = time.time()
+    BLOCKED = "投递被拒：服务端拒绝为这条主动消息建立会话（ret=-2 prepare failed）"
+    TOKEN_MISSING = "缺 context_token：服务端已受理，但消息不会到达微信"
+    NET = "请求超时（10 秒无响应）"
+
+    def skip(st: dict, refreshed: bool = False, c: dict | None = None) -> int:
+        return N._blocked_state_skip_send(c if c is not None else cfg, st, now, refreshed)
+
+    # ---- ② 间隔限流边界（注意本文件的 check() 收的是**条件**，不是"实测值 vs 期望值"）
+    check("补发间隔默认就是 240 分钟",
+          cfg.get("clawbot_blocked_retry_minutes") == 240,
+          "retry={}".format(cfg.get("clawbot_blocked_retry_minutes")))
+    check("刚捕获到入站消息 → 不跳过", skip({"last_send_error": BLOCKED,
+                                              "last_send_error_ts": now}, True) == 0)
+    check("没有历史失败 → 不跳过", skip({}) == 0)
+    check("网络类失败 → 不跳过（短冷却已在管）",
+          skip({"last_send_error": NET, "last_send_error_ts": now}) == 0)
+    check("投递被拒·刚失败 → 等满 240",
+          skip({"last_send_error": BLOCKED, "last_send_error_ts": now}) == 240,
+          "got={}".format(skip({"last_send_error": BLOCKED,
+                                "last_send_error_ts": now})))
+    check("投递被拒·已过 60 分钟 → 剩 180",
+          skip({"last_send_error": BLOCKED, "last_send_error_ts": now - 3600}) == 180)
+    check("投递被拒·已过 241 分钟 → 不跳过",
+          skip({"last_send_error": BLOCKED, "last_send_error_ts": now - 241 * 60}) == 0)
+    check("缺 context_token → 同属「等窗口」档，也要限流",
+          skip({"last_send_error": TOKEN_MISSING, "last_send_error_ts": now}) == 240)
+    check("关掉该保护（=0）→ 不跳过",
+          skip({"last_send_error": BLOCKED, "last_send_error_ts": now},
+               c={**cfg, "clawbot_blocked_retry_minutes": 0}) == 0)
+    # 配额反推：每天 24*60/间隔 次补发 + 2 次正常到账，不得越过每日上限
+    check("间隔与每日上限自洽（补发次数 + 2 ≤ cap）",
+          (24 * 60 // int(cfg["clawbot_blocked_retry_minutes"]) + 2)
+          <= int(cfg["max_pushes_per_day"]),
+          "cap={} retry={}".format(cfg.get("max_pushes_per_day"),
+                                   cfg.get("clawbot_blocked_retry_minutes")))
+
+    saved = (N.STATE, N.clawbot, N.send, N._send_via, N._send_native,
+             N.load_config, N._channel_order, N._native_enabled, N._has_credential)
+    orig_send = N.send
+    with tmpdir() as td:
+        try:
+            N.STATE = pathlib.Path(td) / "notify_state.json"
+            N.load_config = lambda: dict(N.DEFAULT_CONFIG)
+            N._native_enabled = lambda c: False
+            N._channel_order = lambda c: ["clawbot"]
+
+            class _FakeClaw:
+                DELIVER_BLOCKED_MARK = "投递被拒"
+                TOKEN_MISSING_MARK = "缺 context_token"
+                SESSION_EXPIRED_MARK = "会话已过期"
+                RATE_LIMIT_MARK = "频率限制"
+                peeked = 0
+
+                @classmethod
+                def capture_inbound_once(cls, *, timeout=5):
+                    cls.peeked += 1
+                    return False
+
+            N.clawbot = _FakeClaw
+
+            def seed(**kw):
+                base = {"sent": {}, "local_sent": {}, "daily": {}, "pending": []}
+                base.update(kw)
+                N._save_state(base)
+
+            # ---- ① 有积压时 flush 必须真的去收信箱
+            sent_calls = []
+            N.send = lambda *a, **k: (sent_calls.append(a), {"wechat": False})[1]
+            _FakeClaw.peeked = 0
+            seed(pending=[{"fp": "todo", "level": "success", "title": "T",
+                           "content": "C", "ts": time.time()}])
+            N.flush_pending()
+            check("有积压时 flush 会先收一次信箱", _FakeClaw.peeked == 1,
+                  "peeked={}".format(_FakeClaw.peeked))
+
+            # ---- ③ 已送达的条目必须被作废（否则队列永久卡死）
+            sent_calls[:] = []
+            seed(pending=[{"fp": "done", "level": "success", "title": "T2",
+                           "content": "C2", "ts": time.time()}],
+                 sent={"done": time.time()})
+            r = N.flush_pending()
+            check("已送达的条目 → 计入 already", r.get("already") == 1,
+                  json.dumps(r, ensure_ascii=False))
+            check("已送达的条目 → 不再重复发送", len(sent_calls) == 0)
+            check("已送达的条目 → 队列排空（这是修掉的卡死）",
+                  r.get("remaining") == 0, json.dumps(r, ensure_ascii=False))
+
+            # ---- 未送达的条目照旧走 send；失败则留在队列等下次
+            sent_calls[:] = []
+            seed(pending=[{"fp": "todo2", "level": "success", "title": "T3",
+                           "content": "C3", "ts": time.time()}])
+            r = N.flush_pending()
+            check("未送达的条目 → 确实调用 send", len(sent_calls) == 1)
+            check("未送达的条目 → 不误记 already", r.get("already") == 0)
+            check("发送失败 → 保留在队列", r.get("remaining") == 1)
+
+            # ---- ② 「投递被拒」状态下不烧配额
+            sent_calls[:] = []
+            seed(pending=[{"fp": "todo3", "level": "success", "title": "T4",
+                           "content": "C4", "ts": time.time()}],
+                 last_send_error=BLOCKED, last_send_error_ts=time.time())
+            r = N.flush_pending()
+            check("投递被拒·间隔未到 → 跳过且一次都不发",
+                  len(sent_calls) == 0 and "skipped" in r,
+                  json.dumps(r, ensure_ascii=False))
+
+            # ---- ④ force 成功必须清掉过期的失败标记（用真身 send，不发真消息）
+            N._send_via = lambda ch, c, t, s: (True, "clawbot 已送达（message_id=1）")
+            seed(last_send_error=BLOCKED, last_send_error_ts=time.time(),
+                 clawbot_cooldown_until=time.time() + 3600)
+            orig_send("T5", "C5", level="success", force=True)
+            st5 = N._load_state()
+            check("force + 成功 → 清掉过期的 last_send_error",
+                  st5.get("last_send_error") is None, repr(st5.get("last_send_error")))
+            check("force + 成功 → 冷却解除",
+                  N._clawbot_cooldown_remaining_min(st5, time.time()) == 0)
+
+            # ---- force + 失败：仍不设冷却、不入队（force 原语义不许被改坏）
+            N._send_via = lambda ch, c, t, s: (False, BLOCKED)
+            seed()
+            orig_send("T6", "C6", level="success", force=True)
+            st6 = N._load_state()
+            check("force + 失败 → 不设冷却",
+                  N._clawbot_cooldown_remaining_min(st6, time.time()) == 0)
+            check("force + 失败 → 不入补发队列", len(st6.get("pending") or []) == 0)
+        finally:
+            (N.STATE, N.clawbot, N.send, N._send_via, N._send_native,
+             N.load_config, N._channel_order, N._native_enabled,
+             N._has_credential) = saved
+
+
 def main() -> int:
     global VERBOSE
     ap = argparse.ArgumentParser(prog="selftest.py")
@@ -3248,6 +3407,7 @@ def main() -> int:
         test_dedupe_write_policy()
         test_endpoint_change_semantics()
         test_notify_delivery_semantics()
+        test_notify_selfheal_paths()
         test_renew_remind_gating()
         test_watchdog_job_state()
         test_localized_console_text()
