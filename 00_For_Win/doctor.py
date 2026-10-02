@@ -304,7 +304,7 @@ def check_clawbot(r: Report) -> None:
     else:
         r.warn("可送达性：还差一步 —— 缺 context_token",
                "主动推送会被服务端受理（照样占每日配额）但**不会出现在微信里**",
-               "在微信里给该机器人发一条消息（如「1」），然后双击 check_channel.cmd "
+               "在微信里给该机器人发一条消息（如「好」），然后双击 check_channel.cmd "
                "（= clawbot.py ready 90）完成验收：它会自动捕获令牌并实测一条。")
 
     last_err = st.get("last_send_error")

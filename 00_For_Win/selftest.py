@@ -1452,6 +1452,20 @@ def test_watchdog() -> None:
 
     # --- 判定逻辑：注入 job_loaded，用临时 state.json 控制心跳新鲜度 ---
     orig_state, orig_log = wd.STATE, wd.MAIN_LOG
+    # ★ 本组统一注入「系统一直醒着」的基线（wall 与 monotonic 同步推进 ⇒ slept=0
+    #   ⇒ just_woke=False）。**不注入就会整组失效**：prev_check=None 时 just_woke
+    #   恒为真、每一次 stale 都被豁免掉，这一组便再也测不出任何东西了。
+    #   「刚睡醒则豁免」由紧随其后的第 17 组单独覆盖。
+    #   基线以**被检查的时刻** t 为基准（而不是固定 now），这样午夜/07:00/14:00
+    #   那几组都成立，不受「自检恰好在几点跑」影响。
+    orig_check = wd.check
+    _mono0 = time.monotonic()
+
+    def _awake_check(t, **kw):
+        return orig_check(t, prev_check={"wall": t - 30 * 60, "mono": _mono0 - 30 * 60},
+                          mono_now=_mono0, **kw)
+
+    wd.check = _awake_check
     try:
         orig_quiet = wd.QUIET_FROM
         # 先关掉静默判定，让 1)~6) 专注「心跳新旧 → 报不报」这条逻辑本身；
@@ -1655,6 +1669,74 @@ def test_watchdog() -> None:
     finally:
         wd.STATE, wd.MAIN_LOG = orig_state, orig_log
         wd.QUIET_FROM = orig_quiet
+        wd.check = orig_check
+
+    # --- 17) ★ 2026-10-02：刚睡醒的豁免（本次误报的直接修复）-------------------
+    #   实测背景：2026-10-02 10:31 弹出「主脚本已 1446 分钟没有运行」，
+    #   真相是 02:32–10:28 整夜睡眠、launchd 压根没调度过主脚本 ——
+    #   那是「没机会跑」，不是「停摆」。判据 = wall 间隔 − monotonic 间隔。
+    #   这一组**必须用未被 patch 的 wd.check**（上一组注入的是「一直醒着」基线）。
+    _os17, _ol17 = wd.STATE, wd.MAIN_LOG
+    try:
+        with tmpdir() as td17:
+            st17 = pathlib.Path(td17) / "state.json"
+            lg17 = pathlib.Path(td17) / "catchup.log"
+            wd.STATE, wd.MAIN_LOG = st17, lg17
+            mono17 = time.monotonic()
+            # 固定用今天 14:00 作探测时刻：既躲开凌晨静默期，也让断言与
+            # 「自检恰好在几点跑」无关。
+            t17 = datetime.datetime.combine(datetime.date.today(),
+                                            datetime.time(14, 0)).timestamp()
+            # ★ mtime 必须基于**真实** time.time() —— _age_minutes() 用的是真实时钟，
+            #   若拿 t17（今天 14:00）去减，在 14:00 之前跑自检会得到一个**未来**的
+            #   mtime，age 变成负数、stale 永远不触发，断言就假通过了。
+            old17 = time.time() - (wd.STALE_MINUTES + 60) * 60
+            _yest17 = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+            st17.write_text(json.dumps(
+                {"day": _yest17, "checkin_done": True, "claim_done": True},
+                ensure_ascii=False), encoding="utf-8")
+            os.utime(st17, (old17, old17))
+            lg17.write_text("x\n", encoding="utf-8")
+
+            # a) 整夜睡了 476 分钟后刚醒 → 豁免（本次误报的真实参数）
+            r = wd.check(t17, job_loaded=True,
+                         prev_check={"wall": t17 - 500 * 60, "mono": mono17 - 24 * 60},
+                         mono_now=mono17)
+            check("整夜睡眠后刚醒（slept 约 476 分钟）→ 不报 stale",
+                  r["healthy"] and r["just_woke"] and not r["quiet_hours"]
+                  and (r["state_age_minutes"] or 0) > wd.STALE_MINUTES,
+                  "slept={} just_woke={} problems={}".format(
+                      r["slept_minutes"], r["just_woke"], r["problems"]))
+
+            # b) 系统一直醒着 → 照报（豁免不许掩盖真停摆）
+            r = wd.check(t17, job_loaded=True,
+                         prev_check={"wall": t17 - 30 * 60, "mono": mono17 - 30 * 60},
+                         mono_now=mono17)
+            check("系统一直醒着（slept=0）→ 照报 stale",
+                  "stale" in r["problems"] and not r["just_woke"],
+                  "slept={} problems={}".format(r["slept_minutes"], r["problems"]))
+
+            # c) 睡眠不足阈值 → 不豁免（阈值下界）
+            r = wd.check(t17, job_loaded=True,
+                         prev_check={"wall": t17 - 60 * 60, "mono": mono17 - 30 * 60},
+                         mono_now=mono17)
+            check("睡眠不足 {} 分钟 → 仍报 stale".format(wd.STALE_MINUTES),
+                  "stale" in r["problems"] and not r["just_woke"],
+                  "slept={} problems={}".format(r["slept_minutes"], r["problems"]))
+
+            # d) 无基线（首次运行 / 换机后第一次）→ 豁免一次并显式标 None
+            r = wd.check(t17, job_loaded=True, prev_check=None, mono_now=mono17)
+            check("无基线（首次运行）→ 豁免，slept_minutes 标为 None",
+                  r["healthy"] and r["just_woke"] and r["slept_minutes"] is None,
+                  "slept={} problems={}".format(r["slept_minutes"], r["problems"]))
+
+            # e) 基线字段残缺（从旧版本升级上来）→ 按无基线处理，不许抛异常
+            r = wd.check(t17, job_loaded=True, prev_check={"wall": 123}, mono_now=mono17)
+            check("基线残缺 → 按无基线处理，不抛异常",
+                  r["slept_minutes"] is None and r["just_woke"],
+                  "slept={}".format(r["slept_minutes"]))
+    finally:
+        wd.STATE, wd.MAIN_LOG = _os17, _ol17
 
     # --- 静默判据：catchup 决定「写不写心跳」，watchdog 据此判活，口径必须一致 ---
     import catchup as cu
@@ -3245,6 +3327,14 @@ def test_notify_selfheal_paths() -> None:
     def skip(st: dict, refreshed: bool = False, c: dict | None = None) -> int:
         return N._blocked_state_skip_send(c if c is not None else cfg, st, now, refreshed)
 
+    # ★ 把「用户最后一次给机器人发消息的时刻」钉成已知值。默认实现 `_current_inbound_ts()`
+    #   会去读真实的 clawbot_state.json —— 本机只要刚收到过微信消息（2026-10-02 10:55 就是），
+    #   「已过 60 分钟」这类**造在过去**的场景就会被规则 1b（入站晚于上次失败 → 窗口已重开 →
+    #   放行）判成 0，断言随本机状态漂移。macOS 侧实跑时正是这样挂掉了一条。
+    _real_inbound = N._current_inbound_ts
+    _ib = {"ts": 0.0}
+    N._current_inbound_ts = lambda: _ib["ts"]
+
     # ---- ② 间隔限流边界（注意本文件的 check() 收的是**条件**，不是"实测值 vs 期望值"）
     check("补发间隔默认就是 240 分钟",
           cfg.get("clawbot_blocked_retry_minutes") == 240,
@@ -3264,6 +3354,28 @@ def test_notify_selfheal_paths() -> None:
           skip({"last_send_error": BLOCKED, "last_send_error_ts": now - 241 * 60}) == 0)
     check("缺 context_token → 同属「等窗口」档，也要限流",
           skip({"last_send_error": TOKEN_MISSING, "last_send_error_ts": now}) == 240)
+
+    # ---- 规则 1b：入站消息晚于上次失败 → 立刻放行（2026-10-02 修）
+    #   为什么不能只看 `refreshed`（本轮刚捕获到）：入站消息可能已被**别的路径**收走
+    #   （上一轮 tick / renew.py / 手工探测），游标一前进本次轮询就永远看不到它，
+    #   refreshed 恒为 False —— 用户按提示发完消息仍要干等满 240 分钟。
+    check("无入站记录（老状态）→ 仍按间隔跳过",
+          skip({"last_send_error": BLOCKED, "last_send_error_ts": now}) == 240)
+    _ib["ts"] = now - 60
+    check("入站早于上次失败 → 不算新证据，仍按间隔跳过",
+          skip({"last_send_error": BLOCKED, "last_send_error_ts": now}) == 240)
+    _ib["ts"] = now + 60
+    check("入站晚于上次失败 → 立刻放行（修掉的那个坑）",
+          skip({"last_send_error": BLOCKED, "last_send_error_ts": now}) == 0)
+    check("入站晚于失败 → 即便间隔还剩 200 分钟也放行",
+          skip({"last_send_error": BLOCKED,
+                "last_send_error_ts": now - 40 * 60}) == 0)
+    check("入站晚于失败 → 对「缺令牌」档同样放行",
+          skip({"last_send_error": TOKEN_MISSING, "last_send_error_ts": now}) == 0)
+    check("保护关闭（=0）时入站规则不掺和",
+          skip({"last_send_error": BLOCKED, "last_send_error_ts": now},
+               c={**cfg, "clawbot_blocked_retry_minutes": 0}) == 0)
+    _ib["ts"] = 0.0
     check("关掉该保护（=0）→ 不跳过",
           skip({"last_send_error": BLOCKED, "last_send_error_ts": now},
                c={**cfg, "clawbot_blocked_retry_minutes": 0}) == 0)
@@ -3367,6 +3479,7 @@ def test_notify_selfheal_paths() -> None:
             (N.STATE, N.clawbot, N.send, N._send_via, N._send_native,
              N.load_config, N._channel_order, N._native_enabled,
              N._has_credential) = saved
+            N._current_inbound_ts = _real_inbound
 
 
 def main() -> int:

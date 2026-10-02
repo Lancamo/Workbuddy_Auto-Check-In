@@ -14,8 +14,9 @@ WorkBuddy 桌面端的本地签到与旅行奖励补跑工具，支持 macOS 与
 - 独立 watchdog 监控主任务是否停止运行。
 - 00:00–07:00 与当日签到、领取都完成后立即退出，避免无意义空转。
 - Windows 增加每日 07:00 与白天每小时唤醒点，电脑睡眠时也能完成当日签到；可用 `--no-wake` / `--no-daywake` 关闭。
+- macOS 提供 `daily_wake.sh`，用系统电源计划额外设一条每日保底唤醒（默认 07:05），把合盖时「能否签到全看系统当次给的维护唤醒窗口」变成有保底；需手动 `sudo` 执行一次。
 - Windows 本机通知改为右下角卡片，并避免 watchdog 子进程弹出控制台窗口。
-- watchdog 识别预期的静默期，不把正常收工误报为停摆。
+- watchdog 识别预期的静默期与「刚睡眠唤醒」两种情形，不把正常收工或睡眠后的补跑误报为停摆。
 - 区分网络层与业务层失败：断网或代理拦截不会消耗当日重试额度，网络恢复后自动继续。
 - 微信推送被服务端拒绝时，会在后续运行中自动重试并补发，无需人工干预。
 - 投递被拒后按间隔限流重试（失败请求同样计入每日推送配额），避免把当日额度烧光。
@@ -57,6 +58,17 @@ bash install.sh status
 
 - `com.workbuddy.wb-reward-catchup`：每 5 分钟触发主任务。
 - `com.workbuddy.wb-reward-watchdog`：每 30 分钟检查主任务状态。
+
+合盖时 launchd 不会执行任务，当天能否签到取决于系统当次给的维护唤醒窗口（实测 45 秒的能跑完、
+2 秒的来不及）。想加一条保底，用 `daily_wake.sh` 额外设一个每日固定唤醒点：
+
+```bash
+sudo bash daily_wake.sh enable        # 默认 07:05，可带 HH:MM 改时刻
+bash daily_wake.sh status             # 查看当前设置（无需 sudo）
+sudo bash daily_wake.sh disable       # 取消
+```
+
+它只写系统电源计划（`pmset repeat`），不注册 LaunchAgent、不写项目状态。
 
 ### Windows
 

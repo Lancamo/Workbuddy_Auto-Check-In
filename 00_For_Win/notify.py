@@ -633,7 +633,7 @@ def _alert_channel_expired(st: dict, cfg: dict, now: float, kind: str = "session
         ok = _send_native(
             "⚠️ 微信拒收积分通知（通道未失效，但发不出去）",
             "服务端拒绝投递主动消息（prepare failed）。请在微信里给机器人"
-            "随便发一条消息（例如「1」）重新开窗，推送随即自动恢复 —— 不需要重新扫码。",
+            "发一条消息（内容随意，推荐发「好」）重新开窗，推送随即自动恢复 —— 不需要重新扫码。",
         )
     else:
         ok = _send_native(
@@ -732,7 +732,7 @@ def _blocked_state_skip_send(cfg: dict, st: dict, now: float, refreshed: bool) -
     重试一次，3 次把当日 8 条配额烧光 —— 等用户 09:31 真按提示发了消息，反而没配额可用了。
 
     规则（顺序即优先级）：
-      1. 本次刚捕获到入站消息（= 窗口已重开）→ 状态变了，立刻照发（真正能成功的路径）；
+      1. 本次刚捕获到入站消息，或入站时间已晚于上次失败（= 窗口已重开）→ 立刻照发；
       2. 上一次不是失败收场（last_send_error 已被清）→ 照发；
       3. 上一次是网络 / 频率限制 / 未知类失败 → 照发（各自那档短冷却已经管住了，
          这里的间隔只针对「等人工动作」那一类）；
@@ -762,6 +762,15 @@ def _blocked_state_skip_send(cfg: dict, st: dict, now: float, refreshed: bool) -
         return 0
     last = st.get("last_send_error_ts")
     if not isinstance(last, (int, float)):
+        return 0
+    # 1b. 入站时间晚于上次失败 → 用户在那之后又给机器人发过消息，窗口状态已变，值得立刻试一次。
+    #     为什么不能只看 `refreshed`：入站消息可能已被**别的路径**收走（上一轮 tick / renew.py /
+    #     手工探测），游标一前进，本次轮询就永远看不到它，refreshed 恒为 False —— 用户明明
+    #     按提示发完了消息，却仍要干等满 `clawbot_blocked_retry_minutes`。
+    #     macOS 侧 2026-10-02 实测踩到：10:55 已捕获到入站，flush 还是以「215 分钟后再试」跳过，
+    #     那条到账通知白压了 4 小时。
+    #     配额安全：失败后 last_send_error_ts 会前进，同一枚入站最多只放行一次。
+    if last > 0 and _current_inbound_ts() > last:
         return 0
     left = gap_min - (now - last) / 60.0
     return int(left + 0.999) if left > 0 else 0

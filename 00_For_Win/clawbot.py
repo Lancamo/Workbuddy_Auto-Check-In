@@ -448,7 +448,7 @@ def _explain_error(data: dict) -> str:
                 "09-27 起连续两天推送全失败，而桌面端全程按约 18 秒轮询、游标文件一直在刷新；"
                 "随后用**同一枚**旧令牌发送成功。真正决定能否送达的是服务端那个"
                 "「用户最近是否给机器人发过消息」的**会话窗口**。"
-                "恢复动作：**去微信里给机器人随便发一条消息（如「1」）** —— "
+                "恢复动作：**去微信里给机器人随便发一条消息（如「好」）** —— "
                 "窗口一重开推送即恢复，不需要重新扫码。")
     if ret == -2 or errcode == -2:
         return (RATE_LIMIT_MARK + detail +
@@ -577,7 +577,7 @@ def send_text(text: str, *, timeout: int = 20, use_context: bool = True) -> tupl
         return False, (
             TOKEN_MISSING_MARK + "：服务端已受理" + mid_txt +
             "，但消息不会到达微信。请在微信给机器人发任意一条消息"
-            "（如「1」）刷新令牌，推送即自动恢复。"
+            "（如「好」）刷新令牌，推送即自动恢复。"
         )
     return True, "clawbot 已送达" + mid_txt
 
@@ -622,7 +622,7 @@ def poll_updates(*, timeout: int = 40) -> tuple[dict, str]:
 def capture_context_token(*, wait_seconds: int = 60) -> tuple[bool, str]:
     """长轮询等待用户发消息，抓到 context_token 即持久化。
 
-    用法：先在微信里给 ClawBot 机器人发一条消息（如「1」），再运行本函数。
+    用法：先在微信里给 ClawBot 机器人发一条消息（如「好」），再运行本函数。
 
     ⚠️ 2026-09-28 更正：**这里不存在「和桌面端抢消息」**。
       旧注释写「桌面端也在轮询同一 bot，会与本脚本抢消息」——那条结论在
@@ -631,6 +631,10 @@ def capture_context_token(*, wait_seconds: int = 60) -> tuple[bool, str]:
       （桌面端 `<bot_id>.cursor.json`，脚本 `clawbot_state.json.get_updates_buf`），
       互不干扰。见项目记忆「ClawBot 通道关键事实」。
       → 所以抓令牌**不会**让桌面端漏消息；只是长连接本身该克制，别长期挂后台。
+
+    📌 发什么内容都行，「好」只是最省事（2026-10-02 实测）：窗口只看"有没有消息"、
+       不看内容，而机器人对「好」只会回一句「知道了」；发别的（如「1」）它会反问
+       "我不知道指什么" —— 那只是它的对话反应，不影响窗口重开。
     """
     deadline = time.monotonic() + max(wait_seconds, 10)
     last_err = ""
@@ -660,7 +664,7 @@ def capture_context_token(*, wait_seconds: int = 60) -> tuple[bool, str]:
                     if m.get("item_list") else "")
     suffix = ("；最后错误：" + last_err) if last_err else ""
     return False, ("等待超时：未收到消息。请在微信里打开 ClawBot 对话，"
-                   "随便发一条消息（如「1」），然后重跑本命令" + suffix)
+                   "随便发一条消息（如「好」），然后重跑本命令" + suffix)
 
 
 def capture_inbound_once(*, timeout: int = 5) -> bool:
@@ -956,7 +960,7 @@ def check_ready(wait_seconds: int = 90) -> dict:
     if out["context_token"].get("valid") is not True and wait_seconds > 0:
         print(json.dumps({
             "step": "capture",
-            "hint": "请立刻在微信里给机器人发任意一条消息（如「1」）；"
+            "hint": "请立刻在微信里给机器人发任意一条消息（如「好」）；"
                     "本命令将在 {} 秒内捕获它。".format(wait_seconds),
         }, ensure_ascii=False), flush=True)
         ok, why = capture_context_token(wait_seconds=wait_seconds)
@@ -988,7 +992,7 @@ def check_ready(wait_seconds: int = 90) -> dict:
         out["next_action"] = "无需操作。"
     elif not ctx:
         out["gap"] = "缺 context_token：主动推送必须在会话窗口内，而令牌只能从「用户发给机器人的消息」里捕获"
-        out["next_action"] = ("在微信里打开与机器人的对话，发任意一条消息（如「1」），"
+        out["next_action"] = ("在微信里打开与机器人的对话，发任意一条消息（如「好」），"
                               "然后重跑本命令" + ("（本次捕获也失败了：{}）".format(captured_note)
                                                   if captured_note else "") + "。")
     else:
@@ -1029,6 +1033,13 @@ if __name__ == "__main__":
                 "context_token": mask(ctx) if ctx else "(无 → 推送不会到达微信，需 wait 捕获)",
                 "context_token_age_hours": (
                     round((time.time() - ts) / 3600, 1) if isinstance(ts, (int, float)) else None),
+                # ★ 别把这个数读成「用户上次在微信里发消息是多久前」（2026-10-02 更正）：
+                #   它记的是**脚本最后一次主动去看信箱**的时刻，而脚本只在
+                #   「有待补发条目 / 刚推送失败 / 手工跑过」时才去看。
+                #   所以它是**上界** —— 真实间隔可能更短，绝不可能更长。
+                "context_token_age_note": (
+                    "上界，不是精确值：只在脚本主动查看信箱时更新；"
+                    "要看真实间隔请翻微信里自己那条消息的时间"),
                 "token_missing_since": st.get("token_missing_since"),
                 "cursor": "有" if st.get("get_updates_buf") else "(空)",
             })
@@ -1071,7 +1082,7 @@ if __name__ == "__main__":
         # 推不出去 → 服务端需要一条入站消息建立会话
         print(json.dumps({
             "hint": "直接推送未成功，需要一条入站消息来建立会话。"
-                    "请在微信里给 ClawBot 发一条消息（如「1」），"
+                    "请在微信里给 ClawBot 发一条消息（如「好」），"
                     "正在等待（最长 {} 秒）…".format(msg_wait)
         }, ensure_ascii=False), flush=True)
         ok2, reason2 = capture_context_token(wait_seconds=msg_wait)
@@ -1088,7 +1099,7 @@ if __name__ == "__main__":
     if action == "wait":
         secs = int(sys.argv[2]) if len(sys.argv) > 2 else 60
         print(json.dumps({
-            "hint": "请在微信里给 ClawBot 机器人发一条消息（如「1」），"
+            "hint": "请在微信里给 ClawBot 机器人发一条消息（如「好」），"
                     "本命令将在 {} 秒内自动捕获 context_token".format(secs)
         }, ensure_ascii=False))
         ok, reason = capture_context_token(wait_seconds=secs)
@@ -1113,7 +1124,7 @@ if __name__ == "__main__":
         # 验证「每个入站上下文只允许一条出站、桌面端自动回复会抢先消耗掉」这一假设。
         text = sys.argv[2] if len(sys.argv) > 2 else "X｜竞速测试"
         secs = int(sys.argv[3]) if len(sys.argv) > 3 else 180
-        print(json.dumps({"hint": "请在微信给机器人发一条消息（如「1」）；"
+        print(json.dumps({"hint": "请在微信给机器人发一条消息（如「好」）；"
                                   "本命令会在收到的那一刻立刻抢发推送，"
                                   "窗口 {} 秒".format(secs)}, ensure_ascii=False), flush=True)
         deadline = time.monotonic() + secs

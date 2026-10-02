@@ -87,6 +87,14 @@ cfg = dict(notify.DEFAULT_CONFIG)
 now = time.time()
 BLOCKED = "投递被拒：服务端拒绝为这条主动消息建立会话（ret=-2 prepare failed）"
 
+# ★ 把「用户最后一次给机器人发消息的时刻」钉成已知值。默认实现 `_current_inbound_ts()`
+#   会去读真实的 clawbot_state.json —— 本机只要刚收到过微信消息（2026-10-02 10:55 就是），
+#   「已过 60 分钟」这类**造在过去**的场景就会被规则 1b（入站晚于上次失败 → 窗口已重开 →
+#   放行）判成 0，断言随本机状态漂移。2026-10-02 实跑时正是这样挂掉一条。
+_real_inbound = notify._current_inbound_ts
+_inbound = {"ts": 0.0}
+notify._current_inbound_ts = lambda: _inbound["ts"]
+
 check("刚捕获到新 token → 不跳过",
       notify._blocked_state_skip_send(cfg, {"last_send_error": BLOCKED,
                                             "last_send_error_ts": now}, now, True), 0)
@@ -115,6 +123,37 @@ check("关掉该保护（=0）→ 不跳过",
                                       {"last_send_error": BLOCKED,
                                        "last_send_error_ts": now}, now, False), 0)
 check("默认值就是 240", notify.DEFAULT_CONFIG.get("clawbot_blocked_retry_minutes"), 240)
+
+# ---- 规则 1b：入站消息晚于上次失败 → 立刻放行（2026-10-02 修）
+#   为什么不能只看 `refreshed`（本轮刚捕获到）：入站消息可能已被**别的路径**收走
+#   （上一轮 tick / renew.py / 手工探测），游标一前进本次轮询就永远看不到它，
+#   refreshed 恒为 False —— 用户按提示发完消息，仍要干等满 240 分钟。
+_inbound["ts"] = now - 60
+check("入站早于上次失败 → 不算新证据，仍按间隔跳过",
+      notify._blocked_state_skip_send(cfg, {"last_send_error": BLOCKED,
+                                            "last_send_error_ts": now}, now, False), 240)
+_inbound["ts"] = now + 60
+check("入站晚于上次失败 → 立刻放行（修掉的那个坑）",
+      notify._blocked_state_skip_send(cfg, {"last_send_error": BLOCKED,
+                                            "last_send_error_ts": now}, now, False), 0)
+check("入站晚于失败 → 即便间隔还剩 200 分钟也放行",
+      notify._blocked_state_skip_send(cfg, {"last_send_error": BLOCKED,
+                                            "last_send_error_ts": now - 40 * 60},
+                                      now, False), 0)
+check("入站晚于失败 → 对「缺令牌」档同样放行",
+      notify._blocked_state_skip_send(
+          cfg, {"last_send_error": "缺 context_token：服务端已受理",
+                "last_send_error_ts": now}, now, False), 0)
+_inbound["ts"] = 0.0
+check("没有入站记录（升级前的旧状态）→ 回落到按间隔跳过",
+      notify._blocked_state_skip_send(cfg, {"last_send_error": BLOCKED,
+                                            "last_send_error_ts": now}, now, False), 240)
+check("入站规则不越过 refreshed 快路径",
+      notify._blocked_state_skip_send(cfg, {"last_send_error": BLOCKED,
+                                            "last_send_error_ts": now}, now, True), 0)
+
+# 还原，免得影响后面的分组
+notify._current_inbound_ts = _real_inbound
 
 # ------------------------------------------- C. capture_inbound_once（真实短轮询）
 print("\n=== C. capture_inbound_once（真实短轮询一次）===")

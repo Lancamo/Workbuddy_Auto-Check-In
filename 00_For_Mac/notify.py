@@ -287,10 +287,15 @@ def _clear_clawbot_cooldown(st: dict) -> None:
 
 
 def _current_inbound_ts() -> float:
-    """用户最后一次给机器人发消息的时间。
+    """**脚本最后一次捕获到入站消息**的时刻 —— 不是「用户最后一次发消息的时刻」。
 
     取自 clawbot_state.json 的 `context_token_ts` —— 它是每次捕获到**入站消息**时
     更新的（`clawbot.remember_context_token`）。纯本地读文件，无网络、无配额消耗。
+
+    ⚠️ 2026-10-02 更正：它只在脚本**主动去看信箱**时才前进，而脚本只在「有待补发条目 /
+    刚推送失败 / 手工跑过」时才去看；一切顺利的日子它**本来就静止**。因此
+    **不能**用它倒推「用户多久没发过消息」（10-02 就是这样误判了「保活失效」）。
+    本函数的正确用途是**比较两次取值有没有前进**（= 会话窗口是否重开），不是报时间。
     """
     if clawbot is None:
         return 0.0
@@ -541,7 +546,7 @@ def _alert_channel_expired(st: dict, cfg: dict, now: float, kind: str = "session
         return _send_macos(
             "⚠️ 微信拒收积分通知（通道未失效，但发不出去）",
             "服务端拒绝投递主动消息（prepare failed）。请在微信里给机器人"
-            "随便发一条消息（例如「1」）重新开窗，推送随即自动恢复 —— 不需要重新扫码。",
+            "发一条消息（内容随意，推荐发「好」）重新开窗，推送随即自动恢复 —— 不需要重新扫码。",
         )
     return _send_macos(
         "⚠️ 微信推送通道已失效，积分通知发不出去",
@@ -629,7 +634,7 @@ def _blocked_state_skip_send(cfg: dict, st: dict, now: float, refreshed: bool) -
       消息，反而没配额可用了。所以「投递被拒」状态下必须限制重试频率。
 
     规则（顺序即优先级）：
-      1. 本次刚捕获到入站消息（= 窗口已重开）→ 状态变了，立刻照发（真正能成功的路径）；
+      1. 本次刚捕获到入站消息，或入站时间已晚于上次失败（= 窗口已重开）→ 立刻照发；
       2. 上一次不是失败收场（last_send_error 已被清）→ 照发；
       3. 上一次是网络/未知类失败 → 照发（短冷却已经管住了）；
       4. 上一次是「投递被拒 / 缺 context_token」→ 距上次失败不足
@@ -661,6 +666,15 @@ def _blocked_state_skip_send(cfg: dict, st: dict, now: float, refreshed: bool) -
         last = float(st.get("last_send_error_ts") or 0)
     except (TypeError, ValueError):
         last = 0.0
+    # 1b. 入站时间晚于上次失败 → 用户在那之后又给机器人发过消息，窗口状态已变，值得立刻试一次。
+    #     为什么不能只看 `refreshed`：入站消息可能已被**别的路径**收走（上一轮 tick / renew.py /
+    #     手工探测），游标一前进，本次轮询就永远看不到它，refreshed 恒为 False —— 用户明明
+    #     按提示发完了消息，却仍要干等满 `clawbot_blocked_retry_minutes`。
+    #     2026-10-02 实测踩到：10:55 已捕获到入站，flush 还是以「215 分钟后再试」跳过，
+    #     那条到账通知白压了 4 小时。
+    #     配额安全：失败后 last_send_error_ts 会前进，同一枚入站最多只放行一次。
+    if last > 0 and _current_inbound_ts() > last:
+        return 0
     left = gap_min - (now - last) / 60.0
     return int(left + 0.999) if left > 0 else 0
 

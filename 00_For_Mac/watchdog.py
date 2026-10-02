@@ -14,6 +14,13 @@
     · 只做两件事：① 主脚本最近有没有动过  ② 计划任务还在不在；
     · 报警只走本机通知（osascript），不碰微信、不消耗任何推送配额。
 
+  判「心跳陈旧」时有三种**预期静默**，都不算故障（判据全部写进输出的 JSON）：
+    ① 凌晨静默期（00:00–07:00）—— 主脚本故意不写心跳；
+    ② 当日已收工（签到 + 领取都到手）—— 同上；
+    ③ **刚睡醒** —— 系统睡眠期间 launchd 根本不调度，心跳陈旧是必然的。
+       （第三种是 2026-10-02 补的：那天 10:31 弹出「已 1446 分钟没有运行」，
+        真相是 02:32–10:28 整夜合盖睡眠，主脚本压根没被调度过。）
+
 它自己也会死 —— 这是原理性的（无限套娃）。所以本文件不是「万能兜底」，
 而是「把最可能发生的静默死亡变成一条你能看见的本地通知」。
 
@@ -99,6 +106,37 @@ def _quiet_now(now: float) -> bool:
     return dt.hour * 100 + dt.minute < QUIET_FROM
 
 
+def _slept_minutes(prev: dict | None, now: float, mono_now: float) -> float | None:
+    """自上次检查以来系统**睡着**了多少分钟；拿不到基线时返回 None。
+
+    为什么必须有这一条：主脚本靠 LaunchAgent 的 StartInterval 调度，而**系统睡眠
+    期间 launchd 不执行任务**。于是「整夜合盖 → 早上开盖」这个最常见的日常，
+    一定会让心跳看起来极度陈旧 —— 那是「没机会跑」，不是「停摆」。
+    （2026-10-02 实际踩到：10:31 弹出「主脚本已 1446 分钟没有运行」，
+     真相是 02:32–10:28 整夜 Clamshell Sleep，主脚本压根没被调度过。）
+
+    怎么算：wall 时钟走过的时长 − monotonic 时钟走过的时长 = 期间的睡眠时长。
+    `time.monotonic()` 在 macOS / Windows 上**都不计入系统睡眠** ——
+    本机实测：开机时长 370.8 小时 vs monotonic 195.0 小时，187 小时差 = 15 天里
+    的累计睡眠，与 pmset 日志吻合。
+
+    为什么这样不会掩盖真停摆：watchdog 每 30 分钟一轮，两次检查之间的 wall 间隔
+    正常就是 30 分钟 —— 也就是说「睡够 90 分钟」只可能出现在**真的睡了一觉**
+    之后的第一次采样上。若主脚本真的死了，下一轮 slept 必然 < 阈值，照报，
+    最多把报警推迟一轮（30 分钟）。
+    """
+    if not isinstance(prev, dict):
+        return None
+    prev_wall = prev.get("wall")
+    prev_mono = prev.get("mono")
+    if not (isinstance(prev_wall, (int, float)) and isinstance(prev_mono, (int, float))):
+        return None
+    wall_gap = now - float(prev_wall)
+    mono_gap = mono_now - float(prev_mono)
+    # max(0, ...) 防时钟被 NTP 回拨导致负数
+    return max(0.0, (wall_gap - mono_gap) / 60.0)
+
+
 def _day_finished(st: dict, now: float) -> bool:
     """主脚本今天是否已收工（签到 + 旅行奖励都到手）。
 
@@ -158,20 +196,33 @@ def _save_self_state(st: dict) -> None:
         pass
 
 
-def check(now: float, job_loaded: bool | None = None) -> dict:
+def check(now: float, job_loaded: bool | None = None,
+          prev_check: dict | None = None,
+          mono_now: float | None = None) -> dict:
     """返回本次检查的结论（纯函数式：只读外部世界，不通知、不落盘）。
 
     job_loaded 传入时以它为准（自检脚本用它注入「任务已卸载」的情形）。
+    prev_check / mono_now 同理：自检脚本注入「刚睡醒」等情形，不必真去睡一觉。
     """
     age = _age_minutes(STATE)
     log_age = _age_minutes(MAIN_LOG)
     loaded = _job_loaded() if job_loaded is None else bool(job_loaded)
+    if mono_now is None:
+        mono_now = time.monotonic()
 
     # 主脚本在「凌晨静默期」与「当日收工后」是**故意不写心跳**的（见 catchup.py
     # 的 _quiet_now / _day_finished）。这两种情况下心跳陈旧是预期行为，不算故障。
     quiet = _quiet_now(now)
     finished = _day_finished(_state_info(), now)
-    expected_silence = quiet or finished
+
+    # 第三种预期静默：**刚睡醒**。系统睡眠期间 launchd 不调度任务，心跳自然陈旧；
+    # 主脚本要等唤醒后 launchd 补发才有机会跑，所以这一轮不下结论
+    # （判据与理由见 _slept_minutes）。无基线时（首次运行 / 换机后第一次）
+    # 同样按「刚醒」处理 —— 宁可晚一轮报，也不要误报。
+    slept = _slept_minutes(prev_check, now, mono_now)
+    just_woke = slept is None or slept >= STALE_MINUTES
+
+    expected_silence = quiet or finished or just_woke
 
     problems = []
     if age is None:
@@ -190,6 +241,9 @@ def check(now: float, job_loaded: bool | None = None) -> dict:
         # 把判定依据显式写出来：事后核对「为什么这次没报警」时不用猜。
         "quiet_hours": quiet,
         "day_finished": finished,
+        # 刚睡醒：本轮因为「系统睡着过」而豁免。slept_minutes=None 表示没有基线。
+        "just_woke": just_woke,
+        "slept_minutes": None if slept is None else round(slept, 1),
         "problems": [k for k, _ in problems],
         "details": [d for _, d in problems],
         "healthy": not problems,
@@ -198,6 +252,7 @@ def check(now: float, job_loaded: bool | None = None) -> dict:
 
 def main() -> None:
     now = time.time()
+    mono_now = time.monotonic()
     for name, limit, keep in (
         ("watchdog.out.log", MAX_LOG_BYTES, 500),
         ("watchdog.err.log", MAX_LOG_BYTES, 300),
@@ -211,7 +266,12 @@ def main() -> None:
         except OSError:
             pass
     st = _load_self_state()
-    res = check(now)
+    res = check(now, prev_check=st.get("last_check"), mono_now=mono_now)
+
+    # ★ 基线**每轮无条件推进**。若只在「真要通知」时才写，那么被冷却压制的那几轮
+    #   不会更新基线，slept_minutes 会一路累积、just_woke 永远为真 —— 真停摆就被
+    #   永久掩盖了。这是本判据唯一能失效的方式，所以放在这里、而不是分支里。
+    st["last_check"] = {"wall": now, "mono": mono_now}
 
     if res["healthy"]:
         # 恢复正常时清掉告警记录，让下次故障能立刻再报（而不是被冷却吃掉）
@@ -219,8 +279,9 @@ def main() -> None:
             log("恢复正常，清空告警冷却记录")
         st["last_alert"] = {}
         _save_self_state(st)
-        log("ok state_age={} log_age={} job_loaded={}".format(
-            res["state_age_minutes"], res["main_log_age_minutes"], res["job_loaded"]))
+        log("ok state_age={} log_age={} job_loaded={} just_woke={} slept={}".format(
+            res["state_age_minutes"], res["main_log_age_minutes"], res["job_loaded"],
+            res["just_woke"], res["slept_minutes"]))
         print(json.dumps(res, ensure_ascii=False))
         return
 
@@ -244,19 +305,21 @@ def main() -> None:
                 "1) launchctl print gui/$(id -u)/{}".format(JOB_LABEL),
                 "2) tail -20 {}".format(MAIN_LOG.name),
                 "3) python3 {} status".format(pathlib.Path(__file__).name),
-                "",
-                "若电脑刚从长时间睡眠中醒来，可忽略本条。",
             ])
             if _notify("⚠️ WorkBuddy 积分脚本可能已停摆", body):
                 for key, _ in announced:
                     st["last_alert"][key] = now
-                _save_self_state(st)
 
+    _save_self_state(st)
     print(json.dumps(res, ensure_ascii=False))
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "status":
-        print(json.dumps(check(time.time()), ensure_ascii=False, indent=2))
+        # 手动排查时用**真实基线**判定，否则 slept_minutes 恒为 None、just_woke 恒为真，
+        # 会把 stale 掩盖掉 —— 那正好违背了 status 的用途。
+        _st = _load_self_state()
+        print(json.dumps(check(time.time(), prev_check=_st.get("last_check")),
+                         ensure_ascii=False, indent=2))
     else:
         main()
