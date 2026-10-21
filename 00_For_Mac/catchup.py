@@ -453,6 +453,31 @@ def _is_net_fail(res: dict) -> bool:
     return bool(res) and res.get("status") == "failed" and res.get("fail_kind") in _NET_KINDS
 
 
+def _hold_awake(seconds: int = 240) -> None:
+    """在被 launchd 带起的维护窗口里争取更多时间（2026-10-21 加）。
+
+    背景：合盖 + 电池过夜时，系统只在 DarkWake 维护窗口里给约 45 秒
+    （sleepservices 的 cap 是 180 秒，实测 07:05 那次只用了 45 秒就回睡）。
+    脚本一旦被带起、但 Wi-Fi / SSL 还没就绪（表现为 SSL UNEXPECTED_EOF），
+    这一轮就白跑，只能等下一个维护窗口。
+
+    `caffeinate -i` 持一个 PreventUserIdleSystemSleep 断言，把「维护窗口到点回睡」
+    往后推（最多 seconds 秒）。注意边界：合盖是硬件级强制睡眠，断言挡不住真正
+    的 Clamshell Sleep，它只对维护唤醒窗口内的回睡计时有效。
+
+    只在闸门打开、确实要发网络请求时调用（不是每次空转 tick 都申请）。
+    """
+    try:
+        subprocess.Popen(
+            ["caffeinate", "-i", "-t", str(seconds)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:  # noqa: BLE001  caffeinate 缺失（非 macOS）时安静跳过
+        pass
+
+
 def _quiet_now(now: datetime.datetime) -> bool:
     """是否处于完全静默时段（00:00 – 07:00）。
 
@@ -633,6 +658,7 @@ def _run() -> None:
         if need_claim:
             parts.append("claim" if claim_open else "probe")
         tag = "+".join(parts)
+        _hold_awake()   # 先锁住维护唤醒窗口，再发网络请求（见函数说明）
         r = run_all(tag)
         c = r.get("checkin") or {}
         t = r.get("travel") or {}
@@ -683,16 +709,25 @@ def _run() -> None:
         elif t.get("arrive_at"):
             state["arrive_at"] = t["arrive_at"]
 
-        # 网络故障降频：本次失败若**全是网络层失败**（且没有成功到账），每天只推一条告警，
-        # 其余只记日志。否则网络故障持续一整天时，每 30 分钟一条会刷屏。
+        # 网络失败 → 完全静默（2026-10-14 改，原为「每天推一条告警」）：
+        # 本次失败若**全是网络层失败**（且没有成功到账），不推送任何通知，只记日志。
+        # 理由：
+        #   1. 网络失败不烧业务配额，系统按 NET_RETRY_GAP_MIN 自动重试到当天结束；
+        #   2. 用户无法介入 —— 不是 token 过期也不是端点变更，通常几十分钟自愈
+        #      （2026-10-14 实测：10:31 全部网络失败含 preflight，11:11 同端点
+        #      一次通过、领到 +5，积分零损失）；
+        #   3. 恢复后必有「到账」成功推送兜底，信息不丢；
+        #   4. 推了反而制造矛盾观感：「补跑失败」（带 preflight 警告 + 自查命令）
+        #      与 40 分钟后的「到账成功」并列，像出了大事，实际什么都没损失。
+        # 端点真变更时业务请求会返回 404/401（业务失败），仍会照常推送，不受本静默影响。
         fails = [r for r in (c, t) if r and r.get("status") == "failed"]
         gains = [r for r in (c, t) if r and r.get("status") in ("success", "already_checked", "claimed")]
         net_only = bool(fails) and not gains and all(_is_net_fail(r) for r in fails)
-        if net_only and state.get("net_fail_warn_day") == today:
-            log("网络失败持续中（今日已告警），跳过重复通知")
+        if net_only:
+            log("网络失败（自动重试中，不推送）: " + "; ".join(
+                "{task}={status}/{kind}".format(task=r.get("task"), status=r.get("status"),
+                                                kind=r.get("fail_kind")) for r in fails))
         else:
-            if net_only:
-                state["net_fail_warn_day"] = today
             _report(c, t, state, pf)
 
     if need_probe:

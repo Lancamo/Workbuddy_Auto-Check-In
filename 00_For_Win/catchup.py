@@ -753,16 +753,25 @@ def _run() -> None:
         elif t.get("arrive_at"):
             state["arrive_at"] = t["arrive_at"]
 
-        # 网络故障降频：本次失败若**全是网络层失败**（且没有成功到账），每天只推一条告警，
-        # 其余只记日志。否则网络故障持续一整天时，每 30 分钟一条会刷屏。
+        # 网络失败 → 完全静默（2026-10-14 改，原为「每天推一条告警」）：
+        # 本次失败若**全是网络层失败**（且没有成功到账），不推送任何通知，只记日志。
+        # 理由：
+        #   1. 网络失败不烧业务配额，系统按 NET_RETRY_GAP_MIN 自动重试到当天结束；
+        #   2. 用户无法介入 —— 不是 token 过期也不是端点变更，通常几十分钟自愈
+        #      （2026-10-14 实测：10:31 全部网络失败含 preflight，11:11 同端点
+        #      一次通过、领到 +5，积分零损失）；
+        #   3. 恢复后必有「到账」成功推送兜底，信息不丢；
+        #   4. 推了反而制造矛盾观感：「补跑失败」（带 preflight 警告 + 自查命令）
+        #      与 40 分钟后的「到账成功」并列，像出了大事，实际什么都没损失。
+        # 端点真变更时业务请求会返回 404/401（业务失败），仍会照常推送，不受本静默影响。
         fails = [r for r in (c, t) if r and r.get("status") == "failed"]
         gains = [r for r in (c, t) if r and r.get("status") in ("success", "already_checked", "claimed")]
         net_only = bool(fails) and not gains and all(_is_net_fail(r) for r in fails)
-        if net_only and state.get("net_fail_warn_day") == today:
-            log("网络失败持续中（今日已告警），跳过重复通知")
+        if net_only:
+            log("网络失败（自动重试中，不推送）: " + "; ".join(
+                "{task}={status}/{kind}".format(task=r.get("task"), status=r.get("status"),
+                                                kind=r.get("fail_kind")) for r in fails))
         else:
-            if net_only:
-                state["net_fail_warn_day"] = today
             _report(c, t, state, pf)
 
     if need_probe:

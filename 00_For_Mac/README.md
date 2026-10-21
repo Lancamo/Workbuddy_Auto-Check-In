@@ -86,7 +86,9 @@ win 版改 `00_For_Win/README.md`；**跨平台的功能改动两份都要改**�
 > - **业务层失败**（401 / 接口错误）：`MIN_RETRY_GAP_MIN = 20` 分钟一次，最多 `MAX_TRIES = 12` 次
 >   （约 4 小时）；耗尽后进入**探测恢复**——低频只读探测，接口一恢复就自动重置预算、重新签。
 > - **网络层失败**（SSL / 连接 / 超时 / 断开）：**不烧 12 次配额**，改用 `NET_RETRY_GAP_MIN = 30`
->   分钟一次的低频重试，一直试到当天结束；网络故障告警每天只推一条，不刷屏。
+>   分钟一次的低频重试，一直试到当天结束；纯网络失败**完全不推送**（2026-10-14 改，
+>   原为每天推一条告警）——它自愈、自动重试、用户无法介入，恢复后有「到账」推送兜底；
+>   推了只会造成「失败」与几十分钟后「到账」并列的矛盾观感（当天实测）。
 
 **静默（2026-09-19 新增）**
 
@@ -978,6 +980,25 @@ sudo bash daily_wake.sh test 3         # 设一个 3 分钟后的一次性唤醒
 > （同类坑：`$LABEL）` 这种「变量紧跟全角字符」在 macOS 自带的 bash 3.2 下会被解析成
 > 变量名 `LABEL）`，直接报 unbound variable —— 所有输出文案里的变量都已写成 `${...}`。）
 
+**2026-10-21 补记：合盖 + 电池过夜时，定时唤醒也会失效**
+
+那天 07:05 的 `pmset repeat wake` **确实唤醒了机器**（日志里有
+`DarkWake from Deep Idle ... due to rtc/`），但三个事实决定了它签不上：
+
+1. 窗口只有 **45 秒**（sleepservices 的 `cap time=180 secs` 只是上限）；
+2. 是 **DarkWake**，用户会话没有恢复；
+3. 更关键的是那 45 秒里 Wi-Fi 还没就绪 —— 脚本即使被带起，
+   拿到的也是 `SSL UNEXPECTED_EOF`（当天 09:35 那次就是这么失败的）。
+
+**macOS 没有「唤醒时长」这个参数**：`pmset repeat` 只接受时刻与类型
+（sleep / wake / poweron / shutdown / wakeorpoweron），能跑多久由 powerd 决定。
+所以项目从脚本侧解决：闸门打开、真要发网络请求之前，先起一个
+`caffeinate -i -t 240` 子进程持 `PreventUserIdleSystemSleep` 断言，
+把「维护窗口到点回睡」往后推，给网络就绪和签到留出时间（`_hold_awake()`）。
+
+**别高估它**：合盖是硬件级强制睡眠，断言挡不住真正的 Clamshell Sleep，
+它只对「维护唤醒窗口内的回睡计时」有效。要真正稳，还是睡前插电源。
+
 **代价与边界（如实说明）**：
 
 - 每天多一次唤醒 → 电池下有微量耗电；唤醒本身只持续到系统空闲计时结束。
@@ -994,6 +1015,7 @@ sudo bash daily_wake.sh test 3
 # 合盖等 3 分钟以上，开盖后立刻看：
 pmset -g log | grep -E 'Wake |DarkWake' | tail -10   # 这次唤醒持续了几秒
 tail -5 runtime/logs/catchup.log                     # 主脚本有没有被拉起来
+pmset -g assertions | grep -i caffeinate             # 脚本有没有抢到防睡断言
 ```
 
 ## 验证
