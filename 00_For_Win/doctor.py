@@ -352,7 +352,7 @@ def _same_file(a: str | pathlib.Path, b: str | pathlib.Path) -> bool:
 
 def check_task(r: Report) -> None:
     if not winenv.IS_WIN:
-        r.skip("计划任务", "非 Windows 环境（本文件在 mac 上跑只用于审阅）")
+        r.skip("计划任务", "非 Windows 环境（本项目只支持 Windows）")
         return
     try:
         import install

@@ -22,8 +22,8 @@ api_discovery.py — WorkBuddy 积分助手 · 接口前置校验（Pre-flight�
 
   ⚠️ Windows 版差异：具体路径的探测（安装目录候选、版本号来源）全部交给 `winenv.py`。
      Windows 上没有 Info.plist，版本号改为**直接解析 asar 头部的 package.json**
-     （macOS 真机已用 298MB 的 asar 交叉验证，结果与 Info.plist 一致）。
-     本文件除 `client_fingerprint()` 与 `_scan_asar` 的取路径方式外，与 macOS 版一致。
+     （已用 298MB 的真实 asar 验证，结果与客户端显示的版本一致）。
+     `client_fingerprint()` 与 `_scan_asar` 的取路径方式都走 `winenv`。
 
 【切换机制】客户端源码原文（`packages/workbuddy-core` … `CloudAccountRepo`）：
      /**
@@ -62,7 +62,7 @@ api_discovery.py — WorkBuddy 积分助手 · 接口前置校验（Pre-flight�
   - preflight()           探活 + 退化检测 + 变更检测，返回结构化报告
   - 变更历史写进 api_endpoints.json，用于事后回答"到底多久换一次"
 
-降级策略：读不到客户端（未安装 / 非 macOS / 权限不足）时退回内置候选，
+降级策略：读不到客户端（未安装 / 权限不足）时退回内置候选，
 标记 source="fallback"，**不阻断主流程**（宁可照旧跑，也不能因校验失败而不签到）。
 
 安全：只读本机文件；探活请求不发任何新东西、不改变服务端状态；不触碰领取接口
@@ -124,7 +124,7 @@ def client_fingerprint() -> dict:
     因为这正是"接口可能换了"的时刻。
 
     ★ Windows 版：路径与版本的探测全部交给 `winenv.detect_client()`，
-      本函数只做结构转换，与 macOS 版语义完全一致。
+      本函数只做结构转换，不涉及平台差异。
     """
     c = winenv.detect_client()
     return {

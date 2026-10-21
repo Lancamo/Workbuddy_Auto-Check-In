@@ -30,15 +30,12 @@ credentials / http_client / main），**不依赖任何技能、不依赖任何�
 运行时文件（state.json / catchup.log / logs/stdio.log）写在脚本所在目录。
 通知：成功 / 失败 / 无活动 一律经 notify.py 推送（默认走 ClawBot 微信直推 —— 复用
 WorkBuddy 已绑定的凭据，零配置、免实名；不可用时按 pushplus → Server酱 顺序降级，
-全不可用则降级**本机桌面通知**（Windows Toast / macOS 通知中心）；
+全不可用则降级**本机桌面通知**（Windows 弹窗 / Toast）；
 凭据见 notify_config.json）；并向 stdout 输出一行 JSON 摘要。
 
-★ 与 macOS 版的差异（**只在下列标记处**，其余代码逐字一致，便于两套同步）
-  1. 解释器的取法（两侧都不再硬编码，2026-09-18 起一致）：
-     mac 版用 `sys.executable`；Windows 版用 `winenv.default_python()`
-     （同一语义，另做 python.exe ↔ pythonw.exe 的切换）。
-     所以**整个文件夹拷到任何机器都能直接跑，不需要改任何常量**。
-     （2026-09-18 之前 mac 版把一台机器专属的绝对路径写死在脚本顶部，换机即失效。）
+★ 本文件里几处「Windows 特有」的处理（其余为纯业务逻辑）
+  1. 解释器用 `winenv.default_python()`（另做 python.exe ↔ pythonw.exe 的切换）——
+     整个文件夹拷到任何机器都能直接跑，不需要改任何常量。
   2. 启动即调 `winenv.setup_stdio()`：把输出调成 UTF-8，并在「无控制台」时
      （计划任务 + pythonw.exe）把 stdout/stderr 落到 `logs/stdio.log`，避免
      中文乱码 / `sys.stdout is None` 崩溃 / 无输出无法排障。
@@ -82,6 +79,31 @@ MAX_TRIES = 12      # 单事项最多真实尝试次数（业务层失败：401 
 MIN_RETRY_GAP_MIN = 20   # 两次真实尝试之间的最小间隔（分钟）
 NET_RETRY_GAP_MIN = 30   # 网络层失败的重试间隔（分钟）—— 网络失败不烧配额，低频重试到当天结束
 PROBE_GAP_MIN = 30       # 业务预算耗尽后的只读探测间隔（分钟）—— 探测恢复
+
+# ── 本地环境未就绪（2026-10-19 加）────────────────────────────────────────
+# Windows 侧 accessToken 要靠**扫 WorkBuddy 进程内存**取 at-rest 密钥才能解开，
+# 客户端没运行就一定解不出来。而计划任务的「唤醒后触发」总比 Electron 客户端
+# 先起来几十秒 —— 2026-10-19 实测：任务 11:27:21 触发，客户端 11:28:21 才启动，
+# 差 60 秒，于是报了一次「登录态读取失败」并弹窗，20 分钟后退避期满又自己好了。
+#
+# 这跟「401 / 接口报错」性质完全不同：它并没有真的去请求，也不烧服务端配额，
+# 只是**开机竞态**。所以单独归类为 local：
+#   · 不计入 MAX_TRIES（否则一天几次唤醒就能把 12 次预算耗光）
+#   · 用 LOCAL_RETRY_GAP_MIN 短间隔重试（客户端就绪后下一个 tick 即可成功）
+#   · 前 LOCAL_ALERT_AFTER-1 次完全静默，第 LOCAL_ALERT_AFTER 次才告警一次
+#     （防「用户真的登出了 / 登录态文件没了」被永久静默）
+LOCAL_RETRY_GAP_MIN = 5   # local 失败（未达告警阈值）的重试间隔（分钟）
+LOCAL_ALERT_AFTER = 3     # 连续第 N 次仍失败才告警（≈ 10–15 分钟）
+LOCAL_REALERT_EVERY = 12  # 越过阈值后每 N 次再提醒一次（20 分钟 × 12 ≈ 4 小时）
+# ★ 2026-10-21：同类别失败的**全局**告警节流（对所有 fail_kind 生效）。
+#   以前只有 local / net 有降噪，biz 失败是「每次失败都报一条」——而重试间隔
+#   20 分钟，一天最多 12 次预算，就是 12 条通知。10-20 连发 12 条、10-21 连发
+#   11 条（外加 8 条补弹），用户直接被打到关掉通知。这才是真正的「通知方案」
+#   缺陷：降噪只覆盖了两类失败，漏掉了最常见的那一类。
+FAIL_ALERT_EVERY_MIN = 180   # 同类别失败最多每 3 小时提醒一次（首次仍立即报）
+                          # 为什么需要：若用户真的登出了，local 会一直失败且不消耗
+                          # MAX_TRIES（没有上限）。只报一次会永久静默，每 tick 都报
+                          # 又会一天几十条 —— 折成「一次 + 每 4 小时一次」。
 LOCK_STALE_SEC = 600     # 超过 10 分钟未释放的锁视为残留（正常一次运行只需几秒）
 
 # 为什么需要 MIN_RETRY_GAP_MIN：触发频率从 30 分钟提到 5 分钟后，若不加间隔，
@@ -222,6 +244,12 @@ def _hint_for(reasons: list[str]) -> str:
         return ("像是接口变了，脚本已尝试自动跟随。自查方式：{}；"
                 "若仍失败，多半需要等客户端升级。".format(winenv.selfcheck_hint()))
     if any(k in low for k in _AUTH_HINTS):
+        # ★ 开机竞态专属提示（2026-10-19）：Windows 侧令牌靠扫客户端进程内存才能解，
+        #   客户端没起来就一定失败。这句话比「刷新登录态」更贴近真实原因。
+        if "未能解出密钥" in low or "**正在运行**" in low or "正在运行" in low:
+            return ("像是 WorkBuddy 客户端还没启动完 —— 开机/唤醒后脚本会比客户端早跑"
+                    "几十秒，读不到加密的登录态。脚本会每 5 分钟自动重试，"
+                    "客户端起来后即可成功；若持续失败，请确认客户端已打开并处于登录状态。")
         return "打开一次 WorkBuddy 桌面端即可刷新登录态，之后脚本会自动重试。"
     if any(k in low for k in _NET_HINTS):
         return ("像是网络问题，脚本会在 20 分钟后自动重试。若持续失败，"
@@ -251,6 +279,21 @@ def _act(c: dict) -> str:
     return "（{}）".format(name) if name else ""
 
 
+# ★ 2026-10-21：local 失败在通知里只说人话。
+#   原始 reason 是给 doctor 看的（含 C:\Users\...\workbuddy-desktop.info 这种路径
+#   和 WORKBUDDY_ATREST_KEY 这种环境变量名），塞进通知卡片会变成两屏技术细节。
+#   用户第一眼需要的是「客户端没开」，不是「哪条路径读不到」。
+_LOCAL_REASON_SHORT = "读不到登录态：WorkBuddy 客户端没有在运行"
+
+
+def _short_reason(res: dict) -> str:
+    """通知里展示的失败原因（短版）。详细原因仍在日志与 doctor 里。"""
+    raw = str(res.get("reason") or "未知原因")
+    if res.get("fail_kind") == "local":
+        return _LOCAL_REASON_SHORT
+    return raw if len(raw) <= 160 else raw[:160] + "…"
+
+
 def _fmt_checkin(c: dict, done: bool = False) -> str:
     st = c.get("status")
     # done：state 里已记为完成，本次 failed 只是整批调用被网络故障拖挂，不代表没领到
@@ -266,7 +309,7 @@ def _fmt_checkin(c: dict, done: bool = False) -> str:
     if st == "suspect":
         return "签到：⚠️ 接口返回的数据全为零，无法确认活动状态"
     if st == "failed":
-        return "签到：失败 —— {}".format(c.get("reason") or "未知原因")
+        return "签到：失败 —— {}".format(_short_reason(c))
     return "签到：未执行"
 
 
@@ -285,8 +328,32 @@ def _fmt_travel(t: dict, done: bool = False) -> str:
     if st == "daily_limit_reached":
         return "旅行：今日已达上限（已领过）"
     if st == "failed":
-        return "旅行：失败 —— {}".format(t.get("reason") or "未知原因")
+        return "旅行：失败 —— {}".format(_short_reason(t))
     return "旅行：未执行"
+
+
+def _fail_signature(failed: list, c: dict, t: dict) -> str:
+    """同类失败的稳定标识：失败事项 + 失败类别。
+
+    **刻意不含时间**：指纹若带时间戳，每次失败都是「不同内容」，去重永远不命中
+    —— 这正是 10-20/10-21 连发 11–12 条的直接机制。用「事项 + 类别」做键，
+    同一类故障在时间窗内就只报一次，恢复后键自然消失。
+    """
+    kinds = sorted({str(v.get("fail_kind") or "biz")
+                    for v in (c, t)
+                    if isinstance(v, dict) and v.get("status") == "failed"})
+    return "{}|{}".format("+".join(failed), "+".join(kinds) or "biz")
+
+
+def _fail_alert_due(state: dict, sig: str, now_ts: float):
+    """这类失败现在该不该真发通知。返回 (是否发, 距上次的分钟数)。"""
+    if state.get("fail_alert_key") != sig:
+        return True, 0
+    last = float(state.get("fail_alert_ts") or 0)
+    if last <= 0:
+        return True, 0
+    gap = (now_ts - last) / 60.0
+    return gap >= FAIL_ALERT_EVERY_MIN, int(gap)
 
 
 def _report(c: dict, t: dict, state: dict, pf: dict | None = None) -> None:
@@ -299,6 +366,15 @@ def _report(c: dict, t: dict, state: dict, pf: dict | None = None) -> None:
     失败类仍合并成一条 —— 一次故障不该刷两条，而且失败信息要放在一起才看得懂。
     """
     pf = pf or {}
+    # 只要本轮有「确实好起来了」的迹象，就把失败节流的窗口清零 ——
+    # 否则修复后再次出问题，会被上一轮的 3 小时窗口误伤成「静默」。
+    if (c.get("status") in ("success", "already_checked")
+            or t.get("status") in ("claimed", "daily_limit_reached")):
+        if state.get("fail_alert_key"):
+            log("故障已恢复（fail_alert_key={}），重置告警节流".format(
+                state.get("fail_alert_key")))
+        state["fail_alert_key"] = None
+        state["fail_alert_ts"] = 0
     checkin_gain = c.get("status") == "success" and c.get("credit") is not None
     travel_gain = t.get("status") == "claimed" and t.get("reward_credit") is not None
 
@@ -348,13 +424,29 @@ def _report(c: dict, t: dict, state: dict, pf: dict | None = None) -> None:
             ]),
             "success")
 
-    content = "\n".join([
-        _fmt_checkin(c, done_map["签到"]),
-        _fmt_travel(t, done_map["旅行"]),
-        "",
-        "时间：{}".format(stamp),
-        progress,
-    ])
+    # ★ 2026-10-21：签到与旅行「同因失败」时合并成一行。
+    #   两者都要读同一份登录态，读不到就一起失败、reason 逐字相同。原来会把
+    #   同一段 300 字技术细节连印两遍（10-21 的通知卡片就是两屏几乎一样的文字），
+    #   用户读完还不知道该干什么。合并后一行说清「两件事都没做，原因是一个」。
+    c_reason, t_reason = str(c.get("reason") or ""), str(t.get("reason") or "")
+    same_root = (c.get("status") == "failed" and t.get("status") == "failed"
+                 and c_reason and c_reason == t_reason
+                 and not done_map["签到"] and not done_map["旅行"])
+    if same_root:
+        content = "\n".join([
+            "签到 / 旅行：都未执行 —— {}".format(_short_reason(c)),
+            "",
+            "时间：{}".format(stamp),
+            progress,
+        ])
+    else:
+        content = "\n".join([
+            _fmt_checkin(c, done_map["签到"]),
+            _fmt_travel(t, done_map["旅行"]),
+            "",
+            "时间：{}".format(stamp),
+            progress,
+        ])
     if ep_changed:
         old = ((pf.get("changed_from") or {}).get("status_paths") or [])[:2]
         content += "\n\n🔄 接口已切换（客户端 {}）：\n  旧：{}\n  新：{}".format(
@@ -362,12 +454,36 @@ def _report(c: dict, t: dict, state: dict, pf: dict | None = None) -> None:
             pf.get("resolved_status") or pf.get("preferred_status") or "?")
 
     if failed or suspect or pf_bad:
+        # ★ 2026-10-21：失败告警节流（兜底闸，对所有 fail_kind 生效）。
+        #   上游的 _local_quiet / net_only 只覆盖 local 与 net；biz 失败以前是
+        #   「每次失败一条」，20 分钟一跳、12 次预算 = 12 条。
+        #   这里按「事项 + 类别」做稳定键，同一类故障 FAIL_ALERT_EVERY_MIN 内只报
+        #   一次，首次仍立刻报（这样既不漏消息，也不会把通知栏刷满）。
+        #   suspect / pf_bad 不节流：它们是接口层故障，出现频率极低，且必须马上处置。
+        if failed and not suspect and not pf_bad:
+            sig = _fail_signature(failed, c, t)
+            due, gap = _fail_alert_due(state, sig, time.time())
+            if not due:
+                log("失败告警节流：同类别（{}）{} 分钟前已报过，本次只记日志"
+                    "（窗口 {} 分钟）".format(sig, gap, FAIL_ALERT_EVERY_MIN))
+                return
+            state["fail_alert_key"] = sig
+            state["fail_alert_ts"] = time.time()
         if drift and failed:
             # 漂移优先于「失败」：这类故障的处置是「核对端点」，
             # 不是「等重试」也不是「去刷登录态」，标题必须先把性质说清楚。
             title = "WorkBuddy 积分：接口疑似已变更（" + "、".join(failed) + "）"
         elif failed:
-            title = "WorkBuddy 积分补跑失败：" + "、".join(failed)
+            # ★ 2026-10-21：标题先说人话。全是 local 失败（客户端没开）时，
+            #   用「没签到」比「补跑失败」更能让人判断要不要管 —— 后者听起来
+            #   像脚本坏了，实际只是客户端还没启动、脚本会自己重试。
+            local_only = all(
+                str(v.get("fail_kind") or "") == "local"
+                for v in (c, t) if v.get("status") == "failed")
+            if local_only:
+                title = "WorkBuddy 客户端没开，今天还没签到"
+            else:
+                title = "WorkBuddy 积分补跑失败：" + "、".join(failed)
         else:
             title = "WorkBuddy 积分：接口可能已变更，需要处理"
         extra = "\n\n处理建议：" + _hint_for(
@@ -487,6 +603,8 @@ def _due(state: dict, key: str, now_ts: float, gap_min: int) -> bool:
 
 
 _NET_KINDS = ("net",)
+_LOCAL_KINDS = ("local",)
+_LOCAL_FAILS_KEY = {"checkin": "checkin_local_fails", "travel": "claim_local_fails"}
 
 
 def _is_net_fail(res: dict) -> bool:
@@ -498,6 +616,56 @@ def _is_net_fail(res: dict) -> bool:
     不再靠关键词匹配 reason 字符串。
     """
     return bool(res) and res.get("status") == "failed" and res.get("fail_kind") in _NET_KINDS
+
+
+def _is_local_fail(res: dict) -> bool:
+    """判断一次失败是否属于「本地环境未就绪」（客户端没起来 / 没登录）。
+
+    这类失败在**发出任何网络请求之前**就返回了（credentials 读不到 at-rest 密钥），
+    因此不烧服务端配额，也不该占用 MAX_TRIES 的正式尝试预算。
+    checkin.py / travel.py 把它标成 fail_kind="local"。
+    """
+    return bool(res) and res.get("status") == "failed" and res.get("fail_kind") in _LOCAL_KINDS
+
+
+def _local_fails_key(res: dict) -> str:
+    """本次失败对应哪个计数器（签到 / 旅行各一个）。"""
+    return _LOCAL_FAILS_KEY.get(str(res.get("task") or ""), "checkin_local_fails")
+
+
+def _local_quiet(res: dict, state: dict) -> bool:
+    """这次 local 失败是否还在静默期（不告警，只静默重试）。
+
+    节奏：第 1–2 次静默（绝大多数开机竞态在客户端起来后一两次内就恢复了），
+          第 3 次告警一次（≈ 10 分钟还没好，多半不是竞态），
+          之后每 LOCAL_REALERT_EVERY 次再提醒一次（约 4 小时）。
+    为什么不能「越过阈值后每次都报」：local 失败不消耗 MAX_TRIES，会一直重试到
+    当天结束；每 20 分钟一条会变成一天几十条，比原来的误报还糟。
+    """
+    if not _is_local_fail(res):
+        return False
+    n = int(state.get(_local_fails_key(res)) or 0)
+    if n < LOCAL_ALERT_AFTER:
+        return True
+    return (n - LOCAL_ALERT_AFTER) % LOCAL_REALERT_EVERY != 0
+
+
+def _gap_for(state: dict, kind_key: str, fails_key: str) -> int:
+    """按上次失败类型决定重试间隔（分钟）。
+
+    net   → 30 分钟（不烧配额，低频重试到当天结束）
+    local → 未达阈值 5 分钟（抢客户端启动那几十秒）；已告警退回 20 分钟
+            （避免一整天每 5 分钟扫一次进程内存）
+    其它  → 20 分钟（业务失败，保护配额）
+    """
+    kind = state.get(kind_key)
+    if kind == "net":
+        return NET_RETRY_GAP_MIN
+    if kind == "local":
+        if int(state.get(fails_key) or 0) < LOCAL_ALERT_AFTER:
+            return LOCAL_RETRY_GAP_MIN
+        return MIN_RETRY_GAP_MIN
+    return MIN_RETRY_GAP_MIN
 
 
 def _quiet_now(now: datetime.datetime) -> bool:
@@ -543,7 +711,7 @@ def _reshow_pending_notifications() -> None:
     代价极小：正常情况下队列文件不存在，只多做一次文件存在性检查。
     """
     if winenv.platform() != "win":
-        return            # 这一层是 Windows 的显示行为兜底，mac 版没有对应问题
+        return            # 非 Windows 上不做这层兜底（本项目只跑 Windows）
     try:
         res = winenv.reshow_pending(paths.LOG_DIR)
     except Exception as e:  # noqa: BLE001
@@ -635,8 +803,10 @@ def _run() -> None:
         carry_streak = int(state.get("no_activity_streak") or 0)
         state = {"day": today, "checkin_done": False, "checkin_tries": 0,
                  "checkin_last_try": 0, "checkin_last_kind": "biz",
+                 "checkin_local_fails": 0,
                  "claim_done": False, "claim_tries": 0,
                  "claim_last_try": 0, "claim_last_kind": "biz",
+                 "claim_local_fails": 0,
                  "probe_last_try": 0,
                  "arrive_at": None,
                  "no_activity_streak": carry_streak}
@@ -665,9 +835,10 @@ def _run() -> None:
                 ]),
                 "failure")
 
-    # 上次失败类型决定重试间隔：网络失败用更长间隔（不烧配额），业务失败用原间隔。
-    checkin_gap = NET_RETRY_GAP_MIN if state.get("checkin_last_kind") == "net" else MIN_RETRY_GAP_MIN
-    claim_gap = NET_RETRY_GAP_MIN if state.get("claim_last_kind") == "net" else MIN_RETRY_GAP_MIN
+    # 上次失败类型决定重试间隔：网络失败用更长间隔（不烧配额），本地环境未就绪
+    # 用更短间隔（客户端一启动就能成功），业务失败用原间隔。
+    checkin_gap = _gap_for(state, "checkin_last_kind", "checkin_local_fails")
+    claim_gap = _gap_for(state, "claim_last_kind", "claim_local_fails")
 
     checkin_budget_exhausted = int(state.get("checkin_tries") or 0) >= MAX_TRIES
     claim_budget_exhausted = int(state.get("claim_tries") or 0) >= MAX_TRIES
@@ -721,13 +892,20 @@ def _run() -> None:
             if c.get("status") in ("success", "already_checked", "no_activity", "suspect"):
                 state["checkin_done"] = True
                 state["checkin_last_kind"] = "biz"
+                state["checkin_local_fails"] = 0
             elif _is_net_fail(c):
                 # 网络层失败：不烧配额（tries 不动），只记失败类型 → 下次用更长间隔重试
                 state["checkin_last_kind"] = "net"
+            elif _is_local_fail(c):
+                # 本地环境未就绪（客户端没起来 / 没登录）：请求根本没发出去 → 不烧配额。
+                # 记次数供「前两次静默、第三次告警」用；间隔走 LOCAL_RETRY_GAP_MIN。
+                state["checkin_local_fails"] = int(state.get("checkin_local_fails") or 0) + 1
+                state["checkin_last_kind"] = "local"
             else:
                 # 业务层失败：烧配额
                 state["checkin_tries"] += 1
                 state["checkin_last_kind"] = "biz"
+                state["checkin_local_fails"] = 0
             # 跨日累计「拿不到活动数据」的天数：连续多日即为接口/活动判定异常的信号
             if c.get("status") in ("no_activity", "suspect"):
                 state["no_activity_streak"] = int(state.get("no_activity_streak") or 0) + 1
@@ -738,11 +916,16 @@ def _run() -> None:
             if t.get("status") in ("claimed", "daily_limit_reached"):
                 state["claim_done"] = True
                 state["claim_last_kind"] = "biz"
+                state["claim_local_fails"] = 0
             elif _is_net_fail(t):
                 state["claim_last_kind"] = "net"
+            elif _is_local_fail(t):
+                state["claim_local_fails"] = int(state.get("claim_local_fails") or 0) + 1
+                state["claim_last_kind"] = "local"
             else:
                 state["claim_tries"] += 1
                 state["claim_last_kind"] = "biz"
+                state["claim_local_fails"] = 0
 
         # 记录 / 清除猫的到达时间（「到达即领」的判据来源）：
         #   领到手 → 清掉，不留过期时间戳；
@@ -767,7 +950,12 @@ def _run() -> None:
         fails = [r for r in (c, t) if r and r.get("status") == "failed"]
         gains = [r for r in (c, t) if r and r.get("status") in ("success", "already_checked", "claimed")]
         net_only = bool(fails) and not gains and all(_is_net_fail(r) for r in fails)
-        if net_only:
+        # 本地环境未就绪（开机时客户端还没起来）：请求都没发出去，属竞态不是故障。
+        # 前两次只写日志，第 LOCAL_ALERT_AFTER 次才告警 —— 判据见 _local_quiet。
+        local_quiet = bool(fails) and not gains and all(_local_quiet(r, state) for r in fails)
+        if local_quiet:
+            log("本地环境未就绪（客户端可能尚未启动），静默重试，不发通知")
+        elif net_only:
             log("网络失败（自动重试中，不推送）: " + "; ".join(
                 "{task}={status}/{kind}".format(task=r.get("task"), status=r.get("status"),
                                                 kind=r.get("fail_kind")) for r in fails))
@@ -786,11 +974,13 @@ def _run() -> None:
             state["checkin_tries"] = 0
             state["checkin_last_try"] = 0
             state["checkin_last_kind"] = "biz"
+            state["checkin_local_fails"] = 0
             log("probe: 签到状态已恢复，重置重试预算")
         if claim_budget_exhausted and not state["claim_done"] and ts.get("status") == "ok":
             state["claim_tries"] = 0
             state["claim_last_try"] = 0
             state["claim_last_kind"] = "biz"
+            state["claim_local_fails"] = 0
             log("probe: 旅行状态已恢复，重置重试预算")
 
     if (not need_checkin and not need_claim and not need_probe) and disc.get("changed"):

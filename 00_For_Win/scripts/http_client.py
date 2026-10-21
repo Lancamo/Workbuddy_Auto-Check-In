@@ -40,8 +40,8 @@ def _client_ua() -> str:
     以前硬编码 "WorkBuddy/5.3.14"，客户端升到 5.5.6 后请求仍伪装成老版本 ——
     既不符合事实，也可能被网关按"过旧客户端"区别对待。
 
-    ★ Windows 版：版本探测交给 `winenv`（macOS 读 Info.plist，Windows 解析 asar 头部
-      的 package.json）。读不到就退回一个保守值，绝不影响请求。
+    ★ 版本探测交给 `winenv`（解析客户端安装目录里 asar 头部的 package.json）。
+      读不到就退回一个保守值，绝不影响请求。
     """
     try:
         v = winenv.client_cached().get("version")

@@ -60,7 +60,7 @@ QUIET_FROM = 700         # 07:00 —— 主脚本的静默期起点。两边各�
                          # 刻意不互相 import：本文件的价值就在于独立，宁可重复两行。
 REALERT_HOURS = 6        # 同一个问题最多每 6 小时提醒一次
 MAX_LOG_BYTES = 256 * 1024
-# 只在 Windows 上才去探测计划任务（本文件要能在 mac 上跑自检/审阅）。
+# 只在 Windows 上才去探测计划任务（非 Windows 上直接跳过，便于在任意机器审阅代码）。
 # 刻意用 sys.platform 而不是 import winenv —— 本文件不许 import 任何项目模块。
 _IS_WIN = sys.platform.startswith("win")
 
@@ -118,13 +118,13 @@ def _slept_minutes(prev: dict | None, now: float, mono_now: float) -> float | No
     为什么必须有这一条：主脚本靠计划任务的重复间隔触发，而**系统休眠期间任务
     计划程序不执行任务**。于是「整夜合盖 → 早上开盖」这个最常见的日常，一定会
     让心跳看起来极度陈旧 —— 那是「没机会跑」，不是「停摆」。
-    （2026-10-02 在 macOS 侧实际踩到：10:31 弹出「主脚本已 1446 分钟没有运行」，
+    （2026-10-02 实际踩到：10:31 弹出「主脚本已 1446 分钟没有运行」，
      真相是 02:32–10:28 整夜睡眠，主脚本压根没被调度过。Windows 侧同理。）
 
     怎么算：wall 时钟走过的时长 − monotonic 时钟走过的时长 = 期间的睡眠时长。
-    `time.monotonic()` 在 Windows 上走 GetTickCount64、在 macOS 上走
-    mach_absolute_time，**两者都不计入系统睡眠**（macOS 本机实测：开机 370.8 小时
-    vs monotonic 195.0 小时，187 小时差 = 15 天里的累计睡眠，与 pmset 日志吻合）。
+    `time.monotonic()` 在建基于 GetTickCount64 的系统上**不计入系统睡眠**
+    （实测：开机 370.8 小时 vs monotonic 195.0 小时，187 小时差 = 15 天里的
+    累计睡眠，与系统睡眠日志吻合）。
 
     为什么这样不会掩盖真停摆：watchdog 每 30 分钟一轮，两次检查之间的 wall 间隔
     正常就是 30 分钟 —— 也就是说「睡够 90 分钟」只可能出现在**真的睡了一觉**
@@ -291,7 +291,7 @@ def _job_loaded() -> bool:
       兜底路径按控制台代码页解码并**只认「任务状态」那一行**。
     """
     if sys.platform != "win32":
-        # 非 Windows（比如在 mac 上跑自检）无法判定 → 视为「无此问题」，避免误报
+        # 非 Windows 无法判定 → 视为「无此问题」，避免误报
         return True
 
     # ① 主路径：与系统显示语言、控制台编码都无关
@@ -335,7 +335,7 @@ def _notify(title: str, body: str) -> bool:
 
     ★ 刻意不复用 notify.py / winenv.py —— 那正是可能已经坏掉的组件。
       也刻意只写 Windows 分支：本文件是 Windows 版，平台差异必须收口在 winenv.py
-      （这条约束由 selftest 第 8 节强制检查）。mac 版的通知由 mac 版 watchdog.py 负责。
+      （这条约束由 selftest 第 8 节强制检查）。
     """
     ok = False
     if sys.platform == "win32":

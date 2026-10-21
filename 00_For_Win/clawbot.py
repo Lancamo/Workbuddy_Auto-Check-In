@@ -10,7 +10,7 @@ clawbot.py — 腾讯 iLink / 微信 ClawBot 直推模块（零第三方依赖�
   `<WorkBuddy 数据目录>/settings.json` → `claw.users.<uid>.channels.weixinClawBot`。
 
   ★ Windows 差异：具体路径由 `winenv.settings_candidates()` 给出候选并逐个探测
-    （macOS 实测命中 `~/.workbuddy/settings.json`；Windows 上同一套 Electron 代码
+    （Electron 桌面端通常写在 `~/.workbuddy/settings.json`；Windows 上是同一套 Electron
     大概率同样写在家目录，但也可能落到 `%APPDATA%`，故一并列出）。
     想指定路径：在 `win_paths.json` 里填 `workbuddy_settings` 绝对路径。
 
@@ -46,7 +46,7 @@ context_token：
   主动推送必须携带「从入站消息捕获」的 context_token。
   获取方式：让用户在微信里给 ClawBot 发一条消息，本模块 `wait` 长轮询捕获并持久化。
   ⚠️ 2026-09-29 更正：**令牌本身不会过期，别再当它是短命物**。
-     macOS 侧实测：同一枚 09-25 09:45 捕获的令牌，在 09-27 与 09-29 两次都发送成功，
+     实测：同一枚 09-25 09:45 捕获的令牌，在 09-27 与 09-29 两次都发送成功，
      中间隔着整段 `prepare failed`。它是**耐用的会话句柄**。
      真正决定「这条主动消息能不能进微信」的是服务端那个
      「用户最近是否给机器人发过消息」的**会话窗口** —— 窗口关了就 prepare failed，
@@ -544,7 +544,7 @@ def send_text(text: str, *, timeout: int = 20, use_context: bool = True) -> tupl
         if _is_session_expired(data):
             clear_cursor()
             # 记录失效时刻：notify.py 据此发一条明确的「通道已失效」本地告警
-            # （否则 -14 只会表现为"积分通知降级成 macOS 通知"，用户察觉不到通道挂了）。
+            # （否则 -14 只会表现为"积分通知降级成本机通知"，用户察觉不到通道挂了）。
             stx = _load_state()
             stx["last_session_expired_ts"] = time.time()
             _save_state(stx)
@@ -561,7 +561,7 @@ def send_text(text: str, *, timeout: int = 20, use_context: bool = True) -> tupl
     # 现在把两件事分开：
     #   「受理」= 无错误码（服务端收下了请求）
     #   「送达」= 受理 + 持有 context_token
-    # 缺令牌时返回 False，让 notify.py 降级到 macOS 通知并提示用户做恢复动作，
+    # 缺令牌时返回 False，让 notify.py 降级到本机通知并提示用户做恢复动作，
     # 而不是静默地假装成功。
     mid = data.get("message_id") if data else None
     st = _load_state()
@@ -676,7 +676,7 @@ def capture_inbound_once(*, timeout: int = 5) -> bool:
       · 本函数是**周期任务用**的轻量探针，问一次就返回 —— 有消息立即返回，
         没有则最多等 `timeout` 秒。可安全地放进每 5 分钟一次的 catchup。
 
-    ★ 2026-09-29 为什么必须新增（与 macOS 侧同步修的真实缺口）：
+    ★ 2026-09-29 为什么必须新增（修的是一个真实缺口）：
       此前全项目只有 `capture_context_token` 会调用 `remember_context_token`，它又只在
       `notify._recover_while_cooling` / `_recapture_and_resend` 里被调用；
       而**补发路径 `flush_pending` 从来不轮询**。于是用户按告警提示在微信里发了消息，
@@ -685,7 +685,7 @@ def capture_inbound_once(*, timeout: int = 5) -> bool:
 
     ★ 它真正的作用是**检测"窗口重开"**，而不是"必须换一枚新令牌"（2026-09-29 实测修正）：
       能否主动推送，取决于服务端那个「用户最近是否给机器人发过消息」的会话窗口，
-      **不是** context_token 本身。macOS 侧实测：同一枚 09-25 捕获的令牌，
+      **不是** context_token 本身。实测：同一枚 09-25 捕获的令牌，
       在 09-27 与 09-29 两次发送成功，中间隔着整段 `prepare failed`。
       所以只要发现"有入站消息"，就足以判定窗口已重开、可以立刻重试；
       顺带存下一枚（可能更新的）令牌是无害的附赠，但**不要**把它写成病因。

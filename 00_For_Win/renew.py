@@ -44,9 +44,8 @@ v2 改为**只读桌面端的轮询游标文件**，零网络请求：
 而该会话在同一时期之后再未成功通信，最终于 2026-09-16 确认 -14 失效 —— 游标停滞
 正是会话失活的前兆信号。
 
-★ 与 macOS 版的差异：
-  1. **游标目录不再硬编码** —— mac 版写死 `~/.workbuddy/claw-state/weixin`；
-     Windows 版改为遍历 `winenv.claw_state_dirs()` 的候选目录，
+★ Windows 上的适配（其余为纯业务逻辑）：
+  1. **游标目录不硬编码** —— 遍历 `winenv.claw_state_dirs()` 的候选目录，
      命中哪个用哪个，并把「找过哪些路径」写进 status 输出，便于排障。
   2. 失效提示里的命令按平台生成（用**当前解释器的绝对路径**，不写死，见 `winenv.default_python()`）。
   3. `cursor_dir` 可在 `renew_config.json` 里手动指定（覆盖自动探测）。
@@ -271,7 +270,7 @@ def _notify_stale(now: datetime.datetime, age_hours: float) -> bool:
 
 
 def _notify_expired(now: datetime.datetime) -> bool:
-    # ★ Windows 差异：命令与指引按平台生成（不再硬编码 mac 的解释器绝对路径）
+    # ★ 命令与指引不硬编码解释器绝对路径
     if winenv.IS_WIN:
         howto = "按下面的方式二选一："
         manual = '打开本文件夹，双击 login.cmd'

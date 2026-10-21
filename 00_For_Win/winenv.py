@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-winenv.py — Windows 版「所有 OS 差异」的唯一集中地（跨平台适配层）
+winenv.py — Windows 版「所有 OS 差异」的唯一集中地（平台适配层）
 
 为什么单独搞一个文件
 --------------------
-本项目有两套：macOS 版（上级目录）与 Windows 版（本目录）。两套要求**长期同步演进**。
-同步成本取决于「同名文件之间有多少差异」——如果 OS 相关代码散落在 catchup / notify /
-renew / clawbot / api_discovery / http_client 六个文件里，每次同步都要逐个文件人肉比对，
-迟早漏掉一处。所以约定：
+本项目**只做 Windows**。所有平台相关的东西收在一个文件里，其余文件不必关心
+「这行在别的系统上会怎样」—— 也就没有「平台判断散落各处、改一处漏三处」的问题：
 
     ★ 所有平台判断、路径候选、编码处理、原生通知、解释器探测，**只允许写在本文件**。
-      其余文件除少数几行调用外，应与 macOS 版逐字一致。
+      其余文件除少数几行调用外，不含任何平台分支。
 
-这样同步时的动作就是机械的：`diff` 两套的同名文件，只看差异行，差异必然很小。
+历史备注：本文件最初是为「Windows 版与另一套 macOS 版逐字对齐」而抽出来的，
+那套对齐约定已于 2026-10-21 作废（两套系统独立演进、互不通信），macOS 相关
+分支与文案随后被移除。保留本文件的价值现在是**收敛**而非对齐。
 
 本文件提供的能力
 ----------------
 | 函数 | 作用 |
 |---|---|
-| `IS_WIN` / `IS_MAC` / `IS_LINUX` | 平台判定 |
+| `IS_WIN` | 平台判定（本项目只在 Windows 上运行） |
 | `home()` / `appdata()` / `localappdata()` | 基础目录 |
 | `settings_candidates()` | WorkBuddy 桌面端 `settings.json`（ClawBot 凭据来源）候选路径 |
 | `claw_state_dirs()` | 桌面端 ClawBot 轮询游标目录候选（renew.py 用） |
@@ -28,7 +28,7 @@ renew / clawbot / api_discovery / http_client 六个文件里，每次同步都�
 | `read_asar_version()` | 从 asar 头部直接解析 `package.json` 版本（跨平台） |
 | `default_python()` | 当前解释器 / 计划任务该用哪个解释器 |
 | `selfcheck_hint()` / `login_hint()` | 通知与报错文案里的「请运行 xxx」指引（按平台生成） |
-| `native_notify()` | 原生桌面通知（Windows Toast / macOS 通知中心） |
+| `native_notify()` | 原生桌面通知（Windows Toast / 弹窗） |
 | `setup_stdio()` | 控制台编码 & 无控制台（计划任务）下的输出兜底 |
 | `subprocess_env()` / `subprocess_flags()` | 子进程环境与「不弹黑窗」标志 |
 
@@ -64,28 +64,23 @@ import time
 # 平台
 # ---------------------------------------------------------------------------
 def platform() -> str:
-    """返回 "win" / "mac" / "linux" —— **三选一，互斥**。
+    """返回 "win"。**本项目只支持 Windows**，故恒为 "win"。
 
-    为什么不用 `sys.platform` 直接散在各处判断：
-      · 集中一处，语义唯一（`sys.platform.startswith("win")` 与
-        `sys.platform == "darwin"` 是两个彼此独立的条件，同时为真的组合
-        在逻辑上是可能的，散着写迟早写出「先命中 mac 分支」这类隐蔽 bug）；
-      · **可测试** —— 自检脚本 `selftest.py` 会把本函数换成 `lambda: "win"`，
-        从而在没有 Windows 的机器上真实执行一遍 Windows 分支
-        （路径候选、通知后端、不弹窗标志等）。
+    那为什么还留这个函数，而不是把 `if platform() == "win"` 全删掉：
+
+      · 自检 `selftest.py` 会把本函数替换成 `lambda: "win"`，用来在非 Windows
+        的机器上（例如改代码用的 Linux 容器）也能真实执行一遍 Windows 分支；
+      · 将来若真要移植，只需改这一个函数体，调用方一行不动；
+      · 保留它是「收敛点」，不是「跨平台承诺」。
+
+    2026-10-21 之前的实现会返回 "mac" / "linux"，那些分支已随 macOS 版一同移除。
     """
-    if sys.platform.startswith("win"):
-        return "win"
-    if sys.platform == "darwin":
-        return "mac"
-    return "linux"
+    return "win"
 
 
 # 便捷常量：仅用于「读一眼就懂」的场景；**内部逻辑一律调 platform()**，
-# 这样测试才能把平台翻过去。
+# 这样自检才能把平台翻过去（见 pid_alive 的例外说明）。
 IS_WIN = platform() == "win"
-IS_MAC = platform() == "mac"
-IS_LINUX = platform() == "linux"
 
 HERE = pathlib.Path(__file__).resolve().parent
 PATH_OVERRIDE_FILE = HERE / "win_paths.json"
@@ -171,9 +166,8 @@ def _override(key: str) -> pathlib.Path | None:
 def settings_candidates() -> list[pathlib.Path]:
     """WorkBuddy 桌面端 `settings.json` 候选路径（**顺序即优先级**）。
 
-    macOS 实测命中第一项 `~/.workbuddy/settings.json`。Windows 桌面端由同一套
-    Electron 代码构建，大概率同样写在家目录的 `.workbuddy` 下；但 Electron 应用
-    在 Windows 上也可能落到 `%APPDATA%`，故一并列出。
+    WorkBuddy 桌面端是 Electron 应用：配置通常写在家目录的 `.workbuddy` 下，
+    但在 Windows 上也可能落到 `%APPDATA%` / `%LOCALAPPDATA%`，故一并列出。
     """
     ov = _override("workbuddy_settings")
     out: list[pathlib.Path] = []
@@ -223,37 +217,15 @@ def client_asar_candidates() -> list[pathlib.Path]:
         out.append(ov)
 
     roots: list[pathlib.Path] = []
-    plat = platform()
-    if plat == "mac":
-        roots.append(pathlib.Path("/Applications"))
-    elif plat == "win":
-        la = localappdata()
-        if la:
-            roots += [la / "Programs", la / "Programs" / "WorkBuddy", la]
-        roots += programfiles()
-    else:
-        roots += [pathlib.Path("/usr/lib"), pathlib.Path("/opt"),
-                  home() / ".local" / "share"]
+    la = localappdata()
+    if la:
+        roots += [la / "Programs", la / "Programs" / "WorkBuddy", la]
+    roots += programfiles()
 
     for r in roots:
         for name in APP_DIR_NAMES:
             out.append(r / name / "resources" / "app.asar")
-    if plat == "mac":
-        for name in APP_DIR_NAMES:
-            out.append(pathlib.Path("/Applications") / (name + ".app")
-                       / "Contents" / "Resources" / "app.asar")
     return _dedupe(out)
-
-
-def client_info_plist_candidates() -> list[pathlib.Path]:
-    """macOS 专用：`Info.plist`（版本号来源之一）。其它平台返回空。"""
-    if platform() != "mac":
-        return []
-    out = []
-    for name in APP_DIR_NAMES:
-        out.append(pathlib.Path("/Applications") / (name + ".app")
-                   / "Contents" / "Info.plist")
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -274,9 +246,9 @@ def read_asar_version(asar_path: str | pathlib.Path) -> str | None:
         数据段起始 = 8 + headerPickleSize                ← ★ 实测校准值
         某文件内容偏移 = 数据段起始 + entry.offset
 
-    为什么不用 Info.plist：Windows 上没有它。而 asar 是**两个平台都有的同一份产物**，
-    因此这条路在 Windows 上同样成立（本函数已在 macOS 真机用 298MB 的 asar 交叉验证，
-    解析结果 5.5.6 与 Info.plist 完全一致）。
+    为什么走 asar 而不读别的：asar 是客户端安装目录里**一定存在**的那份产物，
+    不需要客户端运行、不需要解包，读前几十 KB 就能拿到 `package.json` 的版本
+    （已在 298MB 的真实 asar 上验证过，解析结果与客户端显示一致）。
 
     任何异常都返回 None —— 版本号只影响 User-Agent 与指纹，绝不阻断主流程。
     """
@@ -301,7 +273,7 @@ def read_asar_version(asar_path: str | pathlib.Path) -> str | None:
         return None
 
 
-# 版本号文本兜底（asar 解析失败时用；Info.plist 亦失败时才会走到）
+# 版本号文本兜底（asar 头部解析失败时才会走到）
 def _version_from_replacements(asar_path: pathlib.Path) -> str | None:
     """从 asar 同级的 `app-update.yml` / `resources` 目录旁找版本线索。
 
@@ -329,22 +301,6 @@ def _version_from_replacements(asar_path: pathlib.Path) -> str | None:
     return None
 
 
-def _version_from_plist() -> str | None:
-    try:
-        import plistlib
-        for p in client_info_plist_candidates():
-            if p.is_file():
-                with p.open("rb") as f:
-                    info = plistlib.load(f)
-                v = (info.get("CFBundleShortVersionString")
-                     or info.get("CFBundleVersion"))
-                if v:
-                    return str(v)
-    except Exception:  # noqa: BLE001
-        pass
-    return None
-
-
 # ---------------------------------------------------------------------------
 # 客户端探测（api_discovery / http_client 共用）
 # ---------------------------------------------------------------------------
@@ -356,7 +312,7 @@ def detect_client(force: bool = False) -> dict:
           "available": bool,          # 是否找到可读的 app.asar
           "asar": str|None,           # 命中的 asar 绝对路径
           "root": str|None,           # 客户端安装根目录
-          "version": str|None,        # 客户端版本（asar → plist → 旁路文件）
+          "version": str|None,        # 客户端版本（asar 头部 → 旁路文件）
           "version_source": str|None, # 版本是从哪儿读到的
           "asar_size": int|None,
           "asar_mtime": int|None,
@@ -382,9 +338,6 @@ def detect_client(force: bool = False) -> dict:
             asar = p
 
     if asar is None:
-        out["version"] = _version_from_plist()
-        if out["version"]:
-            out["version_source"] = "Info.plist"
         return out
 
     out["asar"] = str(asar)
@@ -401,7 +354,7 @@ def detect_client(force: bool = False) -> dict:
     if v:
         out["version"], out["version_source"] = v, "asar:package.json"
     else:
-        v = _version_from_plist() or _version_from_replacements(asar)
+        v = _version_from_replacements(asar)
         if v:
             out["version"], out["version_source"] = v, "fallback"
     return out
@@ -449,8 +402,7 @@ def default_python(windowless: bool = False) -> str:
 
     优先级：环境变量 WB_REWARD_PYTHON → 当前解释器（按需切换 python/pythonw）。
 
-    两侧语义一致：**用运行自己的那个解释器**，拷到任何机器都成立，无需改任何常量。
-    mac 版等价实现是 `catchup.py` 里的 `PY = sys.executable`；
+    语义：**用运行自己的那个解释器**，拷到任何机器都成立，无需改任何常量。
     Windows 这里多一层 python.exe ↔ pythonw.exe 的切换（计划任务要无控制台的 pythonw）。
 
     ⚠️ 但「运行自己的解释器」**不保证能画窗口** —— 见下面的 `dialog_python()`。
@@ -551,34 +503,18 @@ def dialog_python(windowless: bool = True) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# 给用户看的「该执行什么」指引（按平台生成）
+# 给用户看的「该执行什么」指引
 # ---------------------------------------------------------------------------
-# 为什么放这里：通知和报错文案里会带上「请运行 xxx」的指引，
-# mac 版写的是 `python3 scripts/api_discovery.py`，这在 Windows 上跑不通
-# （既没有 `python3` 命令，api_discovery.py 也不是可执行入口）。
-# 按规则「平台差异只许写在 winenv.py」，把这两句收在这里，
-# 其余文件只调用，不出现任何平台判断。
+# 为什么放这里：通知和报错文案里会带上「请运行 xxx」的指引。这类文案最容易
+# 「改了脚本名却忘了改提示」，所以集中一处，其余文件只调用、不自己拼字符串。
 def selfcheck_hint() -> str:
-    """接口疑似变更时，让用户自查端点的方式。
-
-    ★ 必须调 `platform()` 而不是模块级常量 `IS_WIN`：常量在导入时就固定，
-      自检把平台翻成 mac 后它不会跟着变，于是「文案是否按平台生成」这条不变量
-      根本无法被验证 —— 自检第 8b 节正是因此长期报 FAIL（见 selftest.py）。
-      本模块自己的约定就是「内部逻辑一律调 platform()」，这里之前漏了。
-    """
-    if platform() == "win":
-        return "双击本文件夹下的 doctor.cmd"
-    return "python3 scripts/api_discovery.py"
+    """接口疑似变更时，让用户自查端点的方式。"""
+    return "双击本文件夹下的 doctor.cmd"
 
 
 def login_hint() -> str:
-    """微信会话失效（-14）时，让用户重新登录的方式。
-
-    同样必须调 `platform()`（理由见 selfcheck_hint）。
-    """
-    if platform() == "win":
-        return "双击本文件夹下的 login.cmd"
-    return '"{}" clawbot.py login'.format(default_python())
+    """微信会话失效（-14）时，让用户重新登录的方式。"""
+    return "双击本文件夹下的 login.cmd"
 
 
 def clawbot_status_hint() -> str:
@@ -588,11 +524,8 @@ def clawbot_status_hint() -> str:
       与**真正过期的会话**返回的是**同一个**错误码（假 token 打 sendmessage 也得到
       `{"errcode":-14,"errmsg":"session timeout"}`）。所以 -14 有可能只是「凭据没读对」，
       此时重新扫码毫无用处 —— 必须先让用户看到凭据的来源与形态。
-      同样必须调 `platform()`（理由见 selfcheck_hint）。
     """
-    if platform() == "win":
-        return "双击本文件夹下的 doctor.cmd，看「⑥ 微信通道」一节"
-    return "python3 clawbot.py status"
+    return "双击本文件夹下的 doctor.cmd，看「⑥ 微信通道」一节"
 
 
 # ---------------------------------------------------------------------------
@@ -964,65 +897,45 @@ def _notify_windows_dialog(title: str, content: str,
         return False
 
 
-def _notify_macos(title: str, content: str) -> bool:
-    """macOS 通知中心（保留，便于本目录在 mac 上被测试/复用）。"""
-    try:
-        safe = content.replace('"', "'").replace("\\", "/")[:200]
-        subprocess.run(
-            ["osascript", "-e",
-             'display notification "{}" with title "{}"'.format(safe, title)],
-            capture_output=True, timeout=10,
-        )
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _notify_linux(title: str, content: str) -> bool:
-    try:
-        subprocess.run(["notify-send", title, content], capture_output=True, timeout=10)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def pid_alive(pid: int) -> bool:
     """某个 PID 的进程是否还活着。
 
-    ★ 为什么必须收进 winenv：POSIX 上 `os.kill(pid, 0)` 是**只探测、不发信号**的
-      标准写法；但**Windows 上 `os.kill` 对任何非特殊信号都会直接 TerminateProcess** ——
-      照抄 POSIX 写法会真的把那个进程杀掉（如果 PID 被复用，杀的就是无辜进程）。
-      所以 Windows 改用 `tasklist` 查询。
+    ★ 为什么不能照抄 POSIX 的 `os.kill(pid, 0)`：POSIX 上那是「只探测、不发信号」
+      的标准写法；但 **Windows 上 `os.kill` 对任何非特殊信号都会直接
+      TerminateProcess** —— 万一 PID 被复用，杀的就是无辜进程。
+
+    ★ 本函数**故意**不留任何平台分支（2026-10-21 删除）：本项目只在 Windows 上跑，
+      少一个分支就少一次「误走 os.kill 把别人进程杀掉」的机会。
 
     用途：catchup.py 的排它锁判断「残留锁的持锁进程是否还在」。
-
-    ★ 这里**故意**用模块级常量 `IS_WIN` 而不是 `platform()`（本模块其它地方一律
-      要求调 `platform()`）：它是本模块唯一的例外，理由是**安全**。
-      `os.kill(pid, 0)` 在本机是 Windows 时真的会 TerminateProcess 掉那个进程，
-      而 `IS_WIN` 反映的是**真实操作系统**、不受任何测试桩影响。若改用 `platform()`，
-      一旦有测试把平台翻成 mac/linux，Windows 上就会走到 os.kill 分支 → 误杀进程。
-      换言之：这里要的是「我到底在什么系统上」，不是「测试希望我是什么系统」。
     """
     if pid <= 0:
         return False
-    if IS_WIN:
-        try:
-            # 取 bytes 自己解，不用 text=True（理由见 decode_console）：
-            # 这个函数决定「残留锁的持锁进程是否还活着」，判错会让两个实例并发写 state。
-            r = subprocess.run(["tasklist", "/FI", "PID eq {}".format(pid), "/NH"],
-                               capture_output=True, timeout=10)
-            return str(pid) in decode_console(r.stdout or b"")
-        except Exception:  # noqa: BLE001
-            return False
     try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
+        # 取 bytes 自己解，不用 text=True（理由见 decode_console）：
+        # 这个函数决定「残留锁的持锁进程是否还活着」，判错会让两个实例并发写 state。
+        r = subprocess.run(["tasklist", "/FI", "PID eq {}".format(pid), "/NH"],
+                           capture_output=True, timeout=10)
+        return str(pid) in decode_console(r.stdout or b"")
+    except Exception:  # noqa: BLE001
         return False
 
 
-def native_notify(title: str, content: str, log_dir: pathlib.Path | None = None) -> bool:
+def native_notify(title: str, content: str, log_dir: pathlib.Path | None = None,
+                  style: str | None = None,
+                  queue_on_miss: bool | None = None) -> bool:
     """发一条本机桌面通知。**永不抛异常**。
+
+    style        —— None 按 WORKBUDDY_ALERT_STYLE（默认 dialog）；
+                    "dialog" 必须点掉才消失，"toast" 几秒后自动消失。
+    queue_on_miss —— None 按老规则（只有 Toast 才进补弹队列）；False 表示
+                    即便可能没看到也不补弹。
+
+    ★ 2026-10-21：新增这两个可选参数，让**失败通知**能走 Toast 且不补弹。
+      原因：失败用「必须点 ✕ 才消失」的卡片时，`_DIALOG_MAX=3` 一满，第 4 条
+      起全部退成 Toast 并进补弹队列 —— 失败重试 20 分钟一跳，一天就能堆到
+      3 张常驻卡片 + 8 条待补弹，用户回到机器前被轮番糊屏（10-21 现场）。
+      到账类仍然走常驻卡片：那是「值得看一眼」的消息，而且一天最多两三条。
 
     投递失败时把内容追加到 `logs/notify_fallback.log` —— 宁可留下文本，也不能丢信息
     （这是「微信通道 + 本地通知」两级兜底里的最后一级）。
@@ -1030,22 +943,16 @@ def native_notify(title: str, content: str, log_dir: pathlib.Path | None = None)
     ok = False
     may_be_missed = False   # 这个通道「用户有可能没看到」→ 才需要进补弹队列
     try:
-        plat = platform()
-        if plat == "win":
-            if _alert_style() == "dialog":
-                # ★ 默认通道：**必须点掉才消失**的弹窗（用户 2026-09-21 要求）。
-                #   它一直待在屏幕上等人处理 → 不需要、也不该再补弹一次。
-                ok = _notify_windows_dialog(title, content, log_dir)
-                if not ok:                      # 弹窗被拒/堆太多 → 退回常驻 Toast
-                    ok = _notify_windows(title, content)
-                    may_be_missed = ok
-            else:
+        if (style or _alert_style()) == "dialog":
+            # ★ 默认通道：**必须点掉才消失**的弹窗（用户 2026-09-21 要求）。
+            #   它一直待在屏幕上等人处理 → 不需要、也不该再补弹一次。
+            ok = _notify_windows_dialog(title, content, log_dir)
+            if not ok:                      # 弹窗被拒/堆太多 → 退回常驻 Toast
                 ok = _notify_windows(title, content)
                 may_be_missed = ok
-        elif plat == "mac":
-            ok = _notify_macos(title, content)
         else:
-            ok = _notify_linux(title, content)
+            ok = _notify_windows(title, content)
+            may_be_missed = ok
     except Exception:  # noqa: BLE001
         ok = False
 
@@ -1060,7 +967,7 @@ def native_notify(title: str, content: str, log_dir: pathlib.Path | None = None)
                     title, content))
         except Exception:  # noqa: BLE001
             pass
-    elif may_be_missed:
+    elif may_be_missed and queue_on_miss is not False:
         # 只有"可能被忽略"的通道（Toast）才进补弹队列：
         # 没人看屏幕时 Windows 只把 Toast 塞进通知中心，屏幕上不会出现横幅。
         try:
@@ -1187,7 +1094,15 @@ def _maybe_queue_reshow(title: str, content: str, log_dir=None, idle=None) -> bo
     if idle is None or idle <= _reshow_threshold():
         return False    # 用户在场：这条应当已经看到，不排队（避免重复打扰）
     items = _reshow_load(log_dir)
-    items.append({"title": title[:120], "body": content[:600], "ts": time.time()})
+    # ★ 2026-10-21：按标题去重，同一条消息只留最新的那一份。
+    #   为什么必须去重：失败告警每次的正文都带「时间：…」，指纹因此条条不同，
+    #   于是「同一件事失败 12 次」会在队列里堆 12 条。用户回到机器前，补弹机制
+    #   每次弹 3 条、分 3 轮把 8 条同类失败全泼到屏幕上 —— 10-21 用户看到的
+    #   「这么多失败消息」就是 11 条原发 + 8 条补弹。按标题去重后，
+    #   同类失败只留最后一条，回到机器前最多被提醒一次。
+    key = title[:120]
+    items = [it for it in items if str(it.get("title", "")) != key]
+    items.append({"title": key, "body": content[:600], "ts": time.time()})
     _reshow_save(items[-_RESHOW_MAX_ITEMS:], log_dir)
     return True
 

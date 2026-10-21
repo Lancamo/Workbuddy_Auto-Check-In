@@ -28,11 +28,11 @@ WorkBuddy 桌面端从 5.6.2 起强制开启登录态静态加密（AtRestEncryp
 
   1. 环境变量 WORKBUDDY_ATREST_KEY         —— 直接给 44 字符密钥串
   2. 环境变量 WORKBUDDY_ATREST_KEY_FILE    —— 指向含明文 44 字符密钥的文件
-  3. Windows：扫描登录态所在 Data 目录的 DPAPI blob，解开后用 keyId 校验
-  4. Windows：ReadProcessMemory 扫描运行中 WorkBuddy.exe 进程内存（Windows 主路径）
-  5. macOS：借客户端自带的 Electron 二进制，以 ELECTRON_RUN_AS_NODE 方式启动并向其
-     内置原生绑定 electron_browser_workbuddy_storage.loggerGet() 索取密钥
-     （macOS 主路径；2026-09-28 本机实测成功，无需 root / 注入 / 读内存）
+  3. 扫描登录态所在 Data 目录的 DPAPI blob，解开后用 keyId 校验
+  4. ReadProcessMemory 扫描运行中 WorkBuddy.exe 进程内存（主路径）
+
+（2026-10-21：原先还有第 5 条「macOS 下借客户端自带 Electron 取密钥」，
+ macOS 版移除后一并删除，见 git 历史。）
 
 安全约束：解密得到的明文 JWT 只在内存中流转，绝不打印 / 写日志 / 落盘 / 上传。
 """
@@ -43,7 +43,6 @@ import base64
 import hashlib
 import json
 import os
-import plistlib
 import re
 import subprocess
 import sys
@@ -412,15 +411,10 @@ def _locate_secret_key_uncached(key_id: str) -> str | None:
         if _is_valid_secret(cand):
             return cand
 
-    # 3/4) 平台相关
-    if sys.platform == "win32":
-        key = _locate_key_windows(key_id)
-        if key:
-            return key
-    elif sys.platform == "darwin":
-        key = _locate_key_macos(key_id)
-        if key:
-            return key
+    # 3/4) 扫 DPAPI blob / 读进程内存（仅 Windows）
+    key = _locate_key_windows(key_id)
+    if key:
+        return key
     return None
 
 
@@ -686,132 +680,6 @@ def _scan_one_process(hproc, key_id, ctypes, wintypes, kernel32) -> str | None:
         for s in _extract_b64_candidates(chunk, seen):
             if _is_valid_secret(s) and _secret_matches(s, key_id):
                 return s
-    return None
-
-
-# ---------------------------------------------------------------------------
-# macOS 专属：借客户端自带 Electron 二进制取密钥（ELECTRON_RUN_AS_NODE）
-# ---------------------------------------------------------------------------
-#
-# ★ 为什么这条路可行（2026-09-28 本机实测，macOS + 客户端 5.6.2）：
-#   WorkBuddy 桌面端的 atRestSecretKey 是**构建期内置**的常量，经原生绑定
-#   `electron_browser_workbuddy_storage` 的 `loggerGet()` 暴露出来。把客户端自带的
-#   Electron 二进制**以纯 Node 方式**启动（ELECTRON_RUN_AS_NODE=1），在普通用户权限
-#   下就能直接取回这份 payload ——
-#     · 不需要 root；
-#     · 不需要 lldb / task_for_pid（hardened runtime 下连 root 也会被 AMFI 拒）；
-#     · 不需要 DYLD 注入（entitlements 里没有 allow-dyld-environment-variables）；
-#     · 也不需要客户端正在运行。
-#
-#   实测返回：
-#     {"version":1,"atRestSecretKey":"<44字符base64>","atRestDeveloperPublicKey":{...}}
-#
-#   唯一会让这条路失效的前提是 Electron fuse `RunAsNode` 被禁用
-#   （可用 `npx @electron/fuses read --app /Applications/WorkBuddy.app` 查看）。
-#   5.6.2 未禁用，故当前可用。
-#
-# ★ 注意：`CFBundleExecutable` 实际是 `Electron`，不是 `WorkBuddy`；且**不要**去动
-#   `WorkBuddy AI.app`（BundleId `com.workbuddy.workbuddy-ai`）——那是另一款应用。
-
-# 客户端可执行文件常见位置（首个是默认安装位置）
-_MAC_APP_EXECS = (
-    "/Applications/WorkBuddy.app/Contents/MacOS/Electron",
-    os.path.join(os.path.expanduser("~/Applications"), "WorkBuddy.app", "Contents", "MacOS", "Electron"),
-)
-
-# 在客户端 Node 环境里执行的取密钥脚本：把 loggerGet() 的返回值原样写到 stdout。
-# 只读，不改动客户端任何状态；失败信息走 stderr，不污染 stdout。
-_NODE_GET_KEY_JS = (
-    "const v=process._linkedBinding('electron_browser_workbuddy_storage').loggerGet();"
-    "process.stdout.write(typeof v==='string'?v:JSON.stringify(v));"
-)
-
-
-def _read_bundle_plist(plist_path: str):
-    """读取 .app 的 Info.plist，返回 (CFBundleIdentifier, CFBundleExecutable)。"""
-    try:
-        with open(plist_path, "rb") as f:
-            d = plistlib.load(f)
-    except (OSError, ValueError):
-        return None, None
-    return d.get("CFBundleIdentifier"), d.get("CFBundleExecutable")
-
-
-def _scan_app_bundles() -> list:
-    """扫描常见应用目录，返回 WorkBuddy 桌面端（**排除 AI 版**）的可执行文件路径。"""
-    out = []
-    roots = ("/Applications", os.path.join(os.path.expanduser("~"), "Applications"))
-    for root in roots:
-        try:
-            names = os.listdir(root)
-        except OSError:
-            continue
-        for name in names:
-            if not name.endswith(".app"):
-                continue
-            app_dir = os.path.join(root, name)
-            bid, exe = _read_bundle_plist(os.path.join(app_dir, "Contents", "Info.plist"))
-            if not bid or "workbuddy" not in bid.lower():
-                continue
-            if bid.lower().endswith("workbuddy-ai"):
-                continue  # WorkBuddy AI 是另一款应用，不碰
-            out.append(os.path.join(app_dir, "Contents", "MacOS", exe or "Electron"))
-    return out
-
-
-def _find_macos_app_exec() -> str:
-    """定位可用于 ELECTRON_RUN_AS_NODE 的客户端二进制；找不到返回空串。
-
-    顺序：环境变量 WORKBUDDY_APP_EXEC → 常见安装位置 → 扫描应用目录（排除 AI 版）。
-    """
-    env_path = os.environ.get("WORKBUDDY_APP_EXEC")
-    cands = [env_path] if env_path else []
-    cands += list(_MAC_APP_EXECS)
-    cands += _scan_app_bundles()
-    for c in cands:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
-            return c
-    return ""
-
-
-def _extract_secret_candidates(text: str) -> list:
-    """从 Node 输出里提取候选密钥：先按 JSON 字段取，再退化为 44 字符 base64 扫描。"""
-    cands = []
-    for m in re.finditer(r'"atRestSecretKey"\s*:\s*"([^"]{1,128})"', text):
-        cands.append(m.group(1))
-    for m in re.finditer(r"[A-Za-z0-9+/]{43}=", text):
-        cands.append(m.group())
-    seen = set()
-    out = []
-    for s in cands:
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
-
-
-def _macos_payload() -> str:
-    """启动客户端自带 Electron（纯 Node 模式）取其密钥 payload；失败返回空串。"""
-    exe = _find_macos_app_exec()
-    if not exe:
-        return ""
-    env = dict(os.environ)
-    env["ELECTRON_RUN_AS_NODE"] = "1"
-    try:
-        proc = subprocess.run(
-            [exe, "-e", _NODE_GET_KEY_JS],
-            capture_output=True, text=True, timeout=20, env=env,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return proc.stdout or ""
-
-
-def _locate_key_macos(key_id: str) -> str | None:
-    """macOS 下定位密钥：借客户端自带 Electron 二进制取 payload，按 keyId 校验。"""
-    for cand in _extract_secret_candidates(_macos_payload()):
-        if _is_valid_secret(cand) and _secret_matches(cand, key_id):
-            return cand
     return None
 
 

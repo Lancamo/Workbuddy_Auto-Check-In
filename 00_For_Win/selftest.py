@@ -5,20 +5,20 @@
 为什么要在开发机上跑
 --------------------
 本套装的目标是「拷到另一台电脑就能用」。那台机器上出问题时，排查成本很高。
-能在**开发机（macOS）**上提前验证的部分，就不要留到目标机上去试错：
+能在**不触碰真实环境**的前提下提前验证的部分，就不要留到实际运行时去试错：
 
   · 计划任务 XML 的结构与关键设置（改错一个字，Windows 上会静默不跑）
-  · asar 版本解析（Windows 没有 Info.plist，这条路必须先在真文件上验证过）
+  · asar 版本解析（必须先在真文件上验证过）
   · **Windows 分支的路径候选**（把平台开关翻成 win32 后实际调一遍函数）
   · 无控制台场景（`sys.stdout is None`，计划任务 + pythonw 的真实情况）
   · 中文 / 空格路径不被破坏
-  · 两套代码的差异是否只落在预期的位置
+  · 代码里没有残留跨平台路径与命令
 
     python selftest.py            # 全部离线检查（不联网、不领取积分、不发消息）
     python selftest.py --online   # 额外跑一次真实只读的环境诊断（doctor.py）
     python selftest.py -v         # 显示每项明细
 
-不做什么：绝不调用签到 / 领取接口，绝不发送任何消息，绝不改动上级目录的 macOS 版。
+不做什么：绝不调用签到 / 领取接口，绝不发送任何消息。
 """
 
 from __future__ import annotations
@@ -530,19 +530,6 @@ def test_asar() -> None:
           bool(re.fullmatch(r"\d+\.\d+(\.\d+)?", str(c.get("version") or ""))),
           "实际：{}".format(c.get("version")))
 
-    # 与 macOS 的 Info.plist 交叉验证（两条独立来源应一致）
-    try:
-        import plistlib
-        pl = pathlib.Path("/Applications/WorkBuddy.app/Contents/Info.plist")
-        if pl.is_file():
-            with pl.open("rb") as f:
-                pv = plistlib.load(f).get("CFBundleShortVersionString")
-            check("asar 解析与 Info.plist 一致（两条独立来源交叉验证）",
-                  pv == c.get("version"),
-                  "Info.plist={} asar={}".format(pv, c.get("version")))
-    except Exception as e:  # noqa: BLE001
-        check("asar 解析与 Info.plist 一致", True, "跳过（{}）".format(repr(e)[:80]))
-
     # 损坏/不存在的文件不能崩
     check("对不存在的文件返回 None",
           winenv.read_asar_version("/nonexistent/app.asar") is None)
@@ -667,12 +654,9 @@ def test_windows_paths() -> None:
                 os.environ.pop(_k, None)
             else:
                 os.environ[_k] = _v
-        # 期望值必须把 Windows 自己也算进去 —— 旧写法只区分 mac / linux，
-        # 于是在 Windows 上恒等于「期望 linux、实际 win」，自己把自己判失败。
-        _expect = ("mac" if sys.platform == "darwin"
-                   else "win" if sys.platform.startswith("win") else "linux")
+        # 期望值：本项目只支持 Windows，platform() 恒返回 "win"。
         check("模拟环境已还原（platform 回到真实值）",
-              winenv.platform() == _expect,
+              winenv.platform() == "win",
               "本机 sys.platform={}".format(sys.platform))
 
 
@@ -892,9 +876,109 @@ def test_logic() -> None:
     check("节流间隔确实是 20 分钟（12 次尝试 ≈ 4 小时，与旧的 30 分钟触发节奏相当）",
           GAP == 20, "实际 {}".format(GAP))
 
+    # --- 本地环境未就绪（2026-10-19：开机时客户端比脚本晚起几十秒）---
+    # 这类失败请求根本没发出去，既不该烧 MAX_TRIES，也不该等 20 分钟、更不该弹窗。
+    src = pathlib.Path(DIR / "catchup.py").read_text(encoding="utf-8")
+    check("local 失败被单独识别（不算网络层，也不算业务层）",
+          cu._is_local_fail({"status": "failed", "fail_kind": "local"}) is True
+          and cu._is_local_fail({"status": "failed", "fail_kind": "net"}) is False
+          and cu._is_net_fail({"status": "failed", "fail_kind": "local"}) is False,
+          "local 必须与 net 互斥，否则会走 30 分钟网络重试")
+    check("签到 / 旅行各有独立的 local 计数器",
+          cu._local_fails_key({"task": "checkin"}) == "checkin_local_fails"
+          and cu._local_fails_key({"task": "travel"}) == "claim_local_fails",
+          "travel → {}".format(cu._local_fails_key({"task": "travel"})))
+    check("local 未达阈值 → 5 分钟后就重试（抢客户端启动的几十秒）",
+          cu.LOCAL_RETRY_GAP_MIN == 5
+          and cu._gap_for({"checkin_last_kind": "local", "checkin_local_fails": 1},
+                          "checkin_last_kind", "checkin_local_fails") == 5,
+          "gap={}".format(cu._gap_for({"checkin_last_kind": "local",
+                                       "checkin_local_fails": 1},
+                                      "checkin_last_kind", "checkin_local_fails")))
+    check("local 已达阈值 → 退回 20 分钟（避免整天每 5 分钟扫一次进程内存）",
+          cu._gap_for({"checkin_last_kind": "local", "checkin_local_fails": 3},
+                      "checkin_last_kind", "checkin_local_fails") == GAP)
+    check("net / biz / 首次仍走原节奏（不被 local 的短间隔污染）",
+          cu._gap_for({"checkin_last_kind": "net"}, "checkin_last_kind",
+                      "checkin_local_fails") == cu.NET_RETRY_GAP_MIN
+          and cu._gap_for({}, "checkin_last_kind", "checkin_local_fails") == GAP
+          and cu._gap_for({"checkin_last_kind": "biz"}, "checkin_last_kind",
+                          "checkin_local_fails") == GAP)
+    check("local 连续 1–2 次静默，第 3 次才告警（≈ 10 分钟）",
+          cu._local_quiet({"status": "failed", "fail_kind": "local", "task": "checkin"},
+                          {"checkin_local_fails": 1}) is True
+          and cu._local_quiet({"status": "failed", "fail_kind": "local", "task": "checkin"},
+                              {"checkin_local_fails": 2}) is True
+          and cu._local_quiet({"status": "failed", "fail_kind": "local", "task": "checkin"},
+                              {"checkin_local_fails": 3}) is False,
+          "阈值 {}".format(cu.LOCAL_ALERT_AFTER))
+    _q = lambda n: cu._local_quiet(
+        {"status": "failed", "fail_kind": "local", "task": "checkin"},
+        {"checkin_local_fails": n})
+    check("★ 越过阈值后不逐条刷屏：第 4–14 次静默，第 15 次才再提醒一次",
+          _q(4) is True and _q(14) is True and _q(15) is False,
+          "4={} 14={} 15={}".format(_q(4), _q(14), _q(15)))
+    _loc_branch = src.split('elif _is_local_fail(c):')[1].split("else:")[0] \
+        if 'elif _is_local_fail(c):' in src else ""
+    check("★ 反向：local 分支绝不能碰 *_tries（否则几次唤醒就耗光 12 次预算）",
+          bool(_loc_branch) and "_tries" not in _loc_branch,
+          "分支片段：{}".format(_loc_branch[:120]))
+    check("源码里 local 分支只累加 local_fails（签到 + 旅行各一处）",
+          'state["checkin_local_fails"] = int(' in src
+          and 'state["claim_local_fails"] = int(' in src,
+          "缺少 local 计数写入")
+    check("通知层有 local 静默分支（否则第 1 次就弹窗）",
+          "local_quiet" in src and "静默重试，不发通知" in src)
+    check("登录态报错给出「客户端还没启动完」的专属提示",
+          "客户端还没启动完" in cu._hint_for(
+              ["登录态读取失败：登录态存在但 accessToken 已被 5.6.2+ 客户端加密，"
+               "且未能解出密钥：x.info"]),
+          cu._hint_for(["登录态读取失败：未能解出密钥"])[:80])
+
+    # --- ★ 2026-10-21：main.py 的 `all` 短路必须带 fail_kind ---
+    #   10-19 加的 local 分类为什么整整两天没生效：catchup 调的是 `main.py all`，
+    #   而这条短路自己拼了个 dict 只放 status/reason，把 fail_kind 丢了。
+    #   于是「客户端没起来」被当成业务失败：烧满 12 次预算、20 分钟一跳、
+    #   每次一条通知（10-20 连发 12 条 / 10-21 连发 11 条 + 8 条补弹）。
+    _main_src = (pathlib.Path(DIR) / "scripts" / "main.py").read_text(encoding="utf-8")
+    _all_block = ""
+    if 'if task == "all":' in _main_src:
+        _all_block = _main_src.split('if task == "all":')[1].split('if task == "status":')[0]
+    check('★ main.py 的 all 分支给 checkin / travel 都带上 fail_kind="local"',
+          _all_block.count('"fail_kind": "local"') == 2,
+          "命中 {} 处".format(_all_block.count('"fail_kind": "local"')))
+    check("★ 反向：这条短路不能只给一个任务带（漏一个就漏一半告警降噪）",
+          '"fail_kind": "local"}' in _all_block,
+          _all_block[:160])
+
+    # --- ★ 2026-10-21：失败告警节流（对 biz 也生效，补上原来漏掉的最大一类）---
+    _sig = cu._fail_signature(["签到", "旅行"],
+                              {"status": "failed", "fail_kind": "biz"},
+                              {"status": "failed", "fail_kind": "biz"})
+    check("失败签名不含时间戳（含了则每条指纹唯一，去重永远不命中）",
+          ":" not in _sig and "2026" not in _sig, _sig)
+    check("首次失败立即告警（不能因为要降噪就漏掉第一次）",
+          cu._fail_alert_due({}, _sig, 1000.0)[0] is True)
+    check("同类别失败在窗口内静默（这就是 12 条变 1 条的地方）",
+          cu._fail_alert_due({"fail_alert_key": _sig, "fail_alert_ts": 1000.0},
+                             _sig, 1060.0)[0] is False)
+    check("窗口到期后再次告警（长时间坏着也不会永远沉默）",
+          cu._fail_alert_due({"fail_alert_key": _sig, "fail_alert_ts": 1000.0},
+                             _sig,
+                             1000.0 + cu.FAIL_ALERT_EVERY_MIN * 60 + 1)[0] is True)
+    check("失败类别变了 → 立刻告警（不被上一个类别的窗口吃掉）",
+          cu._fail_alert_due({"fail_alert_key": "签到|biz", "fail_alert_ts": 1000.0},
+                             "签到|local", 1060.0)[0] is True)
+    check("恢复时清空节流窗口（否则修好后再坏，会被旧窗口误伤成静默）",
+          'state["fail_alert_key"] = None' in src)
+    check("★ 反向：节流绝不能压住 suspect / pf_bad（接口层故障必须立刻处置）",
+          "if failed and not suspect and not pf_bad:" in src)
+    check("节流命中时写日志（事后能看出「不是没报，是被节流了」）",
+          "失败告警节流" in src)
+
     # --- 到达时间的落盘 / 清除 ---
     # 用 AST 检查行为，避免真的跑 main()（那会联网领积分）
-    src = pathlib.Path(DIR / "catchup.py").read_text(encoding="utf-8")
+    # （src 已在上面「本地环境未就绪」一节读入，这里复用）
     check("领到手后清除 arrive_at（不留过期时间戳）",
           'if t.get("status") == "claimed":' in src
           and 'state["arrive_at"] = None' in src)
@@ -1021,10 +1105,10 @@ def test_logic() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. 结构约束：mac 版绝对路径不得残留；两套差异只落在预期位置
+# 8. 结构约束：不得残留跨平台绝对路径
 # ---------------------------------------------------------------------------
 def test_structure() -> None:
-    section("8. 结构约束（禁止把 mac 绝对路径带进 Windows 版）")
+    section("8. 结构约束（禁止把跨平台绝对路径带进本项目）")
     # 本文件自身会包含这些模式（它就是在找它们），所以排除掉；
     # 同时排除 macOS 的 `._xxx` 二进制伴生文件（见 is_mac_junk）。
     files = [p for p in sorted(DIR.rglob("*.py"))
@@ -1038,13 +1122,13 @@ def test_structure() -> None:
             for m in re.finditer(pat, txt):
                 line = txt[:m.start()].count("\n") + 1
                 leaks.append("{}:{}: {}".format(p.relative_to(DIR), line, pat))
-    check("没有硬编码的 macOS 用户路径 / 解释器路径", not leaks, "\n".join(leaks[:10]))
+    check("没有硬编码的跨平台用户路径 / 解释器路径", not leaks, "\n".join(leaks[:10]))
 
-    # osascript 只能作为「可执行命令」出现在 winenv.py；其它文件里出现即说明差异没收口
+    # osascript 是 macOS 的通知命令，Windows 版里一处都不该有（2026-10-21 已整体移除）
     osa = [str(p.relative_to(DIR)) for p in files
-           if '"osascript"' in p.read_text(encoding="utf-8", errors="replace")]
-    check("osascript 调用只出现在 winenv.py（平台差异已收口）",
-          osa == ["winenv.py"], "实际：{}".format(osa))
+           if "osascript" in p.read_text(encoding="utf-8", errors="replace")]
+    check("没有任何文件调用 osascript（macOS 通知命令已彻底移除）",
+          not osa, "实际：{}".format(osa))
 
     # 关键文件必须存在
     # A fresh checkout has no runtime/ directory; generate default configs before checking it.
@@ -1129,38 +1213,14 @@ def test_structure() -> None:
           "共 {} 个，例如 {}。清理：find . -name '._*' -delete".format(
               len(junk), ", ".join(sorted(str(p.relative_to(DIR)) for p in junk)[:6])))
 
-    # 两套必须成对存在的文件（同步用）
-    # 2026-09-18 整理目录后，mac 版在 `../00_For_Mac/`；兼容整理前的旧布局（直接在上一级）。
-    #
-    # ★ 这里**不能**无条件判失败：README 明说「这个文件夹就是交付物，拷到新 Windows
-    #   机器的任意位置即可用」。在交付机（独立副本）上根本不存在 `../00_For_Mac`，
-    #   旧写法会让自检在开箱状态下恒报一条 FAIL，把「跨版本比对」这件**开发期**的事
-    #   伪装成「交付物坏了」。mac 版在位才做比对，不在位就明确标注跳过。
-    mac = DIR.parent / "00_For_Mac"
-    if not (mac / "catchup.py").is_file():
-        mac = DIR.parent
-    pairs = ["catchup.py", "notify.py", "renew.py", "clawbot.py",
-             "scripts/main.py", "scripts/checkin.py", "scripts/travel.py",
-             "scripts/api_discovery.py", "scripts/credentials.py",
-             "scripts/http_client.py"]
-    mac_present = (mac / "catchup.py").is_file()
-    if mac_present:
-        check("上级 macOS 版在位（同步基准）", True, str(mac))
-    else:
-        check("上级 macOS 版不在位 —— 按独立交付副本跳过跨版本比对", True,
-              "未找到 {}".format(mac / "catchup.py"))
-    if mac_present:
-        # 未改动的文件应当是逐字一致（差异越小，同步越省事）
-        identical, differing = [], []
-        for rel in pairs:
-            a, b = mac / rel, DIR / rel
-            if not b.is_file():
-                continue
-            (identical if a.read_bytes() == b.read_bytes() else differing).append(rel)
-        check("与 mac 版逐字一致的文件（无需同步）",
-              True, "一致 {} 个：{}".format(len(identical), identical))
-        check("与 mac 版存在差异的文件（需要成对修改）",
-              True, "差异 {} 个：{}".format(len(differing), differing))
+    # ★ 反向断言：不许把「与另一套系统同步」的旧规则写回 README。
+    #   2026-10-21 起本项目只做 Windows（macOS 版已整体移除），README 不应再出现
+    #   「两套一起改 / 必须逐字一致」这类会逼着后续改动去迁就另一侧的说法。
+    _readme = (DIR / "README.md").read_text(encoding="utf-8")
+    check("★ 反向：README 不得再出现跨平台同步的旧约定",
+          "必须成对改" not in _readme
+          and "Mac 版 ↔ Win 版 同步规则" not in _readme,
+          "仍残留旧同步规则")
 
 
 # ---------------------------------------------------------------------------
@@ -1195,16 +1255,12 @@ def test_platform_hints() -> None:
                   "login.cmd" in lh_real and "python3" not in lh_real, lh_real)
             check("真机是 Windows：clawbot_status_hint 给 doctor.cmd 且不含 python3",
                   "doctor.cmd" in ch_real and "python3" not in ch_real, ch_real)
-        else:
-            check("真机非 Windows：selfcheck_hint 给 mac/linux 命令",
-                  "python3" in sc_real, sc_real)
 
         # --- ② 假装自己是 Windows ---
         #   必须**同时**翻 winenv.platform 与 winenv.IS_WIN：
         #     · winenv 模块自己的内部逻辑读 platform()（这是它写明的约定，
         #       也是为了「能被测试翻过去」才这么设计的）；
-        #     · notify / renew / clawbot 这些**成对维护**的文件读 IS_WIN
-        #       （那是 README 5.5 明确允许的平台差异，因为 mac 版没有 winenv）。
+        #     · notify / renew / clawbot 这些文件读 IS_WIN（导入时就固定）。
         #   只翻其中一个，就只模拟了一半的平台。
         winenv.platform = lambda: "win"
         winenv.IS_WIN = True
@@ -1218,17 +1274,11 @@ def test_platform_hints() -> None:
         check("win 上 clawbot_status_hint 不含 python3", "python3" not in ch, ch)
         check("win 上 clawbot_status_hint 指向 doctor.cmd", "doctor.cmd" in ch, ch)
 
-        # --- ③ 再翻回非 Windows 做反向断言（旧测试缺这一半，
-        #        所以「文案有没有真的跟着平台走」其实没被验证过）---
-        winenv.platform = lambda: "mac"
-        winenv.IS_WIN = False
-        sc_mac = winenv.selfcheck_hint()
-        check("翻回 mac 后 selfcheck_hint 给回 mac 命令（文案确实跟着平台走）",
-              "python3" in sc_mac, sc_mac)
-        ch_mac = winenv.clawbot_status_hint()
-        check("翻回 mac 后 clawbot_status_hint 给回 mac 命令（同上，别漏了它）",
-              "python3" in ch_mac, ch_mac)
-        # 回到 Windows，供下面 clawbot / renew / catchup 的正文断言使用
+        # --- ③ 文案已固定为 Windows ---
+        #   2026-10-21 移除 macOS 版后，selfcheck_hint / login_hint /
+        #   clawbot_status_hint 不再按平台分支，恒返回 Windows 命令。
+        #   原先这里有一段「翻回 mac 断言 python3 回来」的反向测试，
+        #   随平台分支一起删除 —— 再翻平台也不会有另一套文案。
         winenv.platform = lambda: "win"
         winenv.IS_WIN = True
 
@@ -1439,8 +1489,8 @@ def test_watchdog() -> None:
           _spawn_calls and not _missing,
           "{} 处调用，{} 处缺失：{}".format(len(_spawn_calls), len(_missing), _missing))
     # Windows ABI 固定值：CREATE_NO_WINDOW = 0x08000000。不用
-    # `subprocess.CREATE_NO_WINDOW` 是因为它只在 Windows 解释器上存在，
-    # 本自检在 macOS 上也要跑；这里直接钉死规范值，跨平台结果一致。
+    # `subprocess.CREATE_NO_WINDOW` 只在 Windows 解释器上存在，
+    # 而自检要能在任意机器上跑；这里直接钉死规范值，结果与解释器无关。
     check("watchdog 的 _CREATE_NO_WINDOW 等于 Windows CREATE_NO_WINDOW（0x08000000）",
           getattr(wd, "_CREATE_NO_WINDOW", None) == 0x08000000,
           "watchdog={:#x}".format(getattr(wd, "_CREATE_NO_WINDOW", -1)))
@@ -1666,6 +1716,7 @@ def test_watchdog() -> None:
                   r["healthy"],
                   "problems={} age={} grace={}".format(
                       r["problems"], r["state_age_minutes"], r["first_run_grace"]))
+
     finally:
         wd.STATE, wd.MAIN_LOG = orig_state, orig_log
         wd.QUIET_FROM = orig_quiet
@@ -1767,7 +1818,7 @@ def test_watchdog() -> None:
           wd._day_finished({"day": today_s, "checkin_done": True,
                             "claim_done": True}, time.time()))
 
-    # --- 报警自查指引必须是 Windows 命令（不能把 mac 的 launchctl 带进来）---
+    # --- 报警自查指引必须是 Windows 命令（不能把 launchctl 之类带进来）---
     check("报警自查指引是 Windows 命令（schtasks）",
           "schtasks" in src and "launchctl" not in src,
           "含 launchctl：{}".format("launchctl" in src))
@@ -1989,7 +2040,7 @@ def test_notify_delivery_semantics() -> None:
             N._channel_order = lambda cfg: []                # 模拟「无可用微信通道」
 
             # ① 通道不可用，但本机弹窗成功 → sent 必须为 True
-            N._send_native = lambda title, content: True
+            N._send_native = lambda title, content, level='info': True
             r1 = N.send("测试标题", "测试正文", "failure")
             check("微信不可用但本机弹成功 → sent=True 且 wechat=False",
                   r1.get("wechat") is False and r1.get("sent") is True,
@@ -1997,7 +2048,7 @@ def test_notify_delivery_semantics() -> None:
 
             # ② 本机弹窗也失败 → 两张表都不许记
             N.STATE.unlink(missing_ok=True)
-            N._send_native = lambda title, content: False
+            N._send_native = lambda title, content, level='info': False
             r2 = N.send("测试标题2", "测试正文2", "failure")
             st2 = (json.loads(N.STATE.read_text(encoding="utf-8"))
                    if N.STATE.exists() else {})
@@ -2018,7 +2069,7 @@ def test_notify_delivery_semantics() -> None:
                   json.dumps({"returned": a1, "state": st3}, ensure_ascii=False))
 
             # ④ 送达才记账，且当天不再重复
-            N._send_native = lambda title, content: True
+            N._send_native = lambda title, content, level='info': True
             a2 = N._alert_channel_expired(st3, cfg, time.time(), "session")
             a3 = N._alert_channel_expired(st3, cfg, time.time(), "session")
             check("告警送达 → 记下日期；当天第二次不再重复弹",
@@ -2031,6 +2082,21 @@ def test_notify_delivery_semantics() -> None:
             b1 = N._alert_channel_expired(st4, cfg, time.time(), "blocked")
             check("session 告警不影响 blocked 告警的额度", b1 is True,
                   json.dumps(st4, ensure_ascii=False))
+
+            # ⑥ ★ 2026-10-21：级别必须传到本机通道，失败才能选 Toast
+            seen_levels: list = []
+            N._send_native = lambda title, content, level="info": (
+                seen_levels.append(level), True)[1]
+            N.STATE.unlink(missing_ok=True)
+            N.send("失败标题", "失败正文", "failure")
+            N.send("到账标题", "到账正文", "success")
+            check("★ 级别被传给本机通道（失败要能走 Toast，到账才用常驻卡片）",
+                  seen_levels == ["failure", "success"], seen_levels)
+            _Nsrc = pathlib.Path(DIR / "notify.py").read_text(encoding="utf-8")
+            check("★ 失败 / 警告走会自动消失的 Toast（不是必须点 ✕ 的常驻卡片）",
+                  '"toast" if level in ("failure", "warning")' in _Nsrc)
+            check("★ 失败 / 警告不进补弹队列（否则同一条失败会被弹两遍）",
+                  "queue_on_miss=False if style else None" in _Nsrc)
 
             # ⑥ 状态文件被改坏（两个表不是 dict）时不得抛异常
             N.STATE.write_text('{"sent": [1,2], "local_sent": "oops"}', encoding="utf-8")
@@ -2921,6 +2987,23 @@ def test_notify_reshow() -> None:
         finally:
             W._run_toast = orig
 
+        # ③-b ★ 2026-10-21：同类消息按标题去重，只留最新一条。
+        #   失败告警的正文每次带「时间：…」，指纹条条不同；不去重的话，
+        #   同一件事失败 12 次就在队列里堆 12 条，用户回到机器前被 3+3+2 轮番糊屏
+        #   （10-21 的实际现场：11 条原发 + 8 条补弹）。
+        W._reshow_save([], logdir)
+        for i in range(6):
+            W._maybe_queue_reshow("WorkBuddy 积分补跑失败：签到、旅行",
+                                  "正文 时间：0{}".format(i), logdir, idle=9999)
+        check("同类消息按标题去重（6 条同类失败只留 1 条）",
+              len(W._reshow_load(logdir)) == 1,
+              str(len(W._reshow_load(logdir))))
+        kept = W._reshow_load(logdir)
+        check("去重保留的是最新那条（不是最早那条）",
+              bool(kept) and "05" in kept[0].get("body", ""),
+              kept[0].get("body", "")[:40] if kept else "(空)")
+        W._reshow_save([], logdir)      # 清空，不影响下面的上限与过期断言
+
         # ④ 上限与过期裁剪
         for i in range(W._RESHOW_MAX_ITEMS + 4):
             W._maybe_queue_reshow("t{}".format(i), "b", logdir, idle=9999)
@@ -3012,7 +3095,7 @@ def test_modal_alert() -> None:
                         encoding="utf-8")
                 return _FakeProc()
 
-            # 自检在 macOS 上运行时，真实 `platform()`/解释器探测会返回 mac 路径；
+            # 真实 `platform()`/解释器探测可能返回与预期不同的路径；
             # 这里只替换被 `_notify_windows_dialog` 实际调用的两个边界，保持产品逻辑不变。
             # ★ 2026-09-28 起换的是 `dialog_python`（弹窗专用、要求解释器真有 tkinter），
             #   不再是 `default_python` —— 后者只保证"是运行自己的那个解释器"。
@@ -3141,8 +3224,8 @@ def test_modal_alert() -> None:
         saved_platform = W.platform
         saved_idle_seconds = W.idle_seconds
         try:
-            # `native_notify` 先按平台选择通道；macOS 上需要模拟 Windows，
-            # 同时给补弹状态机一个数值型 idle，才能验证「弹窗失败 → Toast + 队列」。
+            # `native_notify` 内部按平台选通道（现在恒为 Windows），
+            # 这里仍然显式指定一次，同时给补弹状态机一个数值型 idle，才能验证「弹窗失败 → Toast + 队列」。
             W.platform = lambda: "win"
             W.idle_seconds = lambda: 9999.0
             W._notify_windows_dialog = lambda t, c, ld=None: True
@@ -3153,6 +3236,24 @@ def test_modal_alert() -> None:
             check("弹窗不可用 → 退回 Toast **并**进补弹队列（不丢消息）",
                   W.native_notify("t", "b", logdir) and len(W._reshow_load(logdir)) == 1,
                   str(len(W._reshow_load(logdir))))
+
+            # ★ 2026-10-21：失败通知专用组合 —— 走 Toast 且**不**进补弹队列。
+            #   失败重试 20 分钟一跳，进队列就是在用户回来时轮番补弹（10-21 现场）。
+            W._reshow_save([], logdir)
+            call_args: list = []
+            W._notify_windows = lambda t, c: (call_args.append(t), True)[1]
+            check("★ 指定 style=toast → 直接走 Toast（不再尝试常驻卡片）",
+                  W.native_notify("失败", "b", logdir, style="toast",
+                                  queue_on_miss=False)
+                  and call_args == ["失败"],
+                  str(call_args))
+            check("★ 且不进补弹队列（queue_on_miss=False 生效）",
+                  W._reshow_load(logdir) == [],
+                  str(len(W._reshow_load(logdir))))
+            check("★ 默认风格不受影响（到账类仍尝试常驻卡片，失败才退回队列）",
+                  W.native_notify("t2", "b", logdir) is True
+                  and len(W._reshow_load(logdir)) == 1,
+                  "队列 {} 条".format(len(W._reshow_load(logdir))))
         finally:
             W._notify_windows_dialog, W._notify_windows = orig_dlg, orig_toast
             W.platform = saved_platform
@@ -3213,7 +3314,7 @@ def test_cli() -> None:
         except Exception as e:  # noqa: BLE001
             check("status 运行结果字段可读", False, repr(e)[:300])
 
-    # install --dry-run 必须只生成 XML、不注册（否则在 mac 上会误报失败）
+    # install --dry-run 必须只生成 XML、不注册（否则在受限环境下会误报失败）
     with tmpdir() as td:
         xml_out = pathlib.Path(td) / "task.xml"
         try:
@@ -3281,14 +3382,14 @@ def test_online() -> None:
         data = json.loads(p.stdout or "{}")
         summary = data.get("summary") or {}
         fails = [c for c in (data.get("checks") or []) if c.get("level") == "FAIL"]
-        # 在 macOS 上跑 Windows 版，预期会有若干非 Windows 的 FAIL/SKIP
+        # 在受限环境（非 Windows / 无任务调度权限）下，预期会有若干相关的 FAIL/SKIP
         check("doctor.py --json 可解析", bool(summary),
               json.dumps(summary, ensure_ascii=False))
         check("诊断项数量合理", len(data.get("checks") or []) >= 15)
         check("在非 Windows 平台上不会因计划任务缺失而崩溃",
               all("schtasks" not in json.dumps(c, ensure_ascii=False) or True for c in fails))
         if fails:
-            check("（提示）macOS 上运行 Windows 版的预期 FAIL 项", True,
+            check("（提示）环境中预期出现的 FAIL 项", True,
                   "\n".join("{}: {}".format(f["check"], str(f["detail"])[:110])
                             for f in fails))
     except Exception as e:  # noqa: BLE001
@@ -3299,7 +3400,7 @@ def test_online() -> None:
 def test_notify_selfheal_paths() -> None:
     """补发自愈路径：收信箱 / 间隔限流 / 队列排空 / force 成功清状态（2026-09-29）。
 
-    为什么必须钉住（macOS 侧先行踩到的真实事故）：用户按告警提示给机器人发了消息，
+    为什么必须钉住（先行踩到的真实事故）：用户按告警提示给机器人发了消息，
     **补发那侧没有人在听** —— 补发路径从来不轮询入站，context_token 停在几天前，
     补发每 5 分钟硬撞一次 `prepare failed`，把当日 8 条配额烧光，
     等用户真去开窗时反而没配额可用。这一节把修法钉死：
@@ -3330,7 +3431,7 @@ def test_notify_selfheal_paths() -> None:
     # ★ 把「用户最后一次给机器人发消息的时刻」钉成已知值。默认实现 `_current_inbound_ts()`
     #   会去读真实的 clawbot_state.json —— 本机只要刚收到过微信消息（2026-10-02 10:55 就是），
     #   「已过 60 分钟」这类**造在过去**的场景就会被规则 1b（入站晚于上次失败 → 窗口已重开 →
-    #   放行）判成 0，断言随本机状态漂移。macOS 侧实跑时正是这样挂掉了一条。
+    #   放行）判成 0，断言随本机状态漂移。实跑时正是这样挂掉了一条。
     _real_inbound = N._current_inbound_ts
     _ib = {"ts": 0.0}
     N._current_inbound_ts = lambda: _ib["ts"]

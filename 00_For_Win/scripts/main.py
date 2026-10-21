@@ -184,10 +184,19 @@ def run_task(task: str) -> dict:
         try:
             cred = credentials.load_credentials()
         except credentials.CredentialError as e:
+            # ★ 2026-10-21：这条短路必须带 fail_kind="local"。
+            #   以前这里只拼 status/reason，把 fail_kind 丢了 → catchup 的
+            #   _is_local_fail() 永远判 False → 「客户端没起来」被当成业务失败：
+            #   烧满 12 次预算、每次等 20 分钟、每次都推一条失败通知。
+            #   10-19 修的 local 分类之所以没生效，就是因为踩在这个缺口上
+            #   （10-20 连发 12 条、10-21 连发 11 条，用户被打到关通知）。
+            #   三处必须一致：这里、checkin.run_checkin()、travel.run_travel()。
             err = {"checkin": {"task": "checkin", "status": "failed",
-                               "reason": "登录态读取失败：" + str(e)},
+                               "reason": "登录态读取失败：" + str(e),
+                               "fail_kind": "local"},
                    "travel": {"task": "travel", "status": "failed",
-                              "reason": "登录态读取失败：" + str(e)}}
+                              "reason": "登录态读取失败：" + str(e),
+                              "fail_kind": "local"}}
             _log_result("checkin", err["checkin"])
             return err
         pf = _preflight(cred)          # ① 先校验端点（不改变任何服务端状态）

@@ -10,9 +10,7 @@ credentials.py — WorkBuddy 积分助手 · 统一登录态读取（Phase 1）
   - 登录态结构使用 account.uid + auth.accessToken
 
 登录态只有一个来源：`workbuddy-desktop.info`（纯 Python 读取，无需任何外部运行时）。
-       macOS:   ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
        Windows: %LOCALAPPDATA%（优先）/ %APPDATA% 下的 CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
-       Linux:   ~/.config/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
        兜底：   ~/.workbuddy/auth/workbuddy-desktop.info（便携版 / 未知布局）
      结构：{ account: { uid, ... }, auth: { accessToken, refreshToken, expiresAt, ... }, ... }
 
@@ -65,7 +63,7 @@ import atrest  # noqa: E402
 
 SOURCE_DESKTOP_INFO = "workbuddy-desktop.info"
 
-# 候选登录态文件「存在但被系统拒读」（如 macOS 隐私保护/TCC）的记录，
+# 候选登录态文件「存在但被系统拒读」（如杀软 / 文件权限限制）的记录，
 # 仅用于生成准确的错误信息，不含任何敏感内容。
 _PERM_DENIED: list[str] = []
 
@@ -91,10 +89,6 @@ def _appdata() -> str:
 
 def _localappdata() -> str:
     return os.environ.get("LOCALAPPDATA", "")
-
-
-def _xdg_config() -> str:
-    return os.environ.get("XDG_CONFIG_HOME", os.path.join(_home(), ".config"))
 
 
 # ---------------------------------------------------------------------------
@@ -127,21 +121,16 @@ def desktop_info_candidates() -> list[str]:
         "CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info"
     )
     portable = os.path.join(_home(), ".workbuddy", "auth", "workbuddy-desktop.info")
-    if sys.platform == "darwin":
-        out = [os.path.join(_home(), "Library", "Application Support", rel)]
-    elif sys.platform == "win32":
-        out = []
-        # Local 优先（实测命中目录），再退 Roaming
-        for base in (_localappdata(), _appdata()):
-            if base:
-                p = os.path.join(base, rel)
-                if p not in out:
-                    out.append(p)
-        # 两个环境变量都取不到时保留一条，维持原有行为（不去猜其它路径）
-        if not out:
-            out = [os.path.join(_appdata(), rel)]
-    else:
-        out = [os.path.join(_xdg_config(), rel)]
+    out = []
+    # Local 优先（实测命中目录），再退 Roaming
+    for base in (_localappdata(), _appdata()):
+        if base:
+            p = os.path.join(base, rel)
+            if p not in out:
+                out.append(p)
+    # 两个环境变量都取不到时保留一条，维持原有行为（不去猜其它路径）
+    if not out:
+        out = [os.path.join(_appdata(), rel)]
     if portable not in out:
         out.append(portable)
     return out
@@ -244,9 +233,9 @@ def load_credentials() -> dict:
         return cred
     if _PERM_DENIED:
         raise CredentialError(
-            "登录态文件存在但被系统拒绝读取（权限/隐私保护，如 macOS TCC）："
+            "登录态文件存在但被系统拒绝读取（权限/杀软拦截）："
             + "；".join(_PERM_DENIED)
-            + "。请给运行终端授权「完全磁盘访问」，或改在 WorkBuddy 自动化/桌面端上下文运行。"
+            + "。请把该文件所在目录加入杀软白名单，或改在 WorkBuddy 自动化/桌面端上下文运行。"
         )
     if _ENCRYPTED_FOUND:
         raise CredentialError(

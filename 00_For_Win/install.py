@@ -3,13 +3,10 @@
 """
 install.py — 注册 / 卸载 / 查看 Windows 计划任务（Task Scheduler）
 
-这是 macOS 版 `com.workbuddy.wb-reward-catchup.plist`（LaunchAgent）的 Windows 等价物。
-
-    macOS                                  Windows
-    ─────────────────────────────────────  ─────────────────────────────────────────
-    ~/Library/LaunchAgents/*.plist         计划任务「WorkBuddyRewardCatchup」
-    launchctl bootstrap                    schtasks /Create /XML
-    RunAtLoad=true                         LogonTrigger（登录后延迟 1 分钟跑一次）
+    注册方式   schtasks /Create /XML（XML 由本文件生成，UTF-16 写出）
+    触发器     LogonTrigger（登录后延迟 1 分钟）+ 每 5 分钟重复
+    补跑       StartWhenAvailable=true（错过的时间窗开机后补跑）
+    运行用户   当前登录用户（LeastPrivilege，不需要管理员）
     StartInterval=300                      CalendarTrigger + Repetition PT5M
     launchd 唤醒后补发过期任务              StartWhenAvailable=true ← 等价物
     （launchd 无对应项）                    DisallowStartIfOnBatteries=false ← 必须显式关，
@@ -26,7 +23,7 @@ install.py — 注册 / 卸载 / 查看 Windows 计划任务（Task Scheduler）
   1. **默认「仅在使用交流电时启动」** —— Windows 计划任务的默认值是 true，
      笔记本用电池时任务会被静默跳过，且不会报错。必须显式设 false。
   2. **默认不补跑错过的触发** —— `StartWhenAvailable` 默认 false。
-     不打开就退化成「必须整点开机才跑」，比 mac 版弱得多。必须设 true。
+     不打开就退化成「必须恰好在触发点开机才跑」。必须设 true。
   3. **cmd/PowerShell 的中文与引号** —— 任务 XML 用 **UTF-16 编码**写出，
      彻底避开代码页问题；解释器与脚本路径**一律带引号**（路径里常含空格与中文）。
      执行体用 `pythonw.exe`（无控制台）→ 不闪黑窗，输出自动落到 `logs/stdio.log`。
@@ -49,7 +46,7 @@ install.py — 注册 / 卸载 / 查看 Windows 计划任务（Task Scheduler）
     python install.py enable / disable   # 启用 / 停用（不删除）
     python install.py trigger            # 让主任务立即执行一次（验证任务本身可运行）
 
-★ 会注册**四个**任务（对应 mac 版是两个 plist + 系统的维护唤醒）
+★ 会注册**四个**任务（职责各不相同，任何一个都不能少）
   1. WorkBuddyRewardCatchup   —— 每 5 分钟；真正干活的主脚本（WakeToRun=false）
   2. WorkBuddyRewardWatchdog  —— 每 30 分钟；只盯主脚本还活着没，异常时弹本机通知
   3. WorkBuddyRewardWake      —— 每天 07:00 一次；WakeToRun=true，
@@ -60,8 +57,9 @@ install.py — 注册 / 卸载 / 查看 Windows 计划任务（Task Scheduler）
   被停用/删除、Python 被卸载、项目目录被移走，主脚本会**连告警机制一起静默死掉**。
   唯一出路就是一个完全独立的第二个任务（不共享任何代码）来盯它。
 
-本文件不依赖 Windows —— 在 mac/linux 上也能跑 `install.py install --dry-run`
-查看生成的 XML，便于先在 mac 上审阅（自检脚本 selftest.py 就是这么做的）。
+本文件不依赖 Windows —— 在非 Windows 上也能跑 `install.py install --dry-run`
+查看生成的 XML（自检脚本 selftest.py 就是这么做的）；真要注册时由
+`windows_guard()` 拦住并说明原因。
 """
 
 from __future__ import annotations
@@ -84,7 +82,7 @@ import winenv  # noqa: E402
 import paths   # noqa: E402
 
 DEFAULT_TASK_NAME = "WorkBuddyRewardCatchup"
-# 5 分钟：与 mac 版 plist 的 StartInterval=300 对齐。
+# 5 分钟：触发周期越长，「事件发生后被发现」的延迟就越大。
 # 为什么这么密：触发周期的唯一价值是「事件发生后多快被发现」；闸门未开时
 # 只做本地判断就退出、零网络请求，所以代价极小，换来「到达即领」的精度。
 DEFAULT_INTERVAL_MIN = 5
@@ -119,7 +117,7 @@ TASK_XML = paths.cache_path("task.xml")  # 注册时实际提交的 XML（UTF-16
 ENTRY = DIR / "catchup.py"
 LOG = paths.log_path("catchup.log")
 
-# ── 第二个计划任务：watchdog（对应 mac 版 com.workbuddy.wb-reward-watchdog.plist）──
+# ── 第二个计划任务：watchdog（盯主脚本是否还活着）──
 # 它盯的是「主脚本还活着没」，所以必须与主任务**完全独立**：不同的脚本、
 # 不同的任务名、不同的触发周期。30 分钟一次的采样，足够在 90 分钟心跳阈值附近
 # 及时报警，又不会因为自己太频繁而变成噪音源。
@@ -130,7 +128,7 @@ DEFAULT_WATCHDOG_INTERVAL_MIN = 30
 WATCHDOG_LOG = paths.log_path("watchdog.log")
 
 # ── 第三个计划任务：每日唤醒 ────────────────────────────────────────────────
-# 存在的唯一理由：让 Windows 也能做到 mac 那样的「睡着也能签到」。
+# 存在的唯一理由：让电脑睡着时也能把它叫醒签到。
 # 为什么必须是独立任务：`<WakeToRun>` 作用于该任务的**所有**触发器，而主任务是
 # 每 5 分钟重复的 —— 给它开唤醒等于每 5 分钟把电脑叫醒一次，比不设还糟。
 # 所以这件事只能交给一个「每天只触发一次」的任务。
@@ -794,7 +792,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     #     · 非 Windows 上会先在项目里留下一堆 XML 才报错（本不该有的副作用）；
     #     · Windows 上自检本想验证「非 Windows 会失败」，却因为机器真在 Windows 上
     #       而**真的注册并覆盖了一个计划任务** —— 一个自检不该改系统。
-    #   dry-run 不受影响：它的契约就是「只生成 XML 不注册，可在 mac 上审阅」。
+    #   dry-run 不受影响：它的契约就是「只生成 XML 不注册」，便于先审阅。
     if not args.dry_run:
         blocked = windows_guard("注册计划任务（只想生成 XML 审阅请加 --dry-run）")
         if blocked:

@@ -25,7 +25,7 @@ notify.py — 统一通知模块（微信直推 + 本机桌面通知兜底）—
   notify_warning         警告（如当前无活动）是否推送，默认 true
   notify_noop            空转（当日已完成）是否推送，默认 false
   native_notification    微信不可用时是否补一条**本机桌面通知**，默认 true
-  macos_notification     同上，旧字段名（两套兼容，任一设为 false 即关闭）
+  macos_notification     同上的历史字段名（仅为兼容老配置；任一为 false 即关闭）
   dedupe_window_minutes  同一内容去重窗口（分钟），默认 360；0 关闭
   max_pushes_per_day     微信通道每日推送上限，默认 8（iLink 硬上限 10）
   clawbot_cooldown_minutes          登录会话失效（-14）后的熔断，默认 120
@@ -60,14 +60,15 @@ notify.py — 统一通知模块（微信直推 + 本机桌面通知兜底）—
   凭据只从本地配置读取（clawbot 凭据复用 WorkBuddy 的 settings.json）：
   不打印、不写日志、不进代码。
 
-★ 与 macOS 版的差异：
-  1. 本机通知：`_send_native()` 走 `winenv.native_notify()`（Windows Toast /
-     macOS 通知中心），不再直接 exec osascript。**这是唯一的功能性差异。**
-  2. 配置项新增 `native_notification`，与旧名 `macos_notification` 双向兼容。
+★ 本机通知的实现：
+  `_send_native()` 走 `winenv.native_notify()`（Windows 弹窗 / Toast），
+  不直接 exec 任何外部通知命令。所有平台差异都收敛在 `winenv.py`。
+  配置项 `native_notification` 在历史版本里另有旧名 `macos_notification`，
+  两者仍双向兼容（任一为 false 即关闭），以免老配置文件失效。
 
-自测（Windows 上把 `python3` 换成 `py -3`）：
-  python3 notify.py            # 真实发送一条测试通知（退出码看"微信是否真送到"）
-  python3 notify.py status     # 查看配置、配额（发起数 / 送达数分开）、本机通知自测
+自测：
+  py -3 notify.py            # 真实发送一条测试通知（退出码看"微信是否真送到"）
+  py -3 notify.py status     # 查看配置、配额（发起数 / 送达数分开）、本机通知自测
   python3 notify.py localtest  # 只测本机兜底通知，不碰微信、不消耗配额
 """
 
@@ -124,7 +125,7 @@ DEFAULT_CONFIG = {
     # 最小间隔明显大于熔断检查频率（每 5 分钟一次），避免把长连接一直挂在后台。
     "clawbot_recover_window_seconds": 25,
     "clawbot_recover_min_interval_minutes": 15,
-    # 「投递被拒」状态下两次**补发**之间的最小间隔（分钟）。2026-09-29 新增，与 macOS 侧同步。
+    # 「投递被拒」状态下两次**补发**之间的最小间隔（分钟）。2026-09-29 新增。
     # 原因见 _blocked_state_skip_send：失败请求同样烧 iLink 配额，补发若无节制地每 5 分钟
     # 重试一次，几小时就能把当日额度烧光，等用户真去开窗时反而没配额可用。
     # 240 分钟按配额反推：每天最多 6 次补发 + 2 次正常到账通知 = 8，
@@ -514,21 +515,33 @@ def _send_via(channel: str, cfg: dict, title: str, content: str) -> tuple[bool, 
 def _native_enabled(cfg: dict) -> bool:
     """是否允许降级到本机桌面通知。
 
-    `native_notification` 为规范字段名，`macos_notification` 为旧字段名（两套兼容）。
-    任一显式设为 false 即关闭 —— 这样老配置文件里的 `macos_notification: false`
-    在 Windows 上依然生效，不会因为换了平台就悄悄开始弹通知。
+    `native_notification` 为规范字段名，`macos_notification` 是历史字段名
+    （仅在老配置文件里出现过，为兼容而保留）。任一显式设为 false 即关闭 ——
+    这样一份从旧版沿用下来的配置里若写着 `macos_notification: false`，
+    不会因为换了实现就悄悄开始弹通知。
     """
     return bool(cfg.get("native_notification", True)) and bool(cfg.get("macos_notification", True))
 
 
-def _send_native(title: str, content: str) -> bool:
+def _send_native(title: str, content: str, level: str = "info") -> bool:
     """本机桌面通知兜底。
 
-    ★ Windows 差异：平台差异（Windows Toast / macOS 通知中心 / Linux notify-send）
-      全部封装在 `winenv.native_notify()`；投递失败时内容仍会落进
-      `logs/notify_fallback.log`，保证信息不丢。
+    ★ 平台差异（弹窗 / Toast）全部封装在 `winenv.native_notify()`；投递失败时
+      内容仍会落进 `logs/notify_fallback.log`，保证信息不丢。
+
+    ★ 2026-10-21：**失败/警告走会自动消失的 Toast，且不进补弹队列**。
+      以前所有级别都用「必须点 ✕ 才消失」的常驻卡片，于是：失败重试 20 分钟
+      一跳，屏幕上最多堆 3 张（`_DIALOG_MAX`），第 4 条起全部退成 Toast 并进
+      补弹队列 —— 用户回到机器前，8 条同类失败被 3+3+2 轮番补弹出来。
+      失败本身已在 catchup 侧按「同类每 3 小时一条」节流，不需要再靠补弹保证
+      被看见；真要看细节，doctor 和日志里都有。
     """
-    return winenv.native_notify(title, content, log_dir=paths.LOG_DIR)
+    style = "toast" if level in ("failure", "warning") else None
+    return winenv.native_notify(
+        title, content, log_dir=paths.LOG_DIR,
+        style=style,
+        queue_on_miss=False if style else None,
+    )
 
 
 def _reg_get(path: str, name: str):
@@ -574,8 +587,7 @@ def local_check() -> dict:
     而它失效的方式全都无声无息（配置关掉、系统 Toast 关掉、专注助手压掉）。
     """
     cfg = load_config()
-    backend = ("windows-toast" if winenv.IS_WIN else
-               "macos-notification-center" if winenv.IS_MAC else "notify-send")
+    backend = "windows-toast"
     out: dict = {"enabled": _native_enabled(cfg), "backend": backend}
 
     toast = None
@@ -654,7 +666,7 @@ def _alert_channel_expired(st: dict, cfg: dict, now: float, kind: str = "session
 
 def _recapture_and_resend(cfg: dict, title: str, content: str,
                           st: dict, now: float) -> tuple[bool, str]:
-    """「投递被拒 / 缺 context_token」的自动自愈（2026-09-25 新增，与 macOS 版同构）。
+    """「投递被拒 / 缺 context_token」的自动自愈（2026-09-25 新增）。
 
     背景：主动推送依赖本地捕获的 context_token，而捕获此前是**纯手动**操作
     （py -3 clawbot.py wait）。主动推送的闸门是**服务端会话窗口**：窗口一关，
@@ -725,10 +737,10 @@ def _enqueue_pending(st: dict, level: str, title: str, content: str, now: float)
 def _blocked_state_skip_send(cfg: dict, st: dict, now: float, refreshed: bool) -> int:
     """「投递被拒」状态下是否应当**跳过**本次补发发送；返回还要等几分钟（0 = 照发）。
 
-    ★ 2026-09-29 新增，与 macOS 侧同步（macOS 先踩到同一个坑，Windows 结构同构，故一并修）。
+    ★ 2026-09-29 新增（另一份结构相同的实现先踩到这个坑，故一并修）。
 
     真实故障：`prepare failed` = 服务端拒绝为这条**主动消息**建立会话（会话窗口已关），
-    而失败请求**同样计入 iLink 配额**。macOS 侧当天 08:05 冷却一结束，补发就每 5 分钟
+    而失败请求**同样计入 iLink 配额**。实测当天 08:05 冷却一结束，补发就每 5 分钟
     重试一次，3 次把当日 8 条配额烧光 —— 等用户 09:31 真按提示发了消息，反而没配额可用了。
 
     规则（顺序即优先级）：
@@ -740,7 +752,7 @@ def _blocked_state_skip_send(cfg: dict, st: dict, now: float, refreshed: bool) -
          `clawbot_blocked_retry_minutes` 就跳过。
 
     为什么用「间隔」而不是「必须捕获到入站消息才发」：实测存在**自发恢复** ——
-    令牌本身是耐用的会话句柄（macOS 侧同一枚 09-25 09:45 的令牌，在 09-27 与 09-29
+    令牌本身是耐用的会话句柄（同一枚 09-25 09:45 的令牌，在 09-27 与 09-29
     两次都发送成功），能否发出去只取决于服务端的会话窗口何时重开，而那一刻本地不一定
     捕捉得到。硬性要求"捕获到入站"会把自发恢复这条路堵死；
     按间隔限流则既省配额、又保留撞上窗口重开的机会。
@@ -767,7 +779,7 @@ def _blocked_state_skip_send(cfg: dict, st: dict, now: float, refreshed: bool) -
     #     为什么不能只看 `refreshed`：入站消息可能已被**别的路径**收走（上一轮 tick / renew.py /
     #     手工探测），游标一前进，本次轮询就永远看不到它，refreshed 恒为 False —— 用户明明
     #     按提示发完了消息，却仍要干等满 `clawbot_blocked_retry_minutes`。
-    #     macOS 侧 2026-10-02 实测踩到：10:55 已捕获到入站，flush 还是以「215 分钟后再试」跳过，
+    #     2026-10-02 实测踩到：10:55 已捕获到入站，flush 还是以「215 分钟后再试」跳过，
     #     那条到账通知白压了 4 小时。
     #     配额安全：失败后 last_send_error_ts 会前进，同一枚入站最多只放行一次。
     if last > 0 and _current_inbound_ts() > last:
@@ -791,7 +803,7 @@ def flush_pending(day_done: bool = False) -> dict:
     success（到账）不受影响：领到多少分是既成事实，晚到也比漏掉好。
     （warning / info 根本不会入队，见 send() 末尾的入队条件，故这里无需处理。）
 
-    ★ 2026-09-29 新增「补发前先收一次信箱」（与 macOS 侧同步）：入站消息是本地判断
+    ★ 2026-09-29 新增「补发前先收一次信箱」：入站消息是本地判断
     **会话窗口是否重开**的唯一信号 —— 窗口才是能否主动推送的闸门，不是 context_token
     本身。此前只有 send() 失败后的自愈窗口会捕获（见 _recover_while_cooling /
     _recapture_and_resend），而**补发路径从不轮询** → 用户按告警提示发了消息也没有任何人
@@ -825,7 +837,7 @@ def flush_pending(day_done: bool = False) -> dict:
     cutoff = now - 48 * 3600
     # 已经送到过微信的指纹。这些条目若继续留在队列里会**永久卡住**：
     # 再发一次会被 `_dedupe_lookup` 拦下（返回 wechat=False），于是既排不空队列、
-    # 又让每次 catchup 都白跑一遍补发分支。2026-09-29（macOS 侧）实测踩到 ——
+    # 又让每次 catchup 都白跑一遍补发分支。2026-09-29 实测踩到 ——
     # 手工 force 补发两条后，pending 仍是 2 条、sent 表里已有这两条指纹，
     # 队列只能靠人工清；下一次 flush 甚至会被误记成"补发失败"。
     # 送达过的就是送达过了，无论由哪条路径送出去的。
@@ -908,7 +920,7 @@ def send(title: str, content: str, level: str = "info", force: bool = False,
         if block_local:
             out["reason"] += "；本机通知此前已弹过，不重复弹（微信通道恢复后会自动补发）"
             return False
-        if _send_native(title, content):
+        if _send_native(title, content, level):
             out["channel"] = out["channel"] or "native"
             out["reason"] += "；已降级为本机通知"
             return True
@@ -984,7 +996,7 @@ def send(title: str, content: str, level: str = "info", force: bool = False,
 
         # ClawBot 熔断：成功则解除冷却；**任何失败**都进入冷却，避免无谓重试（见上方长注释）
         #
-        # 判据是 `not force or ok` 而不是 `not force`（2026-09-29 修，与 macOS 侧同步）：
+        # 判据是 `not force or ok` 而不是 `not force`（2026-09-29 修）：
         # force=True 只该跳过"失败后的冷却"，不该在**成功**时把过期的失败标记留在状态里。
         # 踩过的坑：手工 force 补发成功后，`last_send_error` 仍停在几个小时前的
         # 「投递被拒」，于是 `_blocked_state_skip_send` 认定通道仍被拒，
@@ -1128,8 +1140,7 @@ if __name__ == "__main__":
             "notify_noop": cfg.get("notify_noop"),
             "native_notification": _native_enabled(cfg),
             "macos_notification": cfg.get("macos_notification"),
-            "native_notify_backend": "windows-toast" if winenv.IS_WIN else (
-                "macos-notification-center" if winenv.IS_MAC else "notify-send"),
+            "native_notify_backend": "windows-toast",
             "local_notify_check": local_check(),
             "dedupe_window_minutes": cfg.get("dedupe_window_minutes"),
             "max_pushes_per_day": cfg.get("max_pushes_per_day"),
