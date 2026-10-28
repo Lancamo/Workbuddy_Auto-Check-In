@@ -193,6 +193,16 @@ case "${1:-install}" in
       [ -f "$DIR/$f" ] || { echo "✗ 缺少 $f —— 本文件夹不完整"; local_ok=0; }
     done
     [ -d "$DIR/scripts" ] || { echo "✗ 缺少 scripts/ 目录"; local_ok=0; }
+    # ima 签到是可选模块（缺了主任务照跑，只是不领算力），但缺了要明说
+    [ -f "$DIR/scripts/ima.py" ] || echo "⚠ 缺少 scripts/ima.py —— ima 算力签到会被跳过"
+    # 桌宠锁定同理：缺了只影响「派哪只猫」，旅行照常
+    [ -f "$DIR/scripts/buddy.py" ] || echo "⚠ 缺少 scripts/buddy.py —— 不会核对/纠偏在岗猫"
+    # 成长任务同理：缺了只是不自动接受/领取任务，签到与旅行照常
+    [ -f "$DIR/scripts/tasks.py" ] || echo "⚠ 缺少 scripts/tasks.py —— 成长任务不会被自动接受/领取"
+    # 成长空间兑现同理：缺了只是连登兑换/补登/抽奖/开盒都不会自动做（会白丢当月额度）
+    [ -f "$DIR/scripts/growth.py" ] || echo "⚠ 缺少 scripts/growth.py —— 连登兑换/补登/抽奖/开盒不会自动兑现"
+    # 晚间看门狗同理：缺了只是不再提醒「今天热力墙没点亮」，连登仍有断掉的风险
+    [ -f "$DIR/scripts/activity_watch.py" ] || echo "⚠ 缺少 scripts/activity_watch.py —— 晚上不会提醒你点亮热力墙（连登可能断）"
     [ "$local_ok" -eq 1 ] || exit 1
 
     PYTHON="$(detect_python)" || {

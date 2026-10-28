@@ -102,6 +102,26 @@ MSG_TYPE_BOT = 2
 MSG_STATE_FINISH = 2
 ITEM_TYPE_TEXT = 1
 
+# 微信端的换行：纯文本里的 `\n` 会被按 Markdown「软换行」渲染成一个**空格**，
+# 整条消息挤成一段（实测 2026-10-22，五种写法逐一对照得出）：
+#   `\n`           → 空格（不可用）
+#   `"  \n"`       → 空格（不可用，WeChat 不按 Markdown 硬换行处理）
+#   `"\n\n"`       → 真换行，但多出一个空行（可用，太松）
+#   `U+200B\n`     → 空格（不可用）
+#   `U+2028`       → 真换行，无多余空行 ✅ 采用
+# 另外「拆成多个 text item」这条路服务端直接拒（ret=-2 invalid arguments），
+# item_list 只接受单条文本 —— 所以只能靠分隔符本身。
+LINE_BREAK = "\u2028"
+
+
+def wx_text(text: str) -> str:
+    """把常规换行换成微信真能渲染的 `U+2028`。
+
+    放在投递层做，而不是让每个调用方各自拼 —— 这是**通道的渲染特性**，不是内容决策：
+    任何经过 ClawBot 的文字（通知、告警、续期提醒）都应该分行，没有例外。
+    """
+    return text.replace("\r\n", "\n").replace("\n", LINE_BREAK)
+
 
 # ---------------------------------------------------------------------------
 # 凭据：优先用本机 login 得到的，其次复用 WorkBuddy 的
@@ -463,7 +483,8 @@ def send_text(text: str, *, timeout: int = 20, use_context: bool = True) -> tupl
                                               random.randrange(16 ** 6)),
         "message_type": MSG_TYPE_BOT,
         "message_state": MSG_STATE_FINISH,
-        "item_list": [{"type": ITEM_TYPE_TEXT, "text_item": {"text": text}}],
+        "item_list": [{"type": ITEM_TYPE_TEXT,
+                       "text_item": {"text": wx_text(text)}}],
     }
     ctx = _load_state().get("context_token") if use_context else None
     if ctx:

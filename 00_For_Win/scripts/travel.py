@@ -10,11 +10,18 @@ travel.py — WorkBuddy 积分助手 · Buddy旅行（派猫猫）模块（Phase
   1. 查询旅行状态（GET /activity/growth/buddy/travel/status）
   2. 按状态决策（幂等，先领后派）：
        state = arrived   → POST /activity/growth/buddy/travel/claim {}（领取奖励）
-       state = idle      → daily_limit_reached=false → POST depart {"location_id":1}（固定咖啡馆）
+       state = idle      → daily_limit_reached=false → 先核对在岗猫（buddy.ensure_duty）
+                           → POST depart {"location_id":1}（固定咖啡馆）
                            daily_limit_reached=true  → 返回今日旅行次数已完成，不派遣
        state = traveling → 返回旅行中，不重复派遣
        未知 state        → failed
   3. 返回结构化结果（绝不含 token / 完整请求头 / 敏感用户信息）
+
+关于「派哪只猫」（2026-10-28 加）：
+  depart 接口**没有指定桌宠的参数**，服务端永远派 buddy/info 里的 current_buddy。
+  所以「指定猫出门」只能在派遣前把在岗猫换过去（见 scripts/buddy.py）。
+  注意：旅行奖励区间来自地点配置（4 个地点一致：5–10），**与桌宠品级无关**，
+  锁定常驻猫是为了观感一致与避免被意外换掉，不产生额外积分。
 
 接口契约（host 为 www.workbuddy.cn）：
   - GET  /activity/growth/buddy/travel/status
@@ -49,6 +56,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import api_discovery  # noqa: E402  仅用它的「路由不存在」判别（端点漂移）
 import credentials  # noqa: E402
 import http_client  # noqa: E402
+
+# 桌宠锁定是**可选**模块：它坏了只影响「派哪只猫」，不该拦住旅行本身。
+# 顶部裸 import 一旦抛错会让 travel 整个起不来，所以兜住退化成「用当前在岗猫」。
+try:
+    import buddy  # noqa: E402  在岗猫核对/纠偏（见 scripts/buddy.py）
+    BUDDY_IMPORT_ERROR = None
+except Exception as _e:  # noqa: BLE001
+    buddy = None
+    BUDDY_IMPORT_ERROR = repr(_e)
 
 TRAVEL_HOST = "https://www.workbuddy.cn"   # 默认候选（保留向后兼容）
 TRAVEL_HOSTS = ("https://www.workbuddy.cn", "https://copilot.tencent.com")
@@ -136,6 +152,28 @@ def resolve_host(cred: dict, timeout: int = http_client.DEFAULT_TIMEOUT) -> str:
     return cands[0]
 
 
+def _ensure_duty(cred: dict, host: str, timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
+    """派遣前核对在岗猫；被换掉了就纠偏回来。
+
+    为什么只放在「派遣前」这一刻：旅行接口（`travel/depart`）只接受 location_id，
+    服务端永远派**当前在岗**的那只 —— 想让指定的猫出门，唯一手段是先换在岗猫。
+    而每天只有一次派遣机会，所以纠偏时机只有「派之前」，平时不必去动它
+    （否则用户白天手动换猫会被我们反复改回去，等于抢控制权）。
+
+    任何异常都退化成「不纠偏照常派遣」：猫是派出去才有积分，纠偏失败不该让
+    今天直接归零（而且奖励与品级无关，见 buddy.py）。
+    """
+    if buddy is None:
+        return {"status": "skipped", "reason": "桌宠模块不可用：" + str(BUDDY_IMPORT_ERROR)}
+    try:
+        cfg = buddy.load_config()
+        return buddy.ensure_duty(
+            host=host, token=cred.get("access_token", ""), uid=cred.get("uid", ""),
+            prefer_name=cfg.get("prefer_name") or "", timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "failed", "reason": repr(e)[:200]}
+
+
 def run_travel(timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
     """执行一次旅行状态机（单次检查+决策），返回统一结构化结果。"""
 
@@ -200,7 +238,8 @@ def run_travel(timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
         if daily_limit_reached:
             # 今日已达派遣上限：不派遣
             return _result("daily_limit_reached", message="今日旅行次数已完成")
-        # 未达上限 → 派遣（固定咖啡馆）
+        # 未达上限 → 先把在岗猫纠到目标猫，再派遣（固定咖啡馆）
+        duty = _ensure_duty(cred, host, timeout)
         try:
             d_code, d_body = http_client.post_json(
                 host + DEPART_PATH, body={"location_id": LOCATION_ID},
@@ -209,12 +248,14 @@ def run_travel(timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
             )
         except http_client.HttpTransportError as e:
             return _result("failed", reason="depart 失败（网络异常）：" + str(e),
-                           fail_kind="net")
+                           fail_kind="net", duty=duty)
         if d_code == 401:
             return _result("failed", reason="depart 返回 401（令牌失效），停止本轮",
-                           fail_kind="auth")
+                           fail_kind="auth", duty=duty)
         if d_body.get("code") != 0:
-            return _biz_fail("depart", d_body.get("code"), d_body)
+            res = _biz_fail("depart", d_body.get("code"), d_body)
+            res["duty"] = duty
+            return res
         dd = d_body.get("data") or {}
         loc = dd.get("location") or {}
         return _result(
@@ -222,6 +263,7 @@ def run_travel(timeout: int = http_client.DEFAULT_TIMEOUT) -> dict:
             record_id=dd.get("record_id"),
             location=loc.get("name"),
             arrive_at=dd.get("arrive_at"),
+            duty=duty,
         )
 
     if state == STATE_TRAVELING:

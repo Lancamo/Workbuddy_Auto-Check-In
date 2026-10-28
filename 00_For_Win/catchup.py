@@ -73,12 +73,46 @@ import api_discovery  # noqa: E402  接口前置校验（从本机客户端现�
 import notify        # noqa: E402  同目录通知模块（微信推送 + 本机通知兜底）
 import renew         # noqa: E402  同目录续期守护（ClawBot 会话快到期时提醒用户发消息）
 
+# ── 五个可选模块（2026-10-28 从 Mac 侧同步）──────────────────────────────
+# 逐个独立 try/except，理由一致：它们都不是「每天必拿的那部分」。
+# 签到与旅行坏了才是事故；这五个坏了只该少一笔收益，不能连累主流程起不来。
+# 顶部裸 import 一旦抛错会让整个 catchup 挂掉，所以一律兜住并记下原因。
+try:
+    import ima       # noqa: E402  ima 每日签到（独立账号体系，见 scripts/ima.py）
+    IMA_IMPORT_ERROR = None
+except Exception as _e:  # noqa: BLE001
+    ima = None
+    IMA_IMPORT_ERROR = repr(_e)
+
+try:
+    import tasks     # noqa: E402  成长任务自动接受/领取（见 scripts/tasks.py）
+    TASKS_IMPORT_ERROR = None
+except Exception as _e:  # noqa: BLE001
+    tasks = None
+    TASKS_IMPORT_ERROR = repr(_e)
+
+try:
+    import growth    # noqa: E402  成长空间收益兑现（见 scripts/growth.py）
+    GROWTH_IMPORT_ERROR = None
+except Exception as _e:  # noqa: BLE001
+    growth = None
+    GROWTH_IMPORT_ERROR = repr(_e)
+
+try:
+    import activity_watch    # noqa: E402  晚间活跃看门狗（见 scripts/activity_watch.py）
+    ACTIVITY_IMPORT_ERROR = None
+except Exception as _e:  # noqa: BLE001
+    activity_watch = None
+    ACTIVITY_IMPORT_ERROR = repr(_e)
+
 WINDOW1 = 700       # 07:00 签到 + 派遣（「≥ 时间」语义，过了点补跑）
 QUIET_FROM = 700    # 07:00 —— 在此之前完全静默（见 _quiet_now）
 MAX_TRIES = 12      # 单事项最多真实尝试次数（业务层失败：401 / 接口错误等）
 MIN_RETRY_GAP_MIN = 20   # 两次真实尝试之间的最小间隔（分钟）
 NET_RETRY_GAP_MIN = 30   # 网络层失败的重试间隔（分钟）—— 网络失败不烧配额，低频重试到当天结束
 PROBE_GAP_MIN = 30       # 业务预算耗尽后的只读探测间隔（分钟）—— 探测恢复
+TASKS_GAP_MIN = 60       # 成长任务巡检间隔（分钟）—— 见 _maybe_run_tasks
+GROWTH_GAP_MIN = 60      # 成长空间兑现间隔（分钟）—— 见 _maybe_run_growth
 
 # ── 本地环境未就绪（2026-10-19 加）────────────────────────────────────────
 # Windows 侧 accessToken 要靠**扫 WorkBuddy 进程内存**取 at-rest 密钥才能解开，
@@ -132,6 +166,25 @@ def log(msg: str) -> None:
     # ★ Windows 差异：显式 UTF-8（Windows 默认 GBK，中文日志会乱码/报错）
     with LOG.open("a", encoding="utf-8", errors="replace") as f:
         f.write(f"[{datetime.datetime.now():%F %T}] {msg}\n")
+
+
+def _log_once_a_day(key: str, msg: str) -> None:
+    """同一个「良性状态」每天只记一次日志。
+
+    为什么需要：触发频率是 5 分钟一次（288 次/天）。像「ima 未配置凭据」这种
+    **正常状态**若每轮都写一行，一天 288 行，`rotate_log` 只留 800 行 ——
+    两天就把真正有用的历史挤没了，排查时反而看不到东西。
+    只用于「持续存在的良性状态」；**真错误仍然每轮照写**，那是要看清楚的信号。
+    """
+    today = datetime.date.today().isoformat()
+    try:
+        flag = paths.cache_path("once_{}.day".format(key))
+        if flag.exists() and flag.read_text(encoding="utf-8").strip() == today:
+            return
+        flag.write_text(today, encoding="utf-8")
+    except OSError:
+        pass          # 写标记失败就照常记（宁可多一条，也不要漏掉状态）
+    log(msg)
 
 
 def _load_state() -> dict:
@@ -294,42 +347,186 @@ def _short_reason(res: dict) -> str:
     return raw if len(raw) <= 160 else raw[:160] + "…"
 
 
-def _fmt_checkin(c: dict, done: bool = False) -> str:
+def _fmt_checkin(c: dict, done: bool = False, month_days: int | None = None) -> str:
+    """签到的**正文行**（不含「1、WorkBuddy 签到：」标题，标题由 `_compose` 加）。
+
+    2026-10-28：这里的「连续 N 天」改成**本月**连登天数（`month_days`，来自成长空间的
+    streak 接口）——连登兑换（7/14/28 天档）与补登卡都按这个口径算，正文放同一个数，
+    用户才能对上账。跨月累计的连签成绩挪到消息标题（见 `_snapshot_title`）。
+    两个数不是一回事：签到接口的 streak_days 是累计（10-28 报 29），
+    成长空间的连登是本月的（同日 28），每月 1 日清零。
+    """
     st = c.get("status")
+    if not st:                      # 本轮没去查签到（只有旅行要处理）
+        return "今日已到账（本轮未重查）" if done else "待领取（07:00 后自动签到）"
     # done：state 里已记为完成，本次 failed 只是整批调用被网络故障拖挂，不代表没领到
     if done and st == "failed":
-        return "签到：今日已到账（本次查询失败，积分不受影响）"
+        return "今日已到账（本次查询失败，积分不受影响）"
     if st == "success":
-        return "签到：+{} 积分{}".format(
+        body = "成功，+{} 积分{}".format(
             c.get("credit") if c.get("credit") is not None else "?", _act(c))
+        if month_days:
+            body += "，本月连续签到 {} 天".format(month_days)
+        return body
     if st == "already_checked":
-        return "签到：今日已领过{}".format(_act(c))
+        return "今日已领过{}".format(_act(c))
     if st == "no_activity":
-        return "签到：当前没有进行中的活动（空档期不计积分）"
+        return "当前没有进行中的活动（空档期不计积分）"
     if st == "suspect":
-        return "签到：⚠️ 接口返回的数据全为零，无法确认活动状态"
+        return "⚠️ 接口返回的数据全为零，无法确认活动状态"
     if st == "failed":
-        return "签到：失败 —— {}".format(_short_reason(c))
-    return "签到：未执行"
+        # ★ Win 保留 `_short_reason`：Mac 直接印原始 reason，而 Windows 的 local 失败
+        #   reason 里带 C:\Users\...\workbuddy-desktop.info 与 WORKBUDDY_ATREST_KEY，
+        #   塞进通知就是两屏技术细节。分类逻辑不变，只换展示文案。
+        return "失败 —— {}".format(_short_reason(c))
+    return "待领取（自动重试中）"
 
 
-def _fmt_travel(t: dict, done: bool = False) -> str:
+def _duty_tag(duty: dict | None, note: str = "") -> str:
+    """在岗猫的短标记：` · 暴富喵（UR）`；取不到就返回空串。
+
+    为什么要显示：旅行是「哪只猫回家带信」的唯一可见反馈，而派哪只由服务端按
+    「当前在岗猫」决定。不写出来的话，用户换了猫、或猫被换掉，消息里完全看不出来。
+
+    这个函数要同时吃两种形状（刻意在这里归一，而不是让两边各自记着自己的形状）：
+      · 派遣结果里的 duty：{"status":…, "current":{name,rarity}, "previous":…}
+      · state 里落盘的 duty：{"name":…, "rarity":…}（只为「领取时补名字」而存）
+
+    note：附加说明（如「换猫失败」），与品级一起放进括号，避免多打一层括号。
+    """
+    d = duty or {}
+    cur = d.get("current") or (d if d.get("name") else {})
+    name = cur.get("name")
+    if not name:
+        return ""
+    # 品级与技能用「·」连，说明文字（note）另用「，」分隔 —— 三者语义不同层次。
+    # 技能只有已知名单里才显示（见 buddy.SKILLS），没有就不显示，不占位。
+    head = "·".join(x for x in (cur.get("rarity"), cur.get("skill")) if x)
+    inner = "，".join(x for x in (head, note) if x)
+    return " · {}{}".format(name, "（{}）".format(inner) if inner else "")
+
+
+def _fmt_travel(t: dict, done: bool = False, duty: dict | None = None) -> str:
+    """旅行奖励的正文行（标题由 `_compose` 加）。"""
     st = t.get("status")
+    # 派遣那一次的结果里带着当次要派的猫；领取那一次不带（claim 不查桌宠），
+    # 所以用 state 里落盘的 duty（派遣时写入）来补上名字。
+    td = t.get("duty") or {}
+    tag = _duty_tag(td or duty)
+    if not st:                      # 本轮没去查旅行（只有签到要处理）
+        return "今日已领取（本轮未重查）" if done else "待领取（07:00 后自动派猫）"
     # done：奖励已领取，本次 failed 只是整批调用被网络故障拖挂，不代表没领到
     if done and st == "failed":
-        return "旅行：奖励已领取（本次查询失败，积分不受影响）"
+        return "奖励已领取（本次查询失败，积分不受影响）"
     if st == "claimed":
-        return "旅行：+{} 积分".format(
-            t.get("reward_credit") if t.get("reward_credit") is not None else "?")
+        return "猫已到达{}，奖励领取 +{} 积分".format(
+            tag, t.get("reward_credit") if t.get("reward_credit") is not None else "?")
     if st == "departed":
-        return "旅行：已派出（到达后可领奖励）"
+        # ① 换猫失败：出门的是「不是目标的猫」，必须写出来 —— 静默失败正好是
+        #    本项目最忌讳的那种「看着正常，其实没做到」。
+        # ② 纠偏成功：说清「换回来了」，否则用户不知道发生过替换。
+        if td.get("status") == "failed":
+            tag = _duty_tag(td, "换猫失败")
+            fixed = ""
+        elif td.get("status") == "switched":
+            prev = (td.get("previous") or {}).get("name")
+            fixed = "｜已从 {} 换回".format(prev) if prev else ""
+        else:
+            fixed = ""
+        return "猫已出发{}，到达后自动领取{}".format(tag, fixed)
     if st == "traveling":
-        return "旅行：猫还在路上"
+        return "待领取（猫还在路上）"
     if st == "daily_limit_reached":
-        return "旅行：今日已达上限（已领过）"
+        return "今日已达上限（已领过）"
     if st == "failed":
-        return "旅行：失败 —— {}".format(_short_reason(t))
-    return "旅行：未执行"
+        return "失败 —— {}".format(_short_reason(t))
+    return "待领取（自动重试中）"
+
+
+def _snapshot_title(state: dict, ima_item: dict | None,
+                    streak_days: int | None = None) -> str:
+    """快照消息的标题：只报「今日办完几件」，不报金额。
+
+    金额分散在三条不同的账里（WorkBuddy 积分 / 旅行积分 / ima 算力），
+    标题里相加是错的、分行写出又太长 —— 金额交给正文第一行。
+
+    2026-10-28：标题带上「连续 N 天」作为**长期成就**展示（用户要求）。
+    这个数是签到接口的跨月累计连签（10-28 是 29 天），与正文里「本月连续签到」
+    （成长空间的连登，同日 28 天）不是同一个口径 —— 前者是成绩，后者决定档位。
+
+    Win 侧补充：`streak_days` 取不到时（already_checked 那轮接口不回这个字段）
+    由调用方传 state 里上次记下的值，见 `_report`。
+    """
+    done = [bool(state.get("checkin_done")), bool(state.get("claim_done"))]
+    if ima_item:
+        done.append(bool(ima_item.get("done")))
+    today = "{}/{} 完成".format(sum(1 for x in done if x), len(done))
+    if streak_days:
+        return "每日签到：连续 {} 天 · {}".format(streak_days, today)
+    return "每日签到：" + today
+
+
+def _compose(state: dict, c: dict, t: dict, ima_item: dict | None, stamp: str,
+             month_days: int | None = None, brief: bool = False) -> str:
+    """把三项结果拼成一条统一格式的正文（2026-10-22 用户指定，全站一致）：
+
+        1、WorkBuddy 签到：
+        成功，+100 积分，本月连续签到 23 天
+        2、WorkBuddy 旅行：
+        猫已到达，奖励领取 +5 积分
+        3、ima 算力：
+        成功，+50 算力，本周已签 7 天（满签✓）
+
+        今日进度：签到 ✓ / 旅行 ✓ / ima ✓
+        时间：2026-10-22 08:02
+
+    未到账的事项照同一格式写「待领取（…）」，不换一种排版 —— 三种状态（到账 /
+    待领取 / 失败）长得一样，才一眼看得出「今天还差哪件」。
+
+    ima_item 为空（模块未接入 / 未配置凭据 / 本轮没拿到结果）时，第 3 项与进度里的
+    ima 一并省略，不写「未接入」这种自曝内部结构的话。
+
+    brief=True（同一天的第二条及以后，2026-10-28 加）：**只列本轮真有新结果的项**。
+    第一条已经把「签到成功」「猫已出发」「ima 已签」都说过了，第二条再说一遍
+    「今日已领过」只是把消息撑长；用户要的是「这条消息带来了什么新东西」。
+    「今日进度」与「时间」仍然保留 —— 它们说明的是当天整体到哪一步，不受本条影响。
+    """
+    # ── 哪些项要出现 ─────────────────────────────────────────────────────
+    show_checkin = (not brief) or c.get("status") == "success"
+    show_travel = (not brief) or t.get("status") in (
+        "claimed", "departed", "daily_limit_reached", "failed")
+    show_ima = bool(ima_item) and ((not brief) or bool(ima_item.get("new")))
+
+    items = []
+    if show_checkin:
+        items.append(("WorkBuddy 签到",
+                      _fmt_checkin(c, bool(state.get("checkin_done")), month_days)))
+    if show_travel:
+        items.append(("WorkBuddy 旅行",
+                      _fmt_travel(t, bool(state.get("claim_done")), state.get("duty"))))
+    marks = ["签到 " + ("✓" if state.get("checkin_done") else "…"),
+             "旅行 " + ("✓" if state.get("claim_done") else "…")]
+    if ima_item:
+        marks.append("ima " + ("✓" if ima_item.get("done") else "…"))
+        if show_ima:
+            items.append(("ima 算力", ima_item.get("body") or "待领取（自动重试中）"))
+
+    if not items:
+        # brief 过滤后一条都不剩：宁可退回完整版，也不发一条只有进度和时间的空消息
+        return _compose(state, c, t, ima_item, stamp, month_days, brief=False)
+
+    lines = []
+    for idx, (head, line) in enumerate(items, 1):
+        lines.append("{n}、{h}：".format(n=idx, h=head))
+        lines.append(line)
+    # 空行把「三项清单」和「进度/时间」分开（2026-10-22 用户要求）。
+    # 这里的空串经 join 变成连续两个换行，投递层再转成两个 U+2028 ——
+    # 微信里就是一个真正的空行；单个 U+2028 只会换行不留空。
+    lines.append("")
+    lines.append("今日进度：" + " / ".join(marks))
+    lines.append("时间：" + stamp)
+    return "\n".join(lines)
+
 
 
 def _fail_signature(failed: list, c: dict, t: dict) -> str:
@@ -356,14 +553,23 @@ def _fail_alert_due(state: dict, sig: str, now_ts: float):
     return gap >= FAIL_ALERT_EVERY_MIN, int(gap)
 
 
-def _report(c: dict, t: dict, state: dict, pf: dict | None = None) -> None:
+def _report(c: dict, t: dict, state: dict, pf: dict | None = None,
+            ima_item: dict | None = None) -> bool:
     """按结果推送通知。
 
-    **到账类分成两条独立消息**：签到成功推「签到到账」，旅行领取成功推「旅行奖励到账」。
-    它们本来是两件独立发生的事（实测常相隔 1–2 小时），合并成一条会让人分不清
-    哪一笔到账了、也无法在时间线上对上账。同一次运行里两件都成，就推两条。
+    **一条消息说完三项**（2026-10-28 与 Mac 侧统一，原为签到、旅行各推一条）：
+    用户要的是「今天办到哪一步」的一张快照，而不是三次独立的到账流水。所以到账与
+    待领取合并成同一条编号消息，格式见 `_compose`；日志里仍逐项记录，排查不受影响。
 
-    失败类仍合并成一条 —— 一次故障不该刷两条，而且失败信息要放在一起才看得懂。
+    **失败仍然单独推**：失败是可操作的告警，塞进快照里会被当成日常进度划过去；
+    而且失败信息要自带处理建议，长度也不是快照能容纳的。
+
+    **第二条只列变化**：同一天第二次发消息时走 `brief=True`（见 `_compose`）。
+    判据是 state 里的 `msg_first_sent`，跨日重置时自然清掉。
+
+    ima_item：ima 当次结果（见 `scripts/ima.py: run_daily()` 的 `item`），
+    为空表示本轮没有 ima 结果（未配置凭据 / 未到点 / 模块不可用）。
+    返回值：ima 那一项是否已经跟着消息发出去了（False 时调用方要自己补发）。
     """
     pf = pf or {}
     # 只要本轮有「确实好起来了」的迹象，就把失败节流的窗口清零 ——
@@ -377,6 +583,7 @@ def _report(c: dict, t: dict, state: dict, pf: dict | None = None) -> None:
         state["fail_alert_ts"] = 0
     checkin_gain = c.get("status") == "success" and c.get("credit") is not None
     travel_gain = t.get("status") == "claimed" and t.get("reward_credit") is not None
+    ima_gain = bool(ima_item) and bool(ima_item.get("new"))
 
     done_map = {"签到": bool(state.get("checkin_done")),
                 "旅行": bool(state.get("claim_done"))}
@@ -395,65 +602,56 @@ def _report(c: dict, t: dict, state: dict, pf: dict | None = None) -> None:
     drift = c.get("drift_suspect") or t.get("drift_suspect")
 
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    progress = "今日进度：签到 {} / 旅行 {}".format(
-        "✓" if state.get("checkin_done") else "…",
-        "✓" if state.get("claim_done") else "…")
+    # 2026-10-28 两个口径分开：
+    #   正文「本月连续签到」= 成长空间的连登（决定兑换档位与补登），读一次 streak 接口；
+    #   标题「连续 N 天」    = 签到接口的跨月累计（成绩展示），优先用本轮结果，
+    #                         already_checked 那轮拿不到就用上次记下的。
+    month_days = growth.current_streak_days() if growth is not None else None
+    if c.get("streak_days"):
+        state["checkin_streak_days"] = c["streak_days"]
+    streak_days = c.get("streak_days") or state.get("checkin_streak_days")
+    # 今天已经发过快照 → 本条只列新变化（见 _compose 的 brief 说明）
+    brief = bool(state.get("msg_first_sent"))
 
-    # ① 签到到账 —— 独立一条消息
-    if checkin_gain:
-        _notify(
-            "WorkBuddy 签到到账：+{} 积分".format(c["credit"]),
-            "\n".join([
-                "签到成功，+{} 积分{}".format(c["credit"], _act(c)),
-                "连续签到：{} 天".format(c.get("streak_days", "?")),
-                "",
-                "时间：{}".format(stamp),
-                progress,
-            ]),
-            "success")
+    def _add_ep_change(text: str) -> str:
+        """端点刚被自动切换时，在正文尾部补一段说明（Win 侧原有行为，保留）。"""
+        if not ep_changed:
+            return text
+        old = ((pf.get("changed_from") or {}).get("status_paths") or [])[:2]
+        return text + "\n\n🔄 接口已切换（客户端 {}）：\n  旧：{}\n  新：{}".format(
+            pf.get("client_version") or "?", "\n      ".join(old) or "(无)",
+            pf.get("resolved_status") or pf.get("preferred_status") or "?")
 
-    # ② 旅行到账 —— 独立一条消息
-    if travel_gain:
-        _notify(
-            "WorkBuddy 旅行奖励到账：+{} 积分".format(t["reward_credit"]),
-            "\n".join([
-                "猫已到达，旅行奖励领取成功：+{} 积分".format(t["reward_credit"]),
-                "",
-                "时间：{}".format(stamp),
-                progress,
-            ]),
-            "success")
+    def _merged_same_root() -> str:
+        """签到与旅行「同因失败」时的合并正文（★ 2026-10-21 Win 侧修复，必须保留）。
 
-    # ★ 2026-10-21：签到与旅行「同因失败」时合并成一行。
-    #   两者都要读同一份登录态，读不到就一起失败、reason 逐字相同。原来会把
-    #   同一段 300 字技术细节连印两遍（10-21 的通知卡片就是两屏几乎一样的文字），
-    #   用户读完还不知道该干什么。合并后一行说清「两件事都没做，原因是一个」。
+        两者都要读同一份登录态，读不到就一起失败、reason 逐字相同。原来会把同一段
+        300 字技术细节连印两遍（10-21 的通知卡片就是两屏几乎一样的文字），用户读完
+        还不知道该干什么。合并后一行说清「两件事都没做，原因是一个」。
+        """
+        return "\n".join([
+            "签到 / 旅行：都未执行 —— {}".format(_short_reason(c)),
+            "",
+            "今日进度：签到 {} / 旅行 {}".format(
+                "✓" if state.get("checkin_done") else "…",
+                "✓" if state.get("claim_done") else "…"),
+            "时间：{}".format(stamp),
+        ])
+
     c_reason, t_reason = str(c.get("reason") or ""), str(t.get("reason") or "")
     same_root = (c.get("status") == "failed" and t.get("status") == "failed"
                  and c_reason and c_reason == t_reason
                  and not done_map["签到"] and not done_map["旅行"])
-    if same_root:
-        content = "\n".join([
-            "签到 / 旅行：都未执行 —— {}".format(_short_reason(c)),
-            "",
-            "时间：{}".format(stamp),
-            progress,
-        ])
-    else:
-        content = "\n".join([
-            _fmt_checkin(c, done_map["签到"]),
-            _fmt_travel(t, done_map["旅行"]),
-            "",
-            "时间：{}".format(stamp),
-            progress,
-        ])
-    if ep_changed:
-        old = ((pf.get("changed_from") or {}).get("status_paths") or [])[:2]
-        content += "\n\n🔄 接口已切换（客户端 {}）：\n  旧：{}\n  新：{}".format(
-            pf.get("client_version") or "?", "\n      ".join(old) or "(无)",
-            pf.get("resolved_status") or pf.get("preferred_status") or "?")
+
+    body = _add_ep_change(_compose(state, c, t, ima_item, stamp, month_days, brief=brief))
 
     if failed or suspect or pf_bad:
+        # 告警必须完整：brief 版会省掉「今日已领过」，而故障时用户正是要对照全部三项
+        if same_root and not suspect and not pf_bad:
+            body = _add_ep_change(_merged_same_root())
+        else:
+            body = _add_ep_change(
+                _compose(state, c, t, ima_item, stamp, month_days, brief=False))
         # ★ 2026-10-21：失败告警节流（兜底闸，对所有 fail_kind 生效）。
         #   上游的 _local_quiet / net_only 只覆盖 local 与 net；biz 失败以前是
         #   「每次失败一条」，20 分钟一跳、12 次预算 = 12 条。
@@ -466,7 +664,7 @@ def _report(c: dict, t: dict, state: dict, pf: dict | None = None) -> None:
             if not due:
                 log("失败告警节流：同类别（{}）{} 分钟前已报过，本次只记日志"
                     "（窗口 {} 分钟）".format(sig, gap, FAIL_ALERT_EVERY_MIN))
-                return
+                return False
             state["fail_alert_key"] = sig
             state["fail_alert_ts"] = time.time()
         if drift and failed:
@@ -499,31 +697,36 @@ def _report(c: dict, t: dict, state: dict, pf: dict | None = None) -> None:
                                         winenv.selfcheck_hint()))
         if drift:
             extra += "\n\n🔄 交叉比对（查 vs 领）发现的漂移线索：{}".format(drift)
-        _notify(title, content + extra, "failure")
-    elif checkin_gain or travel_gain:
-        pass   # 到账消息已在上面各推一条，这里不再补汇总
+        _notify(title, body + extra, "failure")
+    elif checkin_gain or travel_gain or ima_gain:
+        _notify(_snapshot_title(state, ima_item, streak_days), body, "success")
+        # 首条已发：之后同一天的消息一律走 brief（只列新变化）
+        state["msg_first_sent"] = True
     elif no_activity and state.get("no_activity_streak", 0) >= 3:
         # 防「静默失效」保险：连续多日报无活动时，多半是接口/活动判定出了问题
         # （2026-09-17 就因旧接口恒返回 active=false，连续静默了整整一轮活动）。
         _notify(
             "WorkBuddy 积分：连续 {} 天报「无活动」，建议人工核对".format(
                 state.get("no_activity_streak")),
-            content + "\n\n⚠️ 请打开 WorkBuddy 桌面端确认积分页是否真有活动。\n"
+            body + "\n\n⚠️ 请打开 WorkBuddy 桌面端确认积分页是否真有活动。\n"
             "若页面有活动而脚本报无活动，说明活动接口又变了，"
             "自查方式：{}。".format(winenv.selfcheck_hint()),
             "failure")
     elif no_activity:
         _notify(
             "WorkBuddy 积分：当前没有进行中的活动",
-            content + "\n\n说明：活动空档期不产生积分，脚本会继续每日巡检，活动开启后自动恢复。",
+            body + "\n\n说明：活动空档期不产生积分，脚本会继续每日巡检，活动开启后自动恢复。",
             "warning")
     else:
         # 常规巡检：但若端点刚变过，提升为 warning 并改标题，确保不被当成噪音划过去
         _notify(
-            "WorkBuddy 积分：接口已自动切换" if ep_changed else "WorkBuddy 积分巡检",
-            content + ("\n\n说明：端点已自动改用客户端当前使用的新路径，不用你操作。"
-                       if ep_changed else ""),
+            "WorkBuddy 积分：接口已自动切换" if ep_changed
+            else _snapshot_title(state, ima_item, streak_days),
+            body + ("\n\n说明：端点已自动改用客户端当前使用的新路径，不用你操作。"
+                    if ep_changed else ""),
             "warning" if ep_changed else "info")
+
+    return bool(ima_item)
 
 
 def run_all(tag: str) -> dict:
@@ -668,6 +871,291 @@ def _gap_for(state: dict, kind_key: str, fails_key: str) -> int:
     return MIN_RETRY_GAP_MIN
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 成长任务 / 成长空间 / 晚间活跃看门狗（2026-10-28 从 Mac 侧同步）
+#
+# 三个模块的共同点：**都不属于每日快照**，都单独成条，都必须在 `_day_finished`
+# 早退之前调用（WorkBuddy 上午收工后，任务可能下午才达标、能量可能下午才攒够）。
+# ═══════════════════════════════════════════════════════════════════════════
+def _fmt_task_claim(c: dict) -> str:
+    """一条任务领取结果：`体验优秀灵感：+100 积分 +5 能量`。"""
+    bits = []
+    if c.get("credit"):
+        bits.append("+{} 积分".format(c["credit"]))
+    if c.get("energy"):
+        bits.append("+{} 能量".format(c["energy"]))
+    return "{}：{}".format(c.get("title") or c.get("code"), " ".join(bits) or "已领取")
+
+
+def _maybe_run_tasks(state: dict, now_ts: float, today: str) -> bool:
+    """巡检成长任务（自动接受 + 领取已达标奖励）。返回 True = 改了 state，调用方要落盘。
+
+    ── 为什么它不属于每日快照 ───────────────────────────────────────────────
+    签到与旅行是「每天一次、结果确定」的事，适合并进那条编号快照。
+    任务领取不一样：进度取决于**用户当天有没有真的用那些功能**，随时可能达标，
+    而且一天可能领到好几次。塞进快照会让同一份内容反复出现，所以它单独成条 ——
+    且**每天最多一条**（用户 2026-10-28 明确要求）：
+      · 当天第一次领到 → 发一条，列出这次领到的全部项；
+      · 之后同一天再领到 → 照常入账，只写日志不推送（否则一天几条，纯噪音）。
+
+    ── 为什么它不看 _day_finished ───────────────────────────────────────────
+    WorkBuddy 签到/旅行上午就收工，之后整轮会早退；但任务可能下午才达标。
+    所以调用点有两处：done 分支里一次、正常路径一次（见 _run）。
+
+    ── 节流 ────────────────────────────────────────────────────────────────
+    触发频率是 5 分钟一次，不快照就不能每轮都打接口。60 分钟一次足够：
+    任务达标不是时效性事件，晚一小时领到不影响一分钱。
+    """
+    if tasks is None:
+        if TASKS_IMPORT_ERROR:
+            log("tasks 模块不可用，已跳过：" + TASKS_IMPORT_ERROR)
+        return False
+    if not _due(state, "tasks_last_check", now_ts, TASKS_GAP_MIN):
+        return False
+    state["tasks_last_check"] = now_ts
+
+    try:
+        res = tasks.run_daily()
+    except Exception as e:  # noqa: BLE001 — 任务模块坏了不该影响签到/旅行
+        log("tasks error: {!r}".format(e))
+        return True
+    log("tasks: " + json.dumps(res, ensure_ascii=False)[:500])
+
+    claimed = res.get("claimed") or []
+    if not claimed:
+        return True
+    if state.get("tasks_notified_day") == today:
+        log("tasks: 今日已推送过，本次 {} 项不再通知".format(len(claimed)))
+        return True
+
+    state["tasks_notified_day"] = today
+    amt = []
+    if res.get("credit"):
+        amt.append("+{} 积分".format(res["credit"]))
+    if res.get("energy"):
+        amt.append("+{} 能量".format(res["energy"]))
+    lines = ["{}、{}".format(i, _fmt_task_claim(c)) for i, c in enumerate(claimed, 1)]
+    # 2026-10-28：**先攒着不发**。同一轮里 growth 往往紧接着也有收益（它们都在
+    # 60 分钟节流后同批触发），两条消息连着推等于把「今天赚了什么」拆成两半。
+    # 由 _maybe_run_growth 合并，或本轮的 _flush_growth_pending 单独发出。
+    state["tasks_pending"] = {"lines": lines, "amt": amt, "count": len(claimed)}
+    return True
+
+
+def _sum_credit_prizes(wins: list[dict]) -> int | None:
+    """全是积分奖时求合计；混了实物奖或名字解析不出来就返回 None（调用方回退成列举）。
+
+    奖品名是服务端给的 "10 积分" 这种自然语言，没有数值字段（`prizes` 接口里的
+    probability 与 credit_amount 是奖池配置，不是中奖结果）。所以只能从名字里读数字，
+    读不出来就诚实地逐个列出，不猜。
+    """
+    total = 0
+    for w in wins:
+        name = str(w.get("name") or "")
+        if w.get("type") not in (None, "credit") or "积分" not in name:
+            return None
+        head = name.split("积分")[0].strip().replace(",", "")
+        if not head.isdigit():
+            return None
+        total += int(head)
+    return total or None
+
+
+TIER_NAME = {"7d": "入门档", "14d": "进阶档", "28d": "巅峰档"}   # 官方叫法
+
+
+def _fmt_growth(res: dict) -> tuple[str, str]:
+    """把一次成长空间兑现结果排成 (标题, 正文)。只在真有进项时调用。
+
+    排版沿用每日快照的编号形式：一条一行，一行一件事。
+    """
+    lines = []
+    n = 0
+    redeemed = [r for r in (res.get("redeemed") or []) if not r.get("dry_run")]
+    if redeemed:
+        n += 1
+        bits = []
+        c = sum(r.get("credit", 0) for r in redeemed)
+        e = sum(r.get("energy", 0) for r in redeemed)
+        cards = sum(r.get("cards", 0) for r in redeemed)
+        ch = sum(r.get("chances", 0) for r in redeemed)
+        if c:
+            bits.append("+{} 积分".format(c))
+        if e:
+            bits.append("+{} 能量".format(e))
+        if cards:
+            bits.append("+{} 张补登卡".format(cards))
+        if ch:
+            bits.append("+{} 次抽奖".format(ch))
+        tiers = " / ".join(TIER_NAME.get(r["tier"], r["tier"]) for r in redeemed)
+        lines.append("{}、连登兑换（{}）：{}".format(n, tiers, " ".join(bits)))
+
+    wins = [w for w in (res.get("wins") or []) if not w.get("dry_run")]
+    if wins:
+        n += 1
+        # 全是积分奖时合计成「共 N 积分」，读起来比逐个列举清爽。奖品名是
+        # "10 积分" 这种自然语言，抠不出来就退回原样列举 —— 绝不因为解析失败而少报。
+        total = _sum_credit_prizes(wins)
+        if total is not None:
+            lines.append("{}、抽奖：{} 次 → 共 {} 积分".format(n, len(wins), total))
+        else:
+            names = "、".join(str(w.get("name") or "?") for w in wins)
+            lines.append("{}、抽奖：{} 次 → {}".format(n, len(wins), names))
+
+    madeup = [m for m in (res.get("madeup") or []) if not m.get("dry_run")]
+    if madeup:
+        n += 1
+        # 带上连登变化，一眼看出补登有没有真的把记录接上（没接上就是要人工看的信号）
+        bits = []
+        for m in madeup:
+            b, a = m.get("streak_before"), m.get("streak_after")
+            bits.append(m["date"][5:] + ("（连登 {} → {} 天）".format(b, a) if a else ""))
+        lines.append("{}、补登：{}".format(n, "、".join(bits)))
+
+    opened = res.get("opened") or {}
+    if opened.get("count") and not opened.get("dry_run"):
+        n += 1
+        new = opened.get("new") or []
+        got = "、".join("{}（{}）".format(b.get("name"), b.get("rarity")) for b in new)
+        lines.append("{}、能量开盒：{} 次{}".format(
+            n, opened["count"], " → " + got if got else ""))
+
+    physical = res.get("physical") or []
+    if physical:
+        n += 1
+        lines.append("{}、实物中奖：{} —— 需要你在客户端填收货地址".format(
+            n, "、".join(p.get("name") or "?" for p in physical)))
+
+    if res.get("credit"):
+        title = "成长空间：+{} 积分".format(res["credit"])
+    elif wins:
+        title = "成长空间：抽奖 {} 次".format(len(wins))
+    elif madeup:
+        title = "成长空间：补登 {} 天".format(len(madeup))
+    elif opened.get("count"):
+        title = "成长空间：开盒 {} 次".format(opened["count"])
+    else:
+        title = "成长空间：有新的收益"
+
+    lines.append("")
+    lines.append("时间：" + datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+    return title, "\n".join(lines)
+
+
+def _maybe_run_growth(state: dict, now_ts: float, today: str) -> bool:
+    """兑现成长空间收益（兑换 / 补登 / 抽奖 / 开盒）。返回 True = 改了 state，要落盘。
+
+    ── 为什么单独一条、每天最多一条 ─────────────────────────────────────────
+    和 tasks 同源：这些收益都不确定什么时候到手（兑换要等连登够天数、抽奖要等兑换
+    给次数、开盒要等能量攒够 10），塞进每日快照会反复出现。所以单列，且有真实进项
+    才发、每天最多一条 —— 没有进项时一声不响（避免每天一条「今天没收益」的噪音）。
+
+    ── 为什么不受 _day_finished 影响 ────────────────────────────────────────
+    签到/旅行上午收工后整轮早退，但补登卡可能是下午才够天数触发、能量可能下午才攒够。
+    所以和 tasks 一样，done 分支与正常路径各调一次。
+
+    ── 与 tasks 的关系 ─────────────────────────────────────────────────────
+    两者会互相喂饭：tasks 领到的奖励里有能量（够 10 点就能开盒），兑换来的卡又能
+    保住连登。所以 growth 排在 tasks 之后跑，同一轮里就能用上刚领到的能量。
+    """
+    if growth is None:
+        if GROWTH_IMPORT_ERROR:
+            log("growth 模块不可用，已跳过：" + GROWTH_IMPORT_ERROR)
+        return False
+    if not _due(state, "growth_last_check", now_ts, GROWTH_GAP_MIN):
+        return False
+    state["growth_last_check"] = now_ts
+
+    try:
+        res = growth.run_daily()
+    except Exception as e:  # noqa: BLE001 — 成长空间坏了不该影响签到/旅行
+        log("growth error: {!r}".format(e))
+        return True
+    log("growth: " + json.dumps(res, ensure_ascii=False)[:600])
+
+    if not res.get("changed"):
+        return True
+    if state.get("growth_notified_day") == today:
+        log("growth: 今日已推送过，本次不再通知")
+        return True
+
+    state["growth_notified_day"] = today
+    title, body = _fmt_growth(res)
+    # 同轮里 tasks 已经攒下待发内容 → 合并成一条。两条消息连着推，用户要在两个
+    # 气泡里拼「今天到底赚了多少」，合起来反而更短（只留一个时间行、一个标题）。
+    pending = state.pop("tasks_pending", None)
+    if pending:
+        lines = (pending.get("lines") or []) + [""]
+        body = "\n".join(lines) + body
+        title = "成长空间：任务与连登收益"
+        log("growth: 与 {} 项任务领取合并为一条".format(pending.get("count") or 0))
+    try:
+        _notify(title, body, "success")
+    except Exception as e:  # noqa: BLE001
+        log("growth notify error: {!r}".format(e))
+    return True
+
+
+def _flush_growth_pending(state: dict) -> None:
+    """把 tasks 攒下的那条单独发出去（growth 本轮没有收益时才会走到这里）。
+
+    必须在 tasks / growth 两个调用之后立刻调用：攒着不发又没有 growth 来合并，
+    这条消息就永远丢了 —— 那是真的少报收益，比多发一条严重得多。
+    """
+    p = state.pop("tasks_pending", None)
+    if not p:
+        return
+    title = "WorkBuddy 成长任务：{}（{} 项）".format(
+        " ".join(p.get("amt") or []) or "已领取", p.get("count") or 0)
+    body = "\n".join((p.get("lines") or [])
+                     + ["", "时间：" + datetime.datetime.now().strftime("%Y-%m-%d %H:%M")])
+    try:
+        _notify(title, body, "success")
+    except Exception as e:  # noqa: BLE001
+        log("tasks notify error: {!r}".format(e))
+
+
+def _run_activity_watch() -> dict:
+    """晚间活跃看门狗：今天热力墙黑了就提醒一次（21:30 / 23:40 两档）。
+
+    ── 为什么需要（这不是可选的锦上添花）──────────────────────────────────
+    连登门槛只要当天活跃分 > 0，但实测**签到 / 旅行 / 兑换 / 补登全部计 0 分**，
+    唯一常规来源是真发一次对话请求（2 分）。所以完全不打开 WorkBuddy 的那天，
+    热力墙必然黑，连登当场断；断 1 天要花 1 张补登卡才可能接回，而整月 28 天档
+    只有一次机会。补登是事后补救，这条是事前拦截。
+
+    ── 为什么只读、绝不代发对话 ──────────────────────────────────────────
+    模拟对话刷活跃既是伪造使用行为，也没有收益（分数高低不兑换任何奖励，
+    只按 7/14/28 天档发）。所以这里只查分数、只发提醒，把「点一下」留给本人。
+
+    ── 为什么放在 _day_finished 早退之前 ────────────────────────────────
+    签到与旅行通常上午就收工，之后每轮都会早退；看门狗在晚上才触发，
+    放到早退之后就永远轮不到它。
+
+    ── 为什么调用方不需要节流 ────────────────────────────────────────────
+    未到点 / 已点亮 / 本档已提醒 三种情况都在 activity_watch.check() 里直接返回，
+    不产生网络请求；只有真正「到点且还没查过」的那一次才读接口。
+    """
+    if activity_watch is None:
+        if ACTIVITY_IMPORT_ERROR:
+            log("activity_watch 模块不可用，已跳过：" + ACTIVITY_IMPORT_ERROR)
+        return {"action": "unavailable"}
+    res = activity_watch.check()
+    act = res.get("action")
+    if act == "alert":
+        # 级别用 "warning" 而不是 Mac 侧的 "warn"：Win 版 notify.py 的 `_LEVEL_SWITCH`
+        # 只认 success/failure/warning/info，"warn" 会落进 notify_noop 那一档 ——
+        # 消息仍会发（配置项缺省为 True），但拿不到 Toast 样式，日志里级别也成了非标准值。
+        _notify(res["title"], res["body"], "warning")
+        log("activity_watch: 已提醒（{} 档，score={}，连登={}）".format(
+            res.get("slot"), res.get("score"), res.get("streak_days")))
+    elif act == "lit":
+        log("activity_watch: 今日已点亮（{} 分），今天不再查".format(res.get("score")))
+    elif act == "error":
+        log("activity_watch: " + str(res.get("reason")))
+    return res
+
+
 def _quiet_now(now: datetime.datetime) -> bool:
     """是否处于完全静默时段（00:00 – 07:00）。
 
@@ -758,11 +1246,98 @@ def _run() -> None:
     except Exception as e:  # noqa: BLE001
         log(f"flush_pending error: {e!r}")
 
+    # ── 晚间活跃看门狗（2026-10-28 加，见 scripts/activity_watch.py）──────────
+    # 连登门槛只要 score>0，而签到/旅行/兑换全计 0 分 —— 唯一来源是真发一次对话，
+    # 所以「今天点亮没有」只能靠人。21:30 还来得及，23:40 是最后一道。
+    # 位置：必须在 _day_finished 早退之前（白天收工后不再有别的检查点）。
+    # 未到点 / 已点亮 / 本档已提醒 都直接返回，空转零请求。
+    activity_res: dict = {}
+    try:
+        activity_res = _run_activity_watch()
+    except Exception as e:  # noqa: BLE001 — 看门狗坏了不该影响任何主流程
+        log("activity_watch error: {!r}".format(e))
+
+    # ── ima 每日签到（2026-10-28 加，独立账号体系）──────────────────────────
+    # 为什么放在 day_done 早退**之前**：WorkBuddy 两项通常上午就跑完，之后每次触发
+    # 都会在这里早退；ima 可能还在等重试间隔，放在早退之后就永远轮不到它。
+    # 它有自己的状态文件（runtime/state/ima_state.json）与闸门，这里只做兜底：
+    # ima 的任何异常都不该拖累 WorkBuddy 的补跑（反之亦然）。
+    ima_summary: dict = {}
+    ima_item: dict = {}
+    ima_reported = False
+    if ima is None:
+        if IMA_IMPORT_ERROR:
+            log(f"ima 模块不可用，已跳过：{IMA_IMPORT_ERROR}")
+    elif ima.load_cred() is None:
+        # ★ Win 侧差异（2026-10-28）：未扫码/未迁凭据时**整块跳过**，连摘要都不取。
+        #   理由：ima.run_daily() 在无凭据分支会自己推一条 failure（「还没有登录凭证」
+        #   + 一条 python3 命令）。Mac 上早就扫过码，所以那条只在首次出现一次；
+        #   Win 上还没配，就会变成**每天一条**失败告警，纯噪音。
+        #   「没配置」不是故障，不该占用通知栏 —— 配好凭据（扫码或从 Mac 拷
+        #   ima_credentials.json）后，这里自然就开始工作。
+        #   日志也每天只记一次：5 分钟一轮，每轮一条就是 288 行/天（见 _log_once_a_day）。
+        _log_once_a_day(
+            "ima_no_cred",
+            "ima: 未配置凭据，跳过（不影响签到/旅行）。要启用：python scripts\\ima.py login 扫码一次")
+    else:
+        try:
+            # embed=True：结果不自己推，交给下面 WorkBuddy 那条消息带走
+            # （两者同在 07:00 开闸，并排推两条只会让人多看一条消息）。
+            ima_summary = ima.run_daily(embed=True)
+            ima_item = ima_summary.get("item") or {}
+            if ima_summary.get("action") in ("ran", "blocked", "exhausted"):
+                log("ima: " + json.dumps(ima_summary, ensure_ascii=False)[:400])
+        except Exception as e:  # noqa: BLE001
+            log(f"ima error: {e!r}")
+
+    def _flush_ima_item(st: dict) -> None:
+        """ima 结果没有被任何 WorkBuddy 消息带走时，自己补发一条（否则结果彻底丢失）。
+
+        补发也用**同一套 `_compose`**：用户视野里只该有一种排版，
+        不然「WorkBuddy 已收工的那天」会收到一条长得不一样的 ima 专属消息。
+        """
+        nonlocal ima_reported
+        if not ima_item or ima_reported:
+            return
+        # 只补发「本轮真有结果」的情形（`ran` 且结果为完成/新到账）。
+        # `waiting` 是常态（每 5 分钟一次），补发它等于把消息刷成心跳；
+        # `blocked` / `exhausted` 已由 ima 自己推过，再补一条就是重复。
+        if ima_summary.get("action") != "ran":
+            return
+        if not (ima_item.get("new") or ima_item.get("done")):
+            return
+        ima_reported = True
+        try:
+            _notify(
+                _snapshot_title(st, ima_item, st.get("checkin_streak_days")),
+                _compose(st, {}, {}, ima_item,
+                         datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                         brief=bool(st.get("msg_first_sent"))),
+                "success" if ima_item.get("new") else "info")
+        except Exception as e:  # noqa: BLE001
+            log(f"ima notify error: {e!r}")
+
     # 静默第二道：当天该做的都做完了 → 之后每次触发都不再做任何事。
     # 放在 ensure_config / renew / discovery 之前，因为那些都属于「每次触发都跑」
     # 的固定开销，正是静默要省掉的那部分。
     if done:
-        print(json.dumps({"action": "day_done"}, ensure_ascii=False))
+        # ima 可能刚在这一轮完成，而 WorkBuddy 早已收工 —— 用现读的 state 拼快照
+        st = _load_state()
+        _flush_ima_item(st)
+        # 成长任务不看签到/旅行的闸门：WorkBuddy 上午收工之后，任务仍可能下午才达标。
+        # 放在早退之前跑，否则当天后半段的达标永远等不到领取。
+        tasks_ran = _maybe_run_tasks(st, time.time(), today)
+        # 成长空间同理：兑换要等连登天数，开盒要等能量，都可能下午才成立。
+        growth_ran = _maybe_run_growth(st, time.time(), today)
+        # tasks 若攒下了内容而 growth 没合并（本轮无收益），在这里补发
+        _flush_growth_pending(st)
+        if tasks_ran or growth_ran or ima_reported:
+            _save_state(st)
+        print(json.dumps({"action": "day_done", "ima": ima_summary.get("action"),
+                          "tasks_checked": tasks_ran,
+                          "growth_checked": growth_ran,
+                          "activity": activity_res.get("action") or "-"},
+                         ensure_ascii=False))
         return
 
     notify.ensure_config()   # 首次运行自动生成 notify_config.json 模板
@@ -801,6 +1376,10 @@ def _run() -> None:
     if state.get("day") != today:
         # 跨日重置每日进度，但**保留** no_activity_streak（它是跨日累计的失效指标）
         carry_streak = int(state.get("no_activity_streak") or 0)
+        # 连续签到天数也是跨日累积的成就（标题要用），不能跟着当天进度清掉。
+        # 万一今天签到接口拿不到这个数（already_checked 那轮不回），标题就该显示
+        # 昨天的值，而不是干脆不显示——见 _report 里的 streak_days 回退。
+        carry_days = state.get("checkin_streak_days")
         state = {"day": today, "checkin_done": False, "checkin_tries": 0,
                  "checkin_last_try": 0, "checkin_last_kind": "biz",
                  "checkin_local_fails": 0,
@@ -809,7 +1388,8 @@ def _run() -> None:
                  "claim_local_fails": 0,
                  "probe_last_try": 0,
                  "arrive_at": None,
-                 "no_activity_streak": carry_streak}
+                 "no_activity_streak": carry_streak,
+                 "checkin_streak_days": carry_days}
 
     # 系统时间倒退检测：手动改表 / 时区改错 / 虚拟机恢复快照，以及 Windows 上
     # 「拔电源后 CMOS 时间回到出厂」都会让闸门判断错乱 —— 例如时间跳回凌晨后，
@@ -936,6 +1516,16 @@ def _run() -> None:
         elif t.get("arrive_at"):
             state["arrive_at"] = t["arrive_at"]
 
+        # 记下这次派出去的是哪只猫：派遣那一刻的结果里才带猫名，等猫回来领奖时
+        # claim 接口不回猫信息，只能靠落盘补上 —— 与 arrive_at 同一思路。
+        _duty_cur = ((t.get("duty") or {}).get("current") or {})
+        if t.get("status") == "departed" and _duty_cur.get("name"):
+            state["duty"] = {"name": _duty_cur.get("name"),
+                             "rarity": _duty_cur.get("rarity")}
+            # 技能一并落盘：领取那条消息要在没有接口数据的情况下也说出「哪位在岗」
+            if _duty_cur.get("skill"):
+                state["duty"]["skill"] = _duty_cur["skill"]
+
         # 网络失败 → 完全静默（2026-10-14 改，原为「每天推一条告警」）：
         # 本次失败若**全是网络层失败**（且没有成功到账），不推送任何通知，只记日志。
         # 理由：
@@ -960,7 +1550,21 @@ def _run() -> None:
                 "{task}={status}/{kind}".format(task=r.get("task"), status=r.get("status"),
                                                 kind=r.get("fail_kind")) for r in fails))
         else:
-            _report(c, t, state, pf)
+            ima_reported = _report(c, t, state, pf, ima_item)
+
+    # 本轮没有 WorkBuddy 消息把 ima 结果带走（不需要派发 / 纯网络失败静默）→ 自己发一条
+    _flush_ima_item(state)
+
+    # 成长任务巡检：接受待接受的任务 + 领取已达标奖励（不进快照，单独成条，见函数说明）。
+    # state 末尾统一 _save_state，所以这里不用立即落盘。
+    # ★ 必须放在 _day_finished 早退之外的另一半：上面 done 分支已经return，这条路径
+    #   是「今天还没办完」时跑的，同样要巡检 —— 两处都不能漏，否则半天不领。
+    tasks_ran = _maybe_run_tasks(state, now_ts, today)
+    # 成长空间兑现：兑换/补登/抽奖/开盒（同样不进快照，单独成条，见函数说明）。
+    # 排在 tasks 之后：tasks 刚领到的能量可能正好够开一次盒。
+    growth_ran = _maybe_run_growth(state, now_ts, today)
+    # 同轮收尾：tasks 攒下的内容如果没被 growth 合并，就在这一轮单独发出
+    _flush_growth_pending(state)
 
     if need_probe:
         # 探测恢复：业务预算耗尽、当天该事项仍未完成时，低频只读探测一次状态。
@@ -1039,6 +1643,11 @@ def _run() -> None:
         # 排查「为什么一直没领到」：试了几次、预算是否已用尽
         "claim_tries": state.get("claim_tries"),
         "probe_exhausted": probe_exhausted,
+        # 2026-10-28 新增三项的当轮结果，排查「怎么没领任务 / 怎么没提醒看点灯」时看这里
+        "ima": ima_summary.get("action"),
+        "tasks_checked": tasks_ran,
+        "growth_checked": growth_ran,
+        "activity": activity_res.get("action") or "-",
         "renew": renew_result,
         "endpoints": {
             "source": disc.get("source"),

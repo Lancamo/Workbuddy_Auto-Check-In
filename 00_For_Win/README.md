@@ -6,8 +6,7 @@
 ## 简介
 
 **每天自动替你在 WorkBuddy 里签到领积分、派遣旅行并领取奖励，结果推到微信；漏跑自动补，做完即停。**
-早先与 `../00_For_Mac/` 的 macOS 版同源，**2026-10-21 起两套完全独立迭代、互不通信**（见第 5 节）；
-本目录不依赖 mac 环境，也不含任何 mac 路径。
+本项目只做 Windows（范围说明见第 0 节），不依赖任何其它平台的运行时或路径。
 
 它具体替你做的事：
 
@@ -62,8 +61,7 @@ Windows 版本省略了可选的 XML 字段，`doctor.py` 会自动用 PowerShel
 ## 文档维护约定
 
 **本文件与代码同步维护，这是硬要求。** 以后任何一次优化调整 —— 逻辑变更、配置新增、
-目录移动、默认值改动 —— 都必须**同步更新本 README**（只改 `00_For_Win/README.md`；
-`00_For_Mac/` 那份不归本项目维护，见第 5 节）。改完的验证动作见 **第 5.3 节**。
+目录移动、默认值改动 —— 都必须**同步更新本 README**。改完的验证动作见 **第 5.3 节**。
 
 变更历史不在这里维护：大改动的方案与执行记录见上级 `Plan/`，每日工作日志见项目内 `.workbuddy/memory/`。
 
@@ -77,24 +75,27 @@ Windows 版本省略了可选的 XML 字段，`doctor.py` 会自动用 PowerShel
 
 ---
 
-## 0. 与 macOS 版的关系（先看这个）
+## 0. 本项目的范围（先看这个）
 
-> **2026-10-21 起两套系统完全独立迭代、互不通信。** 本节只是目录里为什么还有个
-> `../00_For_Mac/` 的说明 —— **不需要维护它、不需要与它对齐、不需要同步**。
-> 详见第 5 节。
+**只做 Windows。** 这个仓库里只有 `00_For_Win/`，没有任何其它平台的副本。
 
-| | macOS 版（`../00_For_Mac/`，不归本项目维护） | Windows 版（本目录） |
-|---|---|---|
-| 定时器 | LaunchAgent `com.workbuddy.wb-reward-catchup`（由 `00_For_Mac/install.sh` 生成） | 计划任务 `WorkBuddyRewardCatchup` |
-| 触发 | `RunAtLoad` + `StartInterval=300` | `LogonTrigger`（延迟 1 分钟）+ 每 5 分钟重复 |
-| 错过补跑 | launchd 唤醒后自动补发 | `StartWhenAvailable=true` |
-| 解释器 | `sys.executable` | `winenv.default_python()`（同一语义，另切 python/pythonw） |
-| 客户端版本 | 读 `Info.plist` | 直接解 `app.asar` 头部 |
-| 本地通知兜底 | `osascript display notification` | PowerShell Windows Toast / tkinter 卡片 |
-| 入口 | 命令行 / launchd | 双击 `.cmd` |
+早先本项目与另一套 macOS 实现同源；**2026-10-21 那套被整体移除** —— 目录、
+平台分支（`darwin` / `osascript` / `Info.plist`）、平台文案、对应自检断言
+全部删除，改动过程见 git 日志。所以现在：
 
-**这两套已经各自演进，同名文件不再要求逐字一致。** 改这里的代码时，不要去看 mac 版
-「是怎么写的」，也不要因为改了它而回头改 mac 版。
+- 不用考虑「别处是怎么写的」，也不存在需要同步的另一侧；
+- 新增代码里不应再出现跨平台分支；所有平台相关处理只在 `winenv.py` 一个文件里；
+- 自检第 8 节会扫全目录，发现跨平台绝对路径或外部通知命令即判失败。
+
+| | 本项目的做法 |
+|---|---|
+| 定时器 | 计划任务 `WorkBuddyRewardCatchup` |
+| 触发 | `LogonTrigger`（延迟 1 分钟）+ 每 5 分钟重复 |
+| 错过补跑 | `StartWhenAvailable=true` |
+| 解释器 | `winenv.default_python()`（同一语义，另切 python/pythonw） |
+| 客户端版本 | 直接解 `app.asar` 头部 |
+| 本地通知兜底 | PowerShell Windows Toast / tkinter 卡片 |
+| 入口 | 双击 `.cmd` |
 
 ---
 
@@ -151,25 +152,32 @@ Windows 版本省略了可选的 XML 字段，`doctor.py` 会自动用 PowerShel
 ├── install.py            ← 计划任务注册 / 卸载 / 状态 / 立即运行（注册**四个**任务）
 ├── watchdog.py           ← ★ 存活监控：只查主脚本心跳与计划任务是否还在，异常弹 Toast
 ├── doctor.py             ← 一键环境诊断（只读，不领积分、不发消息）
-├── selftest.py           ← 自检（项数随环境浮动，0 失败为准；Windows 真机最近 415 项；
-│                            Windows / mac 都能跑，缺 mac 版时自动跳过跨版本比对）
-│                            排除 `._*` 残留、不假设本机是 mac、不注册任何计划任务，
+├── selftest.py           ← 自检（项数随环境浮动，0 失败为准；真机最近 478 项）
+│                            排除 `._*` 残留、不注册任何计划任务，
 │                            且把日志隔离到 `.selftest_logs/`（跑完即删，绝不写 runtime/logs）
+├── verify_notify_layout.py   ← ★ 离线桩测：通知排版 / 第二条只列变化 / tasks-growth 合并
+├── verify_growth_makeup.py   ← ★ 离线桩测：补登「先算再花」策略（43 条断言）
+├── verify_activity_watch.py  ← ★ 离线桩测：晚间看门狗（10 组 / 38 条断言）
 │
 ├── notify.py             ← 通知编排（微信直推 → 本地 Toast 降级）
 ├── clawbot.py            ← 腾讯 iLink 微信直推（零第三方依赖）
 ├── renew.py              ← 会话续期守护（只读桌面端游标，提前预警失效）
 │
-├── scripts/              ← 引擎，与 mac 版同名同结构
+├── scripts/              ← 引擎
 │   ├── main.py           ← 子命令入口（all / preflight / checkin / travel / status）
 │   ├── api_discovery.py  ← ★ 接口前置校验（每次运行现读本机客户端，防接口漂移）
 │   ├── checkin.py        ← 签到
-│   ├── travel.py         ← 旅行派遣与领奖
+│   ├── travel.py         ← 旅行派遣与领奖（派遣前核对在岗猫；duty 可选模块）
 │   ├── credentials.py    ← 凭据装载（含 5.6.2+ 加密信封自动解密）
 │   ├── atrest.py         ← WorkBuddy 5.6.2+ AtRestEncryption（AES-256-GCM）解密
-│   │                       密钥定位含两条路：Windows = 进程内存扫描；
-│   │                       macOS = 借客户端自带 Electron 取密钥。两平台目录下逐字一致
-│   └── http_client.py    ← HTTP（UA 跟随真实客户端版本）
+│   │                       密钥定位含两条路：扫描 Data 目录的 DPAPI blob；
+│   │                       以及 ReadProcessMemory 扫描运行中的 WorkBuddy.exe
+│   ├── http_client.py    ← HTTP（UA 跟随真实客户端版本）
+│   ├── buddy.py          ← ★ 2026-10-28 桌宠在岗核对/纠偏（选猫：品级>技能>最早获得）
+│   ├── tasks.py          ← ★ 2026-10-28 成长任务自动 accept + claim
+│   ├── growth.py         ← ★ 2026-10-28 连登兑换 / 补登 / 抽奖 / 能量盲盒
+│   ├── activity_watch.py ← ★ 2026-10-28 晚间活跃看门狗（21:30 / 23:40 两档，只读不代发）
+│   └── ima.py            ← ★ 2026-10-28 ima 算力签到（独立账号体系，需单独扫码）
 │
 ├── install.cmd / uninstall.cmd / doctor.cmd
 ├── run_now.cmd / login.cmd / wait_token.cmd      ← 双击入口（纯 ASCII）
@@ -210,7 +218,7 @@ Windows 版本省略了可选的 XML 字段，`doctor.py` 会自动用 PowerShel
 py -3 install.py install                  :: 注册（默认主任务 + watchdog + 每日唤醒 + 白天唤醒，共四个）
 py -3 install.py install --interval 15    :: 自定义主任务间隔
 py -3 install.py install --no-watchdog    :: 只装主任务
-py -3 install.py install --dry-run        :: 只生成 XML 不注册（可在 mac 上审阅）
+py -3 install.py install --dry-run        :: 只生成 XML 不注册（排查 XML 结构用）
 py -3 install.py uninstall                :: 卸载（四个任务一起删，不删文件）
 py -3 install.py status                   :: 看四个任务的定义 + 最近运行痕迹
 py -3 install.py run                      :: 立即前台跑一次
@@ -285,7 +293,7 @@ Python 被卸载、文件夹被移走 —— 主脚本会**连告警机制一起
 | **当日签到与旅行奖励都到手后** | 之后每次触发同样立即退出，不做续期检查、不做端点探测 | 同上，不报 stale |
 | 其他时间 | 照常全量运行 | 照常判定 |
 
-**为什么要有这条**：电脑睡眠时，系统的维护唤醒（mac 的 Power Nap / Windows 的唤醒器）
+**为什么要有这条**：电脑睡眠时，系统的维护唤醒器
 会定期把机器叫起来几秒，计划任务随之被触发。这些触发里绝大多数根本无事可做，
 照常跑完一套流程就是纯空转。静默把它压成「启动解释器 → 看时间 → 退出」。
 
@@ -294,64 +302,52 @@ Python 被卸载、文件夹被移走 —— 主脚本会**连告警机制一起
 > 注意：静默**不减少系统自身的唤醒次数**，只是让我们在那些唤醒窗口里不干活。
 > Windows 的唤醒次数本身就由上面那个每日唤醒器决定（每天最多 1 次）。
 
-> 关于命令前缀：**Windows 上用 `py -3`**。脚本内部那些与 mac 版逐字一致的共享文件
-> （主要是 `scripts/main.py`）的文档字符串里写的是 `python3`，那是 mac 版原文 ——
+> 关于命令前缀：**统一用 `py -3`**。部分脚本的文档字符串里写的是 `python3`（早期写法），
 > 在 Windows 上等价于 `py -3`，照着上面这张表用即可。
-> 另外：**通知与报错文案里的操作指引是按平台生成的**，Windows 上会直接告诉你
+> 另外：**通知与报错文案里的操作指引固定为 Windows 命令** —— 会直接告诉你
 > 「双击 login.cmd / doctor.cmd」，不会给你一条跑不通的命令。
 
 ---
 
-## 5. ★ Windows 版独立迭代规则（2026-10-21 起）
+## 5. ★ 维护规则（单平台）
 
-> **用户明确要求：这边只改 Windows 端，Mac 侧不用管、也不要提同步；
-> 两套系统分别优化迭代，互不通信。** 这一节写给未来的自己（或 AI）看。
+> **本项目只做 Windows。** 2026-10-21 起，另一套 macOS 实现被整体移除
+> （目录、平台分支、平台文案、对应自检断言），这里不再存在「另一侧」这个概念。
+> 这一节写给未来的自己（或 AI）看。
 
-### 5.0 与 macOS 版的关系（一句话说清）
+### 5.0 三条边界（先说清楚）
 
-2026-10-21 之前是「两套一起改、若干文件必须逐字一致」—— **该约定已作废**。
-`../00_For_Mac/` 是 Mac 侧自己的产品，不是本项目的待办事项：
+- 不需要考虑「别处是怎么写的」，也不存在需要同步的对象；
+- 文档 / 提交说明 / 结论里不写「待同步 / 未同步 / 建议移植」这类话；
+- 想加跨平台支持时，**先确认是不是真的要做**——本项目已有明确取舍：只服务 Windows。
 
-- 它有没有缺陷、改没改，**与这里无关**；
-- 这边修了什么，**不需要**「同步过去」，也不需要为了「以后好合」而迁就它；
-- 文档 / 提交说明 / 结论里**不要出现**「Mac 侧待同步 / 未同步 / 建议移植」；
-- 只有用户**明确点名**要处理 Mac 侧时，才去动那个目录。
-
-### 5.1 Windows 版内部的分层
+### 5.1 代码分层
 
 | 类别 | 文件 | 改动要求 |
 |---|---|---|
-| **平台差异收口** | `winenv.py` | 所有平台判断（`sys.platform` / `os.name` / `CREATE_NO_WINDOW` / 盘符 / `%APPDATA%`）只能写在这里，其它文件一律调 `winenv.xxx()` |
-| **自带平台分支（刻意保留）** | `scripts/credentials.py`、`paths.py` | 文件内部用 `sys.platform` 三选一。**不要**因为「这里只用 Windows」就去删 darwin 分支 —— 属于无收益改动，还会打掉自检里跨平台路径候选的断言 |
-| **Windows 版主体** | `catchup.py`、`notify.py`、`renew.py`、`clawbot.py`、`watchdog.py`、`scripts/*.py` | 自由改，只受 5.2 三条硬规则约束 |
-| **仅 Windows 存在** | `install.py`、`doctor.py`、`selftest.py`、`notify_card.py`、`*.cmd` | 同上 |
+| **平台差异收口** | `winenv.py` | 编码、路径候选、通知后端、解释器探测、`CREATE_NO_WINDOW` / 盘符 / `%APPDATA%` —— 全部只能写在这里，其它文件一律调 `winenv.xxx()` |
+| **少量自有判断（刻意保留）** | `scripts/credentials.py`、`paths.py` | 这两个文件各自写一点 `sys.platform` 判断来挑候选路径，是它们自身设计的一部分 |
+| **业务主体** | `catchup.py`、`notify.py`、`renew.py`、`clawbot.py`、`scripts/*.py` | 自由改，只受 5.2 三条硬规则约束 |
+| **Windows 专属工具** | `install.py`、`doctor.py`、`selftest.py`、`notify_card.py`、`*.cmd` | 同上 |
 
-`watchdog.py` 仍然刻意**不 import 任何项目模块**（免得同一个故障同时干掉主脚本与监控），
-所以它自己写 `sys.platform` 判断 —— 这一点与它是否跟 mac 版一致无关。
+`watchdog.py` 刻意**不 import 任何项目模块**（免得同一个故障同时干掉主脚本与监控），
+所以它自己写 `sys.platform` 判断。
+`winenv.pid_alive()` 则**刻意不留平台分支**：Windows 上 `os.kill(pid, 0)` 会真的
+TerminateProcess 掉那个进程，所以这里一律用 `tasklist` 查询。
 
-### 5.2 硬规则（这三条与 Mac 无关，仍然有效）
+### 5.2 硬规则（三条）
 
-1. **任何新增的平台判断（`sys.platform` / `os.name` / `osascript` / `CREATE_NO_WINDOW` / 盘符路径 / `%APPDATA%`），只许写在 `winenv.py` 里。**
-   其它文件只能调用 `winenv.xxx()`。`selftest.py` 第 8 节会**自动检查**这项：
-   ```
-   ✗ osascript 只出现在 winenv.py（平台差异已收口）
-   ```
-   一旦你在别处写了 `osascript`，自检立刻报错。
+1. **平台相关的东西只许写在 `winenv.py` 里**（编码处理、路径候选、通知后端、
+   解释器探测、`CREATE_NO_WINDOW` / 盘符路径 / `%APPDATA%`）。
+   其它文件只能调用 `winenv.xxx()`，不自己写判断。
 
-   > **两条明列的例外**：
-   > 1. **`scripts/credentials.py` 与 `paths.py`** —— 它们内部用 `sys.platform` 分支
-   >    选择候选路径（这是文件设计的一部分，见 5.1 表）。把分支改成 `winenv.xxx()`
-   >    只会让文件与环境耦合更紧，属于倒退。
-   > 2. **`watchdog.py`** —— 它刻意不 import 任何项目模块（免得同一个故障同时干掉
-   >    主脚本与监控），所以只能用 `sys.platform` 自己判断。注意它是唯一一处
-   >    **故意**用 `winenv.IS_WIN` 而不调 `platform()` 的地方之一
-   >    （另一处是 `winenv.pid_alive`，理由见那边注释：Windows 上 `os.kill(pid,0)`
-   >    会真的杀进程，这里必须反映**真实**操作系统、不能被测试桩翻过去）。
-   >
-   > 除这两类之外，新写的平台判断一律进 `winenv.py`。
+   > **两处明列的例外**：
+   > 1. **`scripts/credentials.py` 与 `paths.py`** —— 各自用 `sys.platform` 分支
+   >    选择候选路径（见 5.1 表）。把分支改成 `winenv.xxx()` 只会让文件与环境耦合更紧。
+   > 2. **`watchdog.py`** —— 它刻意不 import 任何项目模块，所以只能自己判断。
 
-2. **禁止在 Win 版任何文件里出现 mac 用户路径**（`/Users/<name>...`、`.workbuddy/binaries/python`）。
-   自检第 8 节会扫全目录。同理，mac 版也不该出现 `C:\` 或 `%APPDATA%`。
+2. **禁止出现非 Windows 的路径与命令**（`/Users/...`、`osascript`、`launchctl`、
+   `Info.plist`）。自检第 8 节会扫全目录，连 `selftest.py` 自己也在约束范围内。
 
 3. **解释器路径永远不硬编码**：用 `winenv.default_python()` / `dialog_python()`，
    整个文件夹拷到任何机器都能直接跑。
@@ -359,41 +355,32 @@ Python 被卸载、文件夹被移走 —— 主脚本会**连告警机制一起
 ### 5.3 改完后的验证动作（照着做，两分钟）
 
 ```bash
-# 在 mac 上就能做，不需要 Windows 机器
+cd "...\00_For_Win"
 
-cd ".../09_Workbuddy自动签到领积分/00_For_Win"
+# ① 自检：除沙箱假阴性外，不应有任何 ✗
+py -3 selftest.py
 
-# ① 自检：必须 0 失败
-#    项数随环境浮动：本机 macOS 基线 433 项（Python 3.13.12）；
-#    Windows 真机原基线 415 项，本轮新增 26 项（第 8q 节），故真机应为 441 项。
-python3 selftest.py
-#    mac 侧对应的局部回归脚本在 ../00_For_Mac/verify_notify_fixes.py（35 项，桩测通知路径）
+# ② 编译校验
+py -3 -m py_compile *.py scripts/*.py && echo "COMPILE OK"
 
-# ② 差异清单：逐字一致的那 6 个文件差异必须是 0
-#    （mac 版在同级的 00_For_Mac/，2026-09-18 整理目录后如此）
-for f in scripts/main.py scripts/checkin.py scripts/travel.py \
-         scripts/credentials.py ../00_For_Mac/runtime/config/notify_config.json \
-         ../00_For_Mac/runtime/config/renew_config.json; do
-  echo "$(diff "../00_For_Mac/$f" "$f" | grep -c '^[<>]')  $f"
-done
-# 期望输出全部为 0
+# ③ 计划任务 XML 结构（只生成 XML，不注册）
+py -3 install.py install --dry-run
 
-# ③ 编译校验
-python3 -m py_compile *.py scripts/*.py && echo "COMPILE OK"
+# ④ 三套离线桩测（不联网、不发消息；动了 catchup 的通知或 tasks/growth 就要跑）
+py -3 verify_notify_layout.py
+py -3 verify_growth_makeup.py
+py -3 verify_activity_watch.py
 ```
 
-> **不再需要**和 `../00_For_Mac/` 做逐字比对 —— 那是 2026-10-21 之前的做法，已取消。
-> `selftest.py` 第 8 节仍会**打印**两边有多少文件相同/不同，但那只是信息，不计入判定；
-> 分叉是预期结果，不是问题。
->
-> 自检基准：Windows 真机当前 **479 项 / 477 通过**；2 项失败固定是沙箱拦了
-> `schtasks.exe` / `reg.exe`（程序黑名单），与代码无关 —— 放行沙箱或在真机桌面会话里跑即全绿。
+> 自检基准：**478 项 / 476 通过**（2026-10-28）。那 2 项失败固定是沙箱拦了
+> `schtasks.exe` / `reg.exe`（程序黑名单），与代码无关 —— 放行沙箱或在真机桌面会话里
+> 跑即全绿。项数会随新增断言而变，判断标准始终是「除这 2 项之外没有别的 ✗」。
 
-> **从 mac 拷贝后先清一遍 `._*`。** macOS 往 U 盘 / 网络共享 / exFAT 上写文件时，会为每个
-> 文件额外生成一个 `._同名` 的 AppleDouble 伴生文件（二进制，头 4 字节 `00 05 16 07`）。
-> 它们不参与运行，但会让所有「按后缀扫描」的检查炸掉（自检的 `.py 可编译` / `.cmd 纯 ASCII`
-> 都踩过），也让交付物看起来不干净。清理：`find . -name '._*' -delete`；
-> 自检第 8 节现在会**主动点出**残留数量并给出这条命令。
+> **从别处（尤其是 macOS）拷来的文件夹，先清一遍 `._*`。** macOS 往 U 盘 / 网络共享 /
+> exFAT 上写文件时，会为每个文件额外生成一个 `._同名` 的 AppleDouble 伴生文件
+> （二进制，头 4 字节 `00 05 16 07`）。它们不参与运行，但会让所有「按后缀扫描」的检查
+> 炸掉（自检的 `.py 可编译` / `.cmd 纯 ASCII` 都踩过）。
+> 清理：`find . -name '._*' -delete`；自检第 8 节会主动点出残留数量并给出这条命令。
 
 ### 5.4 改一处代码前的自问清单
 
@@ -406,28 +393,6 @@ python3 -m py_compile *.py scripts/*.py && echo "COMPILE OK"
    → 顺带想一下：跨日重置时要不要清？`status` / `doctor` 要不要展示？
 4. **改完跑过 `selftest.py` 了吗？** 新增行为要配断言，**包括反向断言**
    （「不许再退回旧行为」那种）。只加正向断言，等于没有护栏。
-
-### 5.5 与 macOS 版的历史差异对照（仅供查证，不再维护）
-
-| 文件 | 差异内容 | 原因 |
-|---|---|---|
-| `catchup.py` | 解释器取值、`setup_stdio()`、通知文案里的操作指引、锁的残留判定（`winenv.pid_alive()`） | 平台 |
-| `notify.py` | 本地通知调用（`winenv.native_notify` vs `osascript`）、`status` 里的本机通知自测实现 | 平台 |
-| `renew.py` | 游标目录候选、`status` 里解释器路径显示 | 平台 |
-| `clawbot.py` | `settings.json` 路径候选、登录引导文案、HTML 字体栈 | 平台 |
-| `api_discovery.py` | asar 路径候选、客户端探测 | 平台 |
-| `http_client.py` | UA 版本探测 | 平台 |
-
-> 下表是 2026-10-21 之前「两套对齐」时期的记录，**留作查证用**：
-> 想知道某个差异是历史原因还是本轮引入的，可以对照。
-> 但它**不再是约束** —— 两套已独立，差异继续扩大是正常的。
-
-> 参考基线（2026-09-19 复测，两套对齐时期）：`catchup.py` 154、`notify.py` 190、
-> `renew.py` 149、`clawbot.py` 83、`scripts/api_discovery.py` 55、`scripts/http_client.py` 17。
-> 口径是 `diff | grep -c '^[<>]'`（换个口径能差出好几成：`diff | wc -l` 数出来是 215 / 254 / 181）。
->
-> **这两个数现在只是历史快照，不用再刷新**。两套独立以后 `catchup.py` / `notify.py` 的
-> 差异必然越拉越大（本轮 10-21 的通知改造就全在 Windows 侧），这是预期结果。
 
 ---
 
@@ -508,7 +473,7 @@ python3 -m py_compile *.py scripts/*.py && echo "COMPILE OK"
 排查时别拿「多久没发消息」当判据。代码里的熔断时长（120/60/20 分钟）只是防止把 iLink
 每日配额烧在注定失败的请求上的工程取舍，**不代表我们已知道成因**。
 
-> ⚠️ **2026-09-29 追记（macOS 侧实测）：上面这个"持续轮询"推测也站不住了。**
+> ⚠️ **2026-09-29 追记（实测）：上面这个"持续轮询"推测也站不住了。**
 > 09-27 11:01 之后推送**连续失败两天**，而这两天桌面端一直在跑、游标文件每几十秒刷新一次
 > —— **在轮询，却依然发不出去。** 同期唯一的变量是"用户在 09-29 09:31 给机器人发过消息"，
 > 随后 10:42 用**同一枚 09-25 捕获的旧令牌**发送成功。
@@ -523,7 +488,7 @@ python3 -m py_compile *.py scripts/*.py && echo "COMPILE OK"
 > ⚠️ **2026-10-02 追记：上面那句里的「检测到入站」必须看两个判据，不能只看一个。**
 > 原实现只认「本次轮询当场捕获到入站」（`refreshed`）。但入站消息可能已被**别的路径**收走
 > （上一轮 tick / `renew.py` / 手工探测），游标一前进，本次轮询就永远看不到它，`refreshed`
-> 恒为 False —— 用户按提示发完消息，仍要干等满 240 分钟。macOS 侧当天实测踩到：
+> 恒为 False —— 用户按提示发完消息，仍要干等满 240 分钟。2026-10-02 当天实测踩到：
 > 10:55 已捕获到入站，`flush` 还是回「215 分钟后再试」，到账通知白压 4 小时。
 > 现在**补上第二判据**：记录里的「最后一次入站时刻」(`context_token_ts`) 晚于
 > `last_send_error_ts` 也视为窗口已重开、立刻放行。配额仍然安全 —— 失败后
@@ -694,7 +659,7 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
    → 笔记本一拔电源，任务被**静默跳过且不报错**。`install.py` 显式设 `false`。
 
 2. **计划任务默认不补跑错过的触发**（`StartWhenAvailable` 默认 false）
-   → 不打开就退化成"必须卡着点开机"。`install.py` 显式设 `true`，对齐 mac 版 launchd 的补发能力。
+   → 不打开就退化成"必须卡着点开机"。`install.py` 显式设 `true`，以支持开机 / 唤醒后补跑。
 
 3. **任务 XML 的编码**
    → XML 用 **UTF-16** 写出（`schtasks /XML` 要求），彻底绕过 cmd 代码页把中文打成乱码的问题。
@@ -849,25 +814,34 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
 旧实现把②也报成①。而 10-08 那条 11461 分钟，正好等于关机时长 —— 典型的「狼来了」，
 喊多了真出事时反而没人信。
 
-**修法**（`watchdog.py` 的 `_machine_was_off`）：机器是否「没在跑」用**两个独立判据**判，
-任一成立即豁免「心跳陈旧」这一项告警（只豁免这一项）：
+**修法**（`watchdog.py` 的 `_slept_minutes`）：不去猜「机器开没开」，直接算
+**这次检查与上次检查之间，系统睡了多久**：
 
-| 判据 | 抓什么 | 抓不到什么 |
-|---|---|---|
-| 开机时长 < 90 分钟（`GetTickCount64`） | 关机再开机 | 只休眠不重启（uptime 仍在累积） |
-| 上次自查距今 ≥ 60 分钟（自查自己的节奏，正常间隔 18~30 分钟） | 休眠唤醒 | 刚开机就连着触发两次 |
-
-两者互补；都缺数据时**保守判「不是机器没跑」**（宁可报，不瞒）。
-`unloaded`（任务被删/停用）与 `missing`（state 不存在）**不受豁免** —— 它们与机器开不开机无关。
-
-**怎么复核「这次为什么没报警」**：`python watchdog.py status` 的 JSON 里直接给出判据：
-
-```json
-"machine_was_off": true,   "uptime_minutes": 13.3,   "self_gap_minutes": null,
-"quiet_hours": false,      "day_finished": true,     "problems": []
+```
+wall 时钟走过的时长 − monotonic 时钟走过的时长 = 期间的睡眠时长
 ```
 
-（自检新增 12 条断言把这个真值表锁死，含「反向」一条：机器一直在跑时真停摆照报。）
+`time.monotonic()` 走 `GetTickCount64`，**不计入系统睡眠**；wall 时钟照走。
+两者之差正好是睡眠时长。差值 ≥ `STALE_MINUTES`（90 分钟）就判 `just_woke`，
+豁免「心跳陈旧」这一项告警（只豁免这一项）。
+
+> 为什么不用「开机时长 + 距上次自查间隔」那套双判据（2026-10-21 已废弃）：
+> 它在「只休眠不重启」（uptime 仍在累积）、「手动改系统时间」这几类场景下会误判，
+> 而且必须两个判据互相补位才勉强覆盖。一个判据能算清的事，不必用两个。
+
+`unloaded`（任务被删/停用）与 `missing`（state 不存在）**不受豁免** —— 它们与机器开不开机无关。
+
+**怎么复核「这次为什么没报警」**：`py -3 watchdog.py status` 的 JSON 里直接给出判据：
+
+```json
+"just_woke": true,        "slept_minutes": 476.3,
+"quiet_hours": false,     "day_finished": true,     "problems": []
+```
+
+`slept_minutes = null` 表示**没有基线**（首次运行 / 基线残缺），此时按「刚睡醒」保守豁免。
+
+（自检把这张真值表锁死：整夜睡眠后刚醒不报、一直醒着照报、睡眠不足 90 分钟仍报、
+无基线豁免、基线残缺不抛异常。）
 
 ---
 
@@ -910,9 +884,9 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
 `checkin_local_fails` / `claim_local_fails`；`*_last_kind` 会记为 `"local"`。
 两者为 0 说明没再发生。
 
-**平台差异提醒**：这条只对 Windows 成立。macOS 用 Keychain / 本地密钥文件取密钥，
-不依赖客户端进程，客户端没开也能签到。**同理，Mac 侧不需要修这个问题，
-也不需要把这里的分支搬过去** —— 两套系统独立迭代（第 5 节）。
+**为什么 Windows 上必然有这个问题**：5.6.2+ 的 `accessToken` 是 at-rest 加密的，
+密钥只能从**运行中的客户端进程**里取。客户端没开 → 解不出密钥 → 签不上。
+这不是脚本能修的 —— 要么让客户端开机自启，要么接受当天签不上。
 
 ---
 
@@ -962,13 +936,143 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
 
 ---
 
+## 7g. 成长任务 / 成长空间 / 活跃看门狗 / ima（2026-10-28 从 Mac 侧同步）
+
+这一批把 Mac 端 2026-10-28 的 5 个模块与通知改版同步到 Win。**形状与 Mac 一致**，
+差别只在通知措辞（见文末「Win 侧偏离」）。
+
+### 7g.1 五个新模块（都在 `scripts/`，零平台依赖）
+
+| 模块 | 干什么 | 什么时候跑 |
+|---|---|---|
+| `buddy.py` | 派遣前核对在岗猫，不一致就纠偏回去 | `travel.py` 每次派遣前（可选模块，坏了退化成用当前猫） |
+| `tasks.py` | 成长任务自动 accept + claim | catchup 每 60 分钟一次 |
+| `growth.py` | 连登兑换 / 补登 / 抽奖 / 能量盲盒 | catchup 每 60 分钟一次，排在 tasks 之后 |
+| `activity_watch.py` | 21:30 / 23:40 检查热力墙有没有点亮，黑了就提醒 | catchup 每轮（未到点/已点亮则零请求） |
+| `ima.py` | ima 算力每日签到（**另一套账号**） | catchup 每轮；未配凭据时整块跳过（本机 2026-10-28 已扫码配好） |
+
+**四条不能违反的红线**（违反任一条都会造成实际损失）：
+
+1. **不要拿品级做旅行收益优化** —— 实测品级与积分无关。4 个地点的奖励区间完全一致
+   （5–10 分 / 1–4 小时），42 天真实记录里 R 级猫也拿到过 10 分。锁猫只为观感一致、
+   防止白天手动换猫后被意外派出去。
+2. **不要模拟对话请求刷活跃分** —— 既是伪造使用行为，也没有收益（分数高低不换奖励，
+   三档只按 7/14/28 天算）。所以 `activity_watch` 只读、只提醒，绝不代发。
+3. **补登前必须先在本地推演** —— 卡不够且跨不过档位时一张都不花（见 `growth.plan_makeup`）。
+4. **盲盒 / 兑换 / 补登 / 抽奖一律「有进项才发，没进项一声不响」。**
+
+### 7g.2 通知改成「一条快照 + 第二条只列变化」
+
+原来是「签到到账一条、旅行到账一条」。现在：
+
+```
+每日签到：连续 29 天 · 3/3 完成          ← 标题：跨月累计连签 + 完成度
+1、WorkBuddy 签到：
+成功，+100 积分（Buddy应用），本月连续签到 28 天    ← 正文：本月连登（决定档位）
+2、WorkBuddy 旅行：
+猫已到达 · 暴富喵（UR），奖励领取 +7 积分
+3、ima 算力：
+成功，+50 算力，本周已签 3 天
+
+今日进度：签到 ✓ / 旅行 ✓ / ima ✓
+时间：2026-10-28 11:34
+```
+
+- **两个「连续天数」不是一回事**：标题的 29 天是签到接口的跨月累计（成绩），
+  正文的 28 天是成长空间的连登（每月 1 日清零，决定兑换档位与补登）。
+  差 1 是正常的，别当成 bug 去「修」。
+- **第二条只列本轮真有变化的那几项**（典型是「猫已到达 +7」），但「今日进度 / 时间」
+  永远保留；三项全无变化时**退回完整版**，绝不发一条只有进度和时间的空消息。
+- **失败告警永不精简**，而且不受 `msg_first_sent` 影响。
+- **tasks 与 growth 同轮都有收益时合并成一条**；growth 本轮没收益时由
+  `_flush_growth_pending()` 补发 tasks 那条 —— 少了它，那条消息会一直躺在 state 里，
+  跨日重置时被清掉，**等于少报收益**。
+
+### 7g.3 与 Mac 的差异（现役 3 处，另有 2 处已于收尾时消除）
+
+**现役偏离 —— Win 有、Mac 没有，别当成「不一致」去删掉：**
+
+1. **`_short_reason` 保留**：失败正文只说人话（「读不到登录态：WorkBuddy 客户端没有
+   在运行」），不印 `C:\Users\...\workbuddy-desktop.info`。Mac 直接印原文。
+2. **失败节流 / 同因合并 / local 分类全部保留**（Mac 没有）：`_fail_signature`、
+   `_fail_alert_due`、`_local_quiet`、`_gap_for`、`_short_reason`、
+   `_reshow_pending_notifications` 一个没动。这是 10-19/10-21 两次通知刷屏的修复，
+   **不要再当成「和 Mac 不一致」而删掉**。
+3. **`ima.py` 的提示文案改成 Windows 命令**：4 处 `python3 scripts/ima.py login` →
+   `python scripts\ima.py login`（Win 上照抄 `python3` 会「找不到命令」）。只动字符串与
+   注释，逻辑零改动。副作用：`ima.py` 从此不再与 Mac 版逐字节相同，下次同步要手工 merge
+   —— 别直接整文件覆盖回去，会把这段文案改回 `python3`。
+
+**已于 2026-10-28 晚消除的 2 处 —— Mac 反向补齐，现在两端同构，不再是差异：**
+
+- **`activity_watch` 的级别**：Win 一直写 `"warning"`，当时 Mac 写的是 `"warn"`。
+  `notify._LEVEL_SWITCH` 只认 success/failure/warning/info/…，拼错就落进 `notify_noop`
+  兜底，而它默认 **False** → **静默丢弃**：不报错、不进失败日志。结果 Mac 的晚间看门狗
+  上线当天一条提醒都发不出去，而 Win 这侧一直是好的。
+  **现在两端都必须写 `"warning"`**，Mac 侧有 `verify_activity_watch.py` S10 断言守着。
+- **ima 未配凭据的处理**：Win 先做了「先查 `ima.load_cred()`，为 `None` 就整块跳过，
+  日志每天只记一行」。Mac 原先是每轮 `log()` 一次（一天 288 行），且 `blocked_day`
+  跨日重置后每天还会再推一条授权提示。Mac 已按同一实现补齐 `_log_once_a_day()`，
+  剩下的差别只有提示命令的措辞（`python` / `python3`，见上条第 3 点）。
+
+### 7g.4 ima 需要单独授权（本机已完成，2026-10-28）
+
+ima 与 WorkBuddy 是**两套完全独立的账号体系**，凭据不共用。ima 没有账号密码通道，
+唯一登录方式是微信扫码：
+
+```bat
+:: 首次授权 / token 失效 / 换账号时，跑这一条，微信扫一次
+python scripts\ima.py login          :: 二维码写到 runtime\cache\ima_login_qr.png
+
+:: 验证（不打印 token，只看状态）
+python scripts\ima.py status
+:: → {"ok": true, "today": "已领取", "checkin_days": 3, "total_reward_points": 150, ...}
+```
+
+凭据落在 `runtime\config\ima_credentials.json`（`runtime/` 已被 `.gitignore` 排除，
+不进 git）。`refresh_token` 会自动续期，**扫一次就一直有效**，不用每天管。
+
+配好之前，`catchup` 每天只在日志里记一行「ima 未配置凭据」并整块跳过，不发任何通知；
+配好之后每轮 tick 自动签到（+50 算力/天），已领过则幂等返回，不重复领也不报错。
+
+> 想复用本机 ima 客户端的登录态是**做不到**的：客户端用 `FILE_SHARE_NONE` 独占锁着
+> `Network\Cookies`，运行中连只读都打不开；而且它那个 token 里没有 `userId`，
+> 而 `refresh` 接口强制要 `userId`。所以别在这上面花时间，扫码最快。
+
+### 7g.5 三套离线桩测（不联网、不发消息）
+
+```bat
+python verify_notify_layout.py     :: 8 组 / 36 条：排版、第二条精简、失败不精简、合并与补发
+python verify_growth_makeup.py     :: 7 组 / 43 条：补登先算再花、不白花、三档全兑省卡、幂等
+python verify_activity_watch.py    :: 10 组 / 38 条：未到点零请求、两档不重复、读失败不写 state、通知级别契约
+```
+
+**它们的断言条数不是「差不多就行」**：每一条后面都有一个真实踩过的坑。
+移植/重构时允许新增，**不要删**。另外三套桩测都**不会**往 `runtime/logs/catchup.log`
+写假记录（`verify_notify_layout` 会替换 `log`），可用「跑前后行数相等」自查。
+
+### 7g.6 换猫 / 补登这类写操作的验收口令
+
+```bat
+python scripts\buddy.py status              :: 当前在岗猫 + 目标猫 + 是否一致
+python scripts\buddy.py ensure --dry-run    :: 只算不换
+python scripts\buddy.py ensure              :: 连跑两次，第二次必须 switched=false
+python scripts\growth.py status             :: 连登 / 档位 / 卡 / 补登计划（零写请求）
+python scripts\growth.py run --dry-run      :: 只推演不兑现
+```
+
+`growth.py status` 里 `streak_if_patched` 必须**等于**服务端 `streak_days`（不补卡时）——
+两者不一致说明本地推演模型算错了，**先别上线**。
+
+---
+
 ## 8. 安全与不干扰承诺
 
 - **不写入文件夹以外的任何数据**（唯一的系统侧痕迹是计划任务注册项，`uninstall.cmd` 可清除）
 - **自检自身不改动系统**：`selftest.py` 不注册 / 不删除任何计划任务，也不发消息
   （2026-09-20 修：此前它是靠「以子进程跑一次真正的 `install`」来验证非 Windows 守卫的，
   在任何 Windows 机器上都会**真的注册一个计划任务** —— 现在改为在进程内翻转平台断言守卫）
-- **不修改 `../00_For_Mac/` 的 mac 版任何文件**，两套完全独立运行
+- **不修改本目录以外的任何文件**（唯一的例外是计划任务注册项）
 - 凭据只从本机 `settings.json` 读取，**不打印、不写日志、不进代码**
 - 所有网络请求只发往 WorkBuddy 官方接口
 - 沙箱/只读命令（`doctor.py`、`main.py status`、`notify.py status`）**不领积分、不发消息**
@@ -977,8 +1081,8 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
 
 ## 9. 一次性完整验证（交付前做过）
 
-自检脚本**在 Windows 与 macOS 上都能跑**（不再假设本机是 mac），Windows 真机最近基线
-**415 项全部通过**（2026-09-28 复测；项数随环境浮动，判据是 0 失败）。它实际验证了：
+自检脚本的可运行性已在**真实 Windows** 与受限环境两头验过，真机最近基线
+**478 项 / 476 通过**（2 项为沙箱拦 `schtasks.exe` / `reg.exe` 的假阴性）。它实际验证了：
 
 - 计划任务 XML 结构合法（命名空间、触发器、重复间隔、几个关键布尔值、UTF-16 编码往返），
   并单独钉死「**轮询主任务 `WakeToRun=false` / 唤醒任务 `WakeToRun=true` 且不带重复触发**」
@@ -990,9 +1094,9 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
 - 闸门逻辑、当日去重、状态文件往返
 - 模块导入链完整，6 个 `.cmd` 入口可运行
 - 非 Windows 上 `install` **明确报错**而不是静默假装成功（在进程内翻转平台断言，**不真的注册任务**）
-- 没有硬编码 mac 路径泄漏进 Windows 版；`.cmd` 为纯 ASCII；**没有 `._*` 拷贝残留**
-- **用户可见文案的平台适配**（第 8b 节）：真机平台、假装 Windows、再翻回 mac 三段都验，
-  把通知与报错的正文真正渲染出来，断言里面**不出现 `python3`**、且指向 `login.cmd` / `doctor.cmd`
+- 没有硬编码的跨平台路径泄漏进代码；`.cmd` 为纯 ASCII；**没有 `._*` 拷贝残留**
+- **用户可见文案不出现非 Windows 命令**（第 8b 节）：把通知与报错的正文真正渲染出来，
+  断言里面**不出现 `python3`**、且指向 `login.cmd` / `doctor.cmd`
 - **watchdog 的独立性**（第 8d 节）：用 `ast` 查它真实的 `import` 语句，断言不依赖任何项目模块；
   并注入 `job_loaded` 覆盖「心跳新鲜 / 心跳过期 / state 缺失 / 任务未注册 / 两者并存 / 未超阈值」
   六种结论，外加**静默期与当日收工后不误报、而真故障照报**两种（2026-09-19 新增）
@@ -1077,7 +1181,7 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
 3. `uninstall.cmd` 的手动删除指引只提了 1 个任务，而当时 `install` 实际注册**三个** ——
    照它做会漏删 watchdog 与唤醒任务，调度仍在跑。已改为列全任务（含自定义任务名的提示）；
    后续又新增 `WorkBuddyRewardDayWake`，当前为**四个**。
-4. 从 mac 拷过来的 66 个 `._*` AppleDouble 残留在所有「按后缀扫描」的检查里炸掉，
+4. 从外部（U 盘 / 网络共享 / macOS 拷过来）带来的 66 个 `._*` AppleDouble 残留在所有「按后缀扫描」的检查里炸掉，
    已清理（临时备份未纳入公开仓库），
    并新增一条会主动点出残留的检查。
 
@@ -1178,7 +1282,7 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
 1. 还原环境变量时用 `os.environ.clear()` + `update(整份快照)` —— Windows 的环境块有
    32767 字符硬上限，本机实测存在一个 28 万字符的变量，于是直接 `ValueError` 崩在第四节，
    **后面 10 节再也跑不到**。现在只回写自己动过的那几个键。
-2. 断言「本机是 mac」的两处（`selfcheck_hint` 给 mac 命令、「项目路径本身含中文」）——
+2. 断言「本机平台」的两处（`selfcheck_hint` 给特定平台命令、「项目路径本身含中文」）——
    在 Windows / ASCII 路径下恒假失败。现在改成按**真实平台**断言 + 用确定性的中文路径
    现场跑一遍创建 / 写入 / 读回。
 3. 「非 Windows 上 install 必须失败」是用**真的注册一次计划任务**来间接验证的 ——
@@ -1186,8 +1290,8 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
 
 顺带把 `._*` 残留从所有「按后缀扫描」的检查里排除，并新增一条会主动点出残留的检查。
 
-> **为什么这些能溜进来：自检原本是「只在开发机（macOS）上跑」的。**
-> 一旦它真的被拿到 Windows 交付机上跑，所有「本机是 mac」的隐含假设同时暴露，
+> **为什么这些能溜进来：自检早期只在开发者本机跑过（那台不是 Windows）。**
+> 一旦它真的被拿到 Windows 交付机上跑，所有「本机不是 Windows」的隐含假设同时暴露，
 > 而环境变量的 32767 上限还把问题从「报几条假失败」升级成「**静默跳过 10 节**」。
 > 教训：**自检的断言必须对「运行环境」保持中立，或者显式声明依赖** ——
 > 否则它给的绿灯是假的。
@@ -1463,7 +1567,7 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
     读成另一个账号）→ **重新扫码一万次也没用**，还会白吃 120 分钟熔断。
     旧文案一口咬定①，把人往"反复扫码"上带 —— 而本轮上一节故障的真因恰恰是②。
     → 已重写 `_explain_error` 的 `-14` 分支：给出两种可能 + 一条自查路径（Windows 指向
-    `doctor.cmd` 的「⑥ 微信通道」，mac 给 `python3 clawbot.py status`）。
+    `doctor.cmd` 的「⑥ 微信通道」）。
 
 40. **桌面端不持久化 `context_token`，只持久化游标。** 把 `.cursor.json` 的写入点找全了：
     客户端只有 `persistCursor(accountId, cursor)` 一处落盘，路径是
@@ -1522,9 +1626,9 @@ token 只在**你给 bot 发消息的那一刻**随长轮询下发，纯轮询�
 然后双击 `check_channel.cmd`。本机没有绑定，所以"真机送达"这一格只能在那台绑定了的机器上验 ——
 但在这之前，凡是**能**在这台机器上验的（网络、协议、报文、错误语义、自愈路径、防假成功）都已经验过了。
 
-### 2026-09-29：补发路径的四个缺口（当时从 macOS 侧一并修，现已各自独立）
+### 2026-09-29：补发路径的四个缺口（历史记录）
 
-macOS 侧当天真实事故暴露了一组缺陷，Win 侧**结构同构、缺口完全相同**，故一并修：
+当天真实事故暴露了一组缺陷，两套结构同构、缺口完全相同：
 
 1. **补发路径从来不轮询入站消息。** 入站消息是本地判断「会话窗口是否重开」的唯一信号，
    而此前只有 `send()` 失败后的自愈窗口会去捕获（`_recover_while_cooling` /
@@ -1532,7 +1636,7 @@ macOS 侧当天真实事故暴露了一组缺陷，Win 侧**结构同构、缺�
    在微信里发了消息，补发那侧没有人在听，只能按固定间隔硬撞 `prepare failed`。
    → 新增 `clawbot.capture_inbound_once()`（轻量探针，问一次就返回，最长 5 秒），
    `flush_pending()` 有积压时先收一次信箱。没有积压时不轮询，常规 tick 零额外开销。
-2. **失败请求同样烧 iLink 配额，而补发没有节流。** macOS 侧当天把 8 条配额全烧在无效重试上，
+2. **失败请求同样烧 iLink 配额，而补发没有节流。** 当天把 8 条配额全烧在无效重试上，
    等用户真去开窗时反而没额度了。
    → 新增 `clawbot_blocked_retry_minutes`（默认 **240**）与 `_blocked_state_skip_send()`：
    「投递被拒 / 缺 context_token」状态下两次补发之间必须隔够间隔；
@@ -1549,8 +1653,9 @@ macOS 侧当天真实事故暴露了一组缺陷，Win 侧**结构同构、缺�
 
 **本节验证**：`00_For_Win/selftest.py` 新增第 **8q** 节 `test_notify_selfheal_paths`
 （26 项断言，覆盖上表四条 + 间隔限流的边界 + 配置自洽）。
-**项数口径**：macOS 上实跑为 **407 → 433**（沙箱缺 `schtasks.exe`，少数项为已知假阴性）；
-**Windows 真机基线 415 项，加本节 26 项后应为 441 项**，请以真机实际输出为准。
+**项数口径**：以真机实际输出为准（当前 **478 项 / 476 通过**，2 项为沙箱拦
+`schtasks.exe` / `reg.exe` 的已知假阴性）。项数会随断言增减而变，**判断标准始终是
+「除那 2 项之外没有别的 ✗」**。
 注：本文件的 `check()` 收的是**布尔条件**（不是"实测值 vs 期望值"），
 写断言时要写成 `... == 240` 这样 —— 直接传 `0` 会被当成 `False` 而恒假。
 
@@ -1560,4 +1665,4 @@ macOS 侧当天真实事故暴露了一组缺陷，Win 侧**结构同构、缺�
 
 ---
 
-*配套 mac 版文档见 `../00_For_Mac/README.md`。*
+*本文档只属于 `00_For_Win/`，与其它任何平台实现无关。*

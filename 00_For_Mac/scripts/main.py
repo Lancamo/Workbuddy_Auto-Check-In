@@ -68,6 +68,12 @@ def _log_result(task: str, result: dict) -> None:
         for key in ("credit", "streak_days", "reward_credit", "record_id", "arrive_at"):
             if result.get(key) is not None:
                 extras.append("{}={}".format(key, result[key]))
+        # 派了哪只猫 —— 排查「旅行用的怎么是那只」时，日志里得能看出名字
+        duty = (result.get("duty") or {})
+        cur = duty.get("current") or {}
+        if cur.get("name"):
+            extras.append("buddy={}{}".format(
+                cur["name"], "/" + str(duty.get("status")) if duty.get("status") else ""))
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         line = "[{}] {} {}{}".format(
             ts, task, status, (" " + " ".join(extras)) if extras else ""

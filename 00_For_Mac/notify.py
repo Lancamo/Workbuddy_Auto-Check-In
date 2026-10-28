@@ -129,6 +129,26 @@ _LEVEL_SWITCH = {
     "info": "notify_noop",
 }
 
+# 微信没送到、只能降级成本机弹窗时，标题必须自带"这条没进微信 + 该怎么办"。
+# 2026-10-23 用户选定方案（另一个方案是加不受窗口限制的第三方通道，暂不做）。
+#
+# 为什么非要写进标题：
+#   · 降级后的正文是「签到成功 +100 积分」这类**正常文案**，用户会以为一切正常；
+#   · 单独的通道告警（_alert_channel_expired）一天只弹一次，碰上勿扰/没在看屏幕就过去了；
+#   · 2026-10-23 真实发生：11:16 与 12:12 两次投递被拒，只留下本机弹窗，用户当天
+#     直到中午才自己发现"好像没收到微信"。
+#
+# **提示必须按原因给**：会话失效要重新扫码、配额用完只能等明天 —— 一律写
+# 「发一句话恢复」会把人引到错误动作上，比不给提示更糟。
+# 长度：macOS 通知标题会被 _send_macos 截到 100 字符，前缀 16 字，留够正文标题。
+DEGRADED_HINTS = {
+    "blocked": "⚠️ 微信未送达｜发一句话恢复｜",    # 会话窗口关：发条消息即可
+    "session": "⚠️ 微信未送达｜需重新扫码｜",      # 登录失效：只能重新授权
+    "quota":   "⚠️ 微信未送达｜今日配额已满｜",    # 请求被限：等次日
+    "none":    "⚠️ 微信未送达｜未配置通道｜",
+    "other":   "⚠️ 微信未送达｜网络异常待重试｜",
+}
+
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -803,14 +823,19 @@ def send(title: str, content: str, level: str = "info", force: bool = False,
 
     st = _load_state()
 
-    def _local_fallback() -> bool:
-        """本机通知兜底。block_local 时跳过（同一内容不重复弹窗）。"""
+    def _local_fallback(kind: str = "other") -> bool:
+        """本机通知兜底。block_local 时跳过（同一内容不重复弹窗）。
+
+        走到这里就一定意味着「这条没进微信」，所以标题按**降级原因**加对应前缀
+        （见 DEGRADED_HINTS）：让用户在看到内容的同一眼就知道"这只是本机弹窗、
+        以及下一步该做什么"。原因不同、动作不同，不能一句话套所有。
+        """
         if not cfg.get("macos_notification", True):
             return False
         if block_local:
             out["reason"] += "；本机通知此前已弹过，不重复弹（微信通道恢复后会自动补发）"
             return False
-        if _send_macos(title, content):
+        if _send_macos(DEGRADED_HINTS.get(kind, DEGRADED_HINTS["other"]) + title, content):
             out["channel"] = out["channel"] or "macos"
             out["reason"] += "；已降级为 macOS 通知"
             return True
@@ -834,7 +859,7 @@ def send(title: str, content: str, level: str = "info", force: bool = False,
     if not order:
         if not out["reason"]:
             out["reason"] = "无可用微信通道（请在 WorkBuddy 绑定 ClawBot，或配置 pushplus/serverchan 凭据）"
-        if _local_fallback():
+        if _local_fallback("none"):
             st.setdefault("local_sent", {})[fp] = now
         _prune_sent(st, now)
         _save_state(st)
@@ -848,7 +873,7 @@ def send(title: str, content: str, level: str = "info", force: bool = False,
     used, _ok_today = _daily_counts(st)
     if cap > 0 and used >= cap:
         out["reason"] = "已达今日微信请求上限 {}/{}，降级为 macOS 通知".format(used, cap)
-        if _local_fallback():
+        if _local_fallback("quota"):
             st.setdefault("local_sent", {})[fp] = now
         _prune_sent(st, now)
         _save_state(st)
@@ -931,7 +956,17 @@ def send(title: str, content: str, level: str = "info", force: bool = False,
     wechat_delivered = out["wechat"]
     local_delivered = False
     if not wechat_delivered:
-        local_delivered = _local_fallback()
+        # 原因取自最后一笔失败（`kind` 在循环里算过，这里按落盘的 last_send_error 复算，
+        # 因为 else 分支拿不到循环内变量）
+        err_txt = str(st.get("last_send_error") or out.get("reason") or "")
+        if clawbot is not None and clawbot.SESSION_EXPIRED_MARK in err_txt:
+            fb_kind = "session"
+        elif clawbot is not None and (clawbot.DELIVER_BLOCKED_MARK in err_txt
+                                      or "缺 context_token" in err_txt):
+            fb_kind = "blocked"
+        else:
+            fb_kind = "other"
+        local_delivered = _local_fallback(fb_kind)
         out["sent"] = local_delivered
 
     # 指纹按**通道**分别记（2026-09-18 修正，详见模块顶部说明）：

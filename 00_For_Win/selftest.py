@@ -1341,70 +1341,95 @@ def test_platform_hints() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8c. 到账通知必须拆分（签到 / 旅行 各一条）
+# 8c. 到账通知：一条快照 + 第二条只列变化（2026-10-28 与 Mac 侧统一）
 # ---------------------------------------------------------------------------
 def test_notification_split() -> None:
-    """签到到账与旅行到账必须**各推一条**，不能合并。
+    """到账通知的**形态**约定（2026-10-28 改版，替代原来的「签到/旅行各一条」）。
 
-    为什么单列：这是用户明确要求的行为（2026-09-18）。两件事实际相隔 1–2 小时发生，
-    合并成「+107 到账」会让人分不清哪笔是哪笔、也对不上时间线。
-    打桩 notify.send 捕获调用（**不真发消息、不消耗推送配额**）。
+    ⚠️ 这一节在 2026-09-18 起钉的是「必须拆成两条、不许合并」，2026-10-28 用户
+    要求与 Mac 侧统一成「一条编号快照」后，那组断言**全部过期**。这里按新契约重写，
+    但把当初两条真实顾虑保留成断言：
+      ① 数字不能丢（+100 / +7 必须在正文里出现）；
+      ② 有结果才发（无到账的巡检不发 success），否则会误报到账；
+      ③ 失败与到账同时发生时，**任何一方都不许被吞掉**（新形态是在同一条 failure
+         正文里把三项都写全，故障时还能对照）。
+    打桩 `notify.send` 与 `growth.current_streak_days`（**不真发消息、不联网**）。
     """
-    section("8c. 到账通知拆分（签到 / 旅行 各自一条）")
+    section("8c. 到账通知形态（一条快照 / 第二条只列变化）")
     import catchup
 
     captured: list = []
-    orig = catchup.notify.send
+    orig_send = catchup.notify.send
+    orig_growth = catchup.growth
     catchup.notify.send = lambda title, content, level="info", force=False: (
         captured.append({"title": title, "content": content, "level": level}),
         {"level": level, "sent": False, "channel": "stub", "reason": "selftest"},
     )[1]
+    # 本月连登天数钉成 28（真调会读账号接口，自检不该联网）
+    catchup.growth = type("G", (), {
+        "current_streak_days": staticmethod(lambda *a, **k: 28),
+        "run_daily": staticmethod(lambda *a, **k: {}),
+    })()
 
-    def run(c: dict, t: dict, done: dict | None = None) -> None:
+    def run(c: dict, t: dict, **state) -> None:
         captured.clear()
-        catchup._report(c, t, done or {"checkin_done": True, "claim_done": True}, {})
+        st = {"checkin_done": True, "claim_done": True}
+        st.update(state)
+        catchup._report(c, t, st, {})
 
     try:
         run({"status": "success", "credit": 100, "streak_days": 3,
              "activity": "高校新生攻略"},
-            {"status": "departed", "arrive_at": 1789701251})
-        check("签到成功 → 恰好推一条", len(captured) == 1,
+            {"status": "departed", "arrive_at": 1789701251},
+            checkin_done=True, claim_done=False)
+        check("签到成功 → 恰好推一条（不再拆成两条）", len(captured) == 1,
               "实际 {} 条：{}".format(len(captured), [x["title"] for x in captured]))
-        check("该条标题讲的是「签到到账」",
-              "签到" in captured[0]["title"] and "到账" in captured[0]["title"],
+        check("该条标题是快照体（含「每日签到：」与完成度）",
+              captured[0]["title"].startswith("每日签到：")
+              and "/" in captured[0]["title"], captured[0]["title"])
+        check("该条标题带累计连签天数", "连续 3 天" in captured[0]["title"],
               captured[0]["title"])
-        check("该条标题不提旅行（不合并）",
-              "旅行" not in captured[0]["title"], captured[0]["title"])
-        check("该条内容含积分与连续天数",
-              "+100" in captured[0]["content"] and "3" in captured[0]["content"],
+        check("正文含积分与本月连登两个口径",
+              "+100" in captured[0]["content"]
+              and "本月连续签到 28 天" in captured[0]["content"],
               captured[0]["content"])
-        check("签到到账级别为 success", captured[0]["level"] == "success")
+        check("正文是编号排版（签到第 1 项、旅行第 2 项）",
+              "1、WorkBuddy 签到：" in captured[0]["content"]
+              and "2、WorkBuddy 旅行：" in captured[0]["content"],
+              captured[0]["content"])
+        check("到账 notification 级别为 success", captured[0]["level"] == "success")
 
+        # 第二条：本轮只有旅行到账 → 只列旅行，但进度与时间仍在
         run({"status": "already_checked", "activity": "高校新生攻略"},
-            {"status": "claimed", "reward_credit": 7})
-        check("旅行领取成功 → 恰好推一条", len(captured) == 1,
+            {"status": "claimed", "reward_credit": 7},
+            msg_first_sent=True)
+        check("同一天第二条 → 仍只推一条", len(captured) == 1,
               "实际 {} 条：{}".format(len(captured), [x["title"] for x in captured]))
-        check("该条标题讲的是「旅行奖励到账」",
-              "旅行" in captured[0]["title"] and "到账" in captured[0]["title"],
-              captured[0]["title"])
-        check("该条内容含奖励积分 +7", "+7" in captured[0]["content"],
+        check("第二条只列变化项（不重复「今日已领过」的签到）",
+              "WorkBuddy 签到" not in captured[0]["content"],
               captured[0]["content"])
-        check("该条标题不提签到（不合并）",
-              "签到" not in captured[0]["title"], captured[0]["title"])
+        check("第二条内容含奖励积分 +7", "+7" in captured[0]["content"],
+              captured[0]["content"])
+        check("第二条仍保留今日进度与时间",
+              "今日进度" in captured[0]["content"] and "时间：" in captured[0]["content"],
+              captured[0]["content"])
 
+        # 同一次运行里两件都成 → 一条里说完（不再是两条）
         run({"status": "success", "credit": 100, "streak_days": 1},
             {"status": "claimed", "reward_credit": 7})
-        check("同一次运行里两件都成 → 推两条，不合并", len(captured) == 2,
+        check("同一次运行里两件都成 → 合成一条，不拆", len(captured) == 1,
               "实际 {} 条：{}".format(len(captured), [x["title"] for x in captured]))
-        check("两条标题互不相同（各自独立成篇）",
-              len({x["title"] for x in captured}) == 2,
-              str([x["title"] for x in captured]))
-        check("两条都是 success 级",
-              all(x["level"] == "success" for x in captured),
-              str([x["level"] for x in captured]))
+        check("这一条里两项都在、两个数字都在",
+              "+100" in captured[0]["content"] and "+7" in captured[0]["content"]
+              and "WorkBuddy 签到" in captured[0]["content"]
+              and "WorkBuddy 旅行" in captured[0]["content"],
+              captured[0]["content"])
+        check("合成那一条仍是 success 级", captured[0]["level"] == "success",
+              captured[0]["level"])
 
-        # probe 那一次运行：签到已是 already_checked、猫在路上 → 不该出现「到账」字样的成功通知
-        run({"status": "already_checked"}, {"status": "traveling", "arrive_at": 1789701251})
+        # probe 那一次运行：签到已是 already_checked、猫在路上 → 不该出现 success
+        run({"status": "already_checked"}, {"status": "traveling", "arrive_at": 1789701251},
+            msg_first_sent=True)
         check("无到账的巡检不发 success 通知（避免误报到账）",
               all(x["level"] != "success" for x in captured),
               str([(x["level"], x["title"]) for x in captured]))
@@ -1413,25 +1438,33 @@ def test_notification_split() -> None:
         #   与 catchup.py 的现行语义（**失败告警只针对真正待办的事项**，
         #   见 _report 里 failed 的 done_map 过滤）自相矛盾 —— 测试自己也过期了
         #   （在未改动的 bundle 上同样失败）。这里按真实语义拆成两个方向来钉。
+        #
+        # 2026-10-28 再修正：新形态下「到账 + 失败」只发一条 failure（与 Mac 一致），
+        # 所以原来「成功与失败分别成条」不再成立；改钉**信息不许丢**：那一条 failure
+        # 的正文必须仍然写出「签到成功 +100」和「旅行 +7」，故障时才能对照。
         run({"status": "failed", "reason": "网络异常"},
             {"status": "claimed", "reward_credit": 7},
-            {"checkin_done": False, "claim_done": True})
-        check("签到未完成 + 本次查询失败 → 到账一条 + 失败一条（互不吞掉）",
-              len(captured) == 2, "实际 {} 条".format(len(captured)))
-        check("成功与失败分别成条",
-              any(x["level"] == "success" for x in captured)
-              and any(x["level"] == "failure" for x in captured),
-              str([(x["level"], x["title"]) for x in captured]))
+            checkin_done=False, claim_done=True)
+        check("签到待办失败 + 旅行到账 → 只发一条失败告警（不刷两条）",
+              len(captured) == 1, "实际 {} 条".format(len(captured)))
+        check("那一条是 failure 级", captured[0]["level"] == "failure",
+              captured[0]["level"])
+        check("失败告警正文仍完整（签到、旅行两项 + 到账 +7 都在，什么都没被吞）",
+              "WorkBuddy 签到" in captured[0]["content"]
+              and "WorkBuddy 旅行" in captured[0]["content"]
+              and "+7" in captured[0]["content"],
+              captured[0]["content"])
 
         # 反向：当日已完成的事项，其查询失败**不该**惊动用户
         run({"status": "failed", "reason": "网络异常"},
             {"status": "claimed", "reward_credit": 7},
-            {"checkin_done": True, "claim_done": True})
+            checkin_done=True, claim_done=True)
         check("签到当日已完成时的查询失败 → 不报 failure（不惊动）",
               not any(x["level"] == "failure" for x in captured),
               str([(x["level"], x["title"]) for x in captured]))
     finally:
-        catchup.notify.send = orig
+        catchup.notify.send = orig_send
+        catchup.growth = orig_growth
 
 
 # ---------------------------------------------------------------------------
