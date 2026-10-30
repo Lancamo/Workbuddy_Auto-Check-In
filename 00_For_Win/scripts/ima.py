@@ -425,6 +425,9 @@ def probe(cred: dict) -> dict:
 
 
 FULL_DAYS = 7          # 满签所需的连续天数（7 格，每格 50 算力）
+# 每日登录福利固定 50 算力。当本次没有真正调用领取接口（服务端回报「今天已签到」，
+# 可能是在别的端先领了），响应里拿不到当日额度，用这个常量回填正文里的金额。
+DAILY_CREDIT = 50
 
 
 def _mk_item(body: str, done: bool, new: bool = False) -> dict:
@@ -465,10 +468,12 @@ def run_daily(force: bool = False, embed: bool = False) -> dict:
                  "exhausted_day": None}
 
     if state.get("done"):
-        # 当天已完成：正文从落盘的结果回填，好让「补发快照」也能写出真实数字
+        # 当天已完成：正文从落盘的结果回填，好让「补发快照」也能写出真实数字。
+        # 措辞写「已领取，+50 算力」而不是「今日已领过」（2026-10-29 用户要求）：
+        # 第一条全量消息必须带金额，只说「领过了」用户看不出今天到底到了多少。
         r = state.get("result") or {}
         days = r.get("checkin_days")
-        body = "今日已领过"
+        body = "已领取，+{} 算力".format(DAILY_CREDIT)
         if days is not None:
             body += "，本周已签 {} 天".format(days)
             if int(days) >= FULL_DAYS:
@@ -557,6 +562,8 @@ def run_daily(force: bool = False, embed: bool = False) -> dict:
     checked_now = False      # 今天「已签到」成立（含在别处签的）→ 满签奖励才有意义
     claimed_now = False      # 本次真的领到了 → 决定通知标题，两者不能混用
     claimed_credit = None    # 本次领到的算力数（供统一格式的正文行使用）
+    # 签到前的账面：用于判断 1002 到底是「别人先领了」还是「我们自己的请求被重发」
+    prev_total = info.get("total_reward_points")
 
     if status == STATUS_AVAILABLE:
         resp = check_in(cookie, token, CHECKIN_TYPE_DAILY)
@@ -580,7 +587,22 @@ def run_daily(force: bool = False, embed: bool = False) -> dict:
                                                 "reason": state["last_reason"]},
                     "item": _mk_item("待领取（网络异常，自动重试中）" if is_net
                                      else "失败（自动重试中）", done=False)}
-        info = get_activity_info(cookie, token)     # 重取：满签奖励状态会变
+        # 重取：满签奖励状态会变。
+        # 同时用「签到前后总分的差值」判 1002 的成因 —— 它有两种来源：
+        #   ① 别的端先领了 → 账面前后不变；
+        #   ② 我们自己的 POST 被网络层重发，服务端把第二次当重复请求回 1002
+        #      → 钱其实已经进账，只是我们读到的是第二个响应。
+        # 2026-10-29 实证：probe 明确回「可领取」，同一秒内 check_in 回 1002，全程无人操作、
+        # 本机在睡、ima 客户端当天零活动 —— 只能是②。判据只能是账面差值，不能靠 code。
+        after_info = get_activity_info(cookie, token)
+        after_total = after_info.get("total_reward_points")
+        if (code == CODE_ALREADY_CHECKED_IN and not claimed_now
+                and isinstance(prev_total, int) and isinstance(after_total, int)
+                and after_total > prev_total):
+            claimed_now = True
+            claimed_credit = after_total - prev_total
+            messages.append("本次进账（服务端对重复请求回了已签到）")
+        info = after_info
     elif status == STATUS_CLAIMED:
         checked_now = True
         messages.append("今天已签到")
@@ -631,10 +653,14 @@ def run_daily(force: bool = False, embed: bool = False) -> dict:
     #   成功，+50 算力，本周已签 7 天（满签✓）
     # 注意：checkin_days / total_reward_points 都是**本周**口径（7 格各 50 算力，
     # 今天领了 1 天就是 1/50），不是历史累计 —— 别写成「累计」。
+    # 两种措辞只为不说假话，两者都带金额（2026-10-29 用户要求第一条必须有明细）：
+    #   claimed_now 为真  → 本次真在接口里领到，「成功，+50 算力」
+    #   否则（服务端回报「今天已签到」，账面又没变化）→ 「已领取，+50 算力」
+    # 过去这里写的是「今日已领过」：只说状态不给金额，正是 2026-10-29 投诉的那一行。
     if claimed_now:
         body = "成功，+{} 算力".format(claimed_credit) if claimed_credit else "成功"
     else:
-        body = "今日已领过"
+        body = "已领取，+{} 算力".format(DAILY_CREDIT)
     if days is not None:
         body += "，本周已签 {} 天".format(days)
         if int(days) >= FULL_DAYS:

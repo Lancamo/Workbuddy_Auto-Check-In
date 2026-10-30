@@ -97,6 +97,15 @@ except Exception as _e:  # noqa: BLE001
     activity_watch = None
     ACTIVITY_IMPORT_ERROR = repr(_e)
 
+# 积分余额（见 scripts/credits.py）：快照末尾那一行「积分余额：」用。
+# 同样可选 —— 查不到余额只是少一行字，绝不能让整条快照发不出去。
+try:
+    import credits    # noqa: E402
+    CREDITS_IMPORT_ERROR = None
+except Exception as _e:  # noqa: BLE001
+    credits = None
+    CREDITS_IMPORT_ERROR = repr(_e)
+
 WINDOW1 = 700       # 07:00 签到 + 派遣（「≥ 时间」语义，过了点补跑）
 QUIET_FROM = 700    # 07:00 —— 在此之前完全静默（见 _quiet_now）
 MAX_TRIES = 12      # 单事项最多真实尝试次数（业务层失败：401 / 接口错误等）
@@ -388,7 +397,8 @@ def _snapshot_title(state: dict, ima_item: dict | None,
 
 
 def _compose(state: dict, c: dict, t: dict, ima_item: dict | None, stamp: str,
-             month_days: int | None = None, brief: bool = False) -> str:
+             month_days: int | None = None, brief: bool = False,
+             balance: int | None = None) -> str:
     """把三项结果拼成一条统一格式的正文（2026-10-22 用户指定，全站一致）：
 
         1、WorkBuddy 签到：
@@ -399,6 +409,7 @@ def _compose(state: dict, c: dict, t: dict, ima_item: dict | None, stamp: str,
         成功，+50 算力，本周已签 7 天（满签✓）
 
         今日进度：签到 ✓ / 旅行 ✓ / ima ✓
+        积分余额：2599
         时间：2026-10-22 08:02
 
     未到账的事项照同一格式写「待领取（…）」，不换一种排版 —— 三种状态（到账 /
@@ -411,6 +422,10 @@ def _compose(state: dict, c: dict, t: dict, ima_item: dict | None, stamp: str,
     第一条已经把「签到成功」「猫已出发」「ima 已签」都说过了，第二条再说一遍
     「今日已领过」只是把消息撑长；用户要的是「这条消息带来了什么新东西」。
     「今日进度」与「时间」仍然保留 —— 它们说明的是当天整体到哪一步，不受本条影响。
+
+    balance（2026-10-30 加）：当前可用积分，压在「今日进度」与「时间」之间。
+    None = 本轮没查到（网络 / 登录态问题）→ **整行不显示**，不写「暂不可用」占位：
+    一行永远在的占位反而让人以为余额一直是坏的，而实际只是那一轮没取到。
     """
     # ── 哪些项要出现 ─────────────────────────────────────────────────────
     show_checkin = (not brief) or c.get("status") == "success"
@@ -434,7 +449,8 @@ def _compose(state: dict, c: dict, t: dict, ima_item: dict | None, stamp: str,
 
     if not items:
         # brief 过滤后一条都不剩：宁可退回完整版，也不发一条只有进度和时间的空消息
-        return _compose(state, c, t, ima_item, stamp, month_days, brief=False)
+        return _compose(state, c, t, ima_item, stamp, month_days, brief=False,
+                        balance=balance)
 
     lines = []
     for idx, (head, line) in enumerate(items, 1):
@@ -445,6 +461,8 @@ def _compose(state: dict, c: dict, t: dict, ima_item: dict | None, stamp: str,
     # 微信里就是一个真正的空行；单个 U+2028 只会换行不留空。
     lines.append("")
     lines.append("今日进度：" + " / ".join(marks))
+    if balance is not None:
+        lines.append("积分余额：{}".format(balance))
     lines.append("时间：" + stamp)
     return "\n".join(lines)
 
@@ -491,16 +509,26 @@ def _report(c: dict, t: dict, state: dict, pf: dict | None = None,
     #   标题「连续 N 天」    = 签到接口的跨月累计（成绩展示），优先用本轮结果，
     #                         already_checked 那轮拿不到就用上次记下的。
     month_days = growth.current_streak_days() if growth is not None else None
+    # 积分余额（2026-10-30 加）：只读查询，短超时不重试。取不到就 None ——
+    # 少显示一行，不影响本条的成败判定（余额不是今天要做的事）。
+    bal = None
+    if credits is not None:
+        _r = credits.query_balance()
+        bal = _r.get("total")
+        if bal is None:
+            log("credits: 余额未取到 —— {}".format(_r.get("__error__")))
     if c.get("streak_days"):
         state["checkin_streak_days"] = c["streak_days"]
     streak_days = c.get("streak_days") or state.get("checkin_streak_days")
     # 今天已经发过快照 → 本条只列新变化（见 _compose 的 brief 说明）
     brief = bool(state.get("msg_first_sent"))
-    body = _compose(state, c, t, ima_item, stamp, month_days, brief=brief)
+    body = _compose(state, c, t, ima_item, stamp, month_days, brief=brief,
+                    balance=bal)
 
     if failed or suspect or pf_bad:
         # 告警必须完整：brief 版会省掉「今日已领过」，而故障时用户正是要对照全部三项
-        body = _compose(state, c, t, ima_item, stamp, month_days, brief=False)
+        body = _compose(state, c, t, ima_item, stamp, month_days, brief=False,
+                        balance=bal)
         if drift and failed:
             # 漂移优先于「失败」：这类故障的处置是「核对端点」，
             # 不是「等重试」也不是「去刷登录态」，标题必须先把性质说清楚。

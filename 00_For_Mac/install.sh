@@ -22,7 +22,7 @@
 # ============================================================
 set -uo pipefail
 
-DIR="$(cd "$(dirname "$0")" && pwd)"
+DIR="$(cd "$(dirname "$0")" && pwd -P)"
 LABEL_MAIN="com.workbuddy.wb-reward-catchup"
 LABEL_WD="com.workbuddy.wb-reward-watchdog"
 DEST="$HOME/Library/LaunchAgents"

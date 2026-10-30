@@ -48,6 +48,13 @@ def fake_log(msg: str) -> None:
 LOGGED: list[str] = []
 
 
+class FakeCredits:
+    """桩掉余额查询：S4 走 `_report`，那里会真去查一次积分余额 —— 桩测必须离线。"""
+    @staticmethod
+    def query_balance(*_a, **_k) -> dict:
+        return {"total": 2599, "raw": "2599.02", "plan": "体验版"}
+
+
 def reset() -> None:
     SENT.clear()
 
@@ -63,13 +70,17 @@ def s1() -> None:
     ima = {"body": "成功，+50 算力，本周已签 3 天", "done": True, "new": True}
 
     title = cu._snapshot_title(st, ima, 29)
-    body = cu._compose(st, c, t, ima, "2026-10-28 10:34", month_days=28)
+    body = cu._compose(st, c, t, ima, "2026-10-28 10:34", month_days=28,
+                       balance=2599)
     check("标题含「连续 29 天」", "连续 29 天" in title, title)
     check("标题含完成度", "2/3 完成" in title, title)
     check("正文写「本月连续签到 28 天」", "本月连续签到 28 天" in body, body)
     check("正文不再出现「连续签到 29 天」", "连续签到 29 天" not in body)
     check("三项齐全", body.count("、WorkBuddy") == 2 and "ima 算力" in body, body)
     check("保留进度与时间", "今日进度" in body and "时间：" in body)
+    check("余额行在「今日进度」与「时间」之间",
+          body.index("今日进度") < body.index("积分余额：2599") < body.index("时间："),
+          body)
 
 
 def s2() -> None:
@@ -176,11 +187,24 @@ def s8() -> None:
     check("不发消息", len(SENT) == 0, str(len(SENT)))
 
 
+def s9() -> None:
+    print("S9 余额查不到：整行不显示，不留占位、不影响其余内容")
+    st = {"checkin_done": True, "claim_done": True}
+    c = {"status": "success", "credit": 100, "streak_days": 31}
+    t = {"status": "claimed", "reward_credit": 5}
+    ima = {"body": "已领取，+50 算力，本周已签 5 天", "done": True, "new": True}
+    body = cu._compose(st, c, t, ima, "2026-10-30 07:05", month_days=22, balance=None)
+    check("没有「积分余额」字样", "积分余额" not in body, body)
+    check("不写「暂不可用」类占位", "暂不可用" not in body, body)
+    check("进度与时间仍在", "今日进度" in body and "时间：" in body, body)
+
+
 def main() -> int:
     print("通知排版与合并桩测\n")
     cu._notify = fake_notify
     cu.log = fake_log          # 别往真实 catchup.log 里写假记录
-    for fn in (s1, s2, s3, s4, s5, s6, s7, s8):
+    cu.credits = FakeCredits   # 别真去查积分余额（离线）
+    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9):
         fn()
         print()
     if FAILED:
